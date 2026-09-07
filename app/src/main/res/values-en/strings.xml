@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Watermark Remover</string>
+
+    <!-- Navigation -->
+    <string name="tab_home">Home</string>
+    <string name="tab_library">My videos</string>
+    <string name="back">Back</string>
+    <string name="back_home">Back to home</string>
+    <string name="cancel">Cancel</string>
+    <string name="open">Open</string>
+    <string name="share">Share</string>
+    <string name="delete">Delete</string>
+    <string name="rename">Rename</string>
+    <string name="more">More options</string>
+    <string name="see_all">See all</string>
+
+    <!-- Home -->
+    <string name="home_title">Remove a watermark in seconds</string>
+    <string name="home_subtitle">Pick a video already saved on this device, frame the watermark, then export.</string>
+    <string name="pick_video">Choose a video</string>
+    <string name="pick_video_hint">The video must already be in the gallery or in the phone\'s files.</string>
+    <string name="recent_title">Recently processed</string>
+    <string name="how_it_works">How it works</string>
+    <string name="step1_title">Pick the video</string>
+    <string name="step1_desc">From the gallery or via "Share" from another app.</string>
+    <string name="step2_title">Frame the watermark</string>
+    <string name="step2_desc">Move the box, tune the method and compare before / after.</string>
+    <string name="step3_title">Export</string>
+    <string name="step3_desc">The video is saved to the gallery and to "My videos".</string>
+    <string name="about_note">100% on-device processing, no video is ever uploaded.</string>
+    <string name="legal_note">Only use this tool on videos you own the rights to.</string>
+
+    <!-- Library -->
+    <string name="library_title">My videos</string>
+    <string name="library_count">%1$d video(s) • %2$s</string>
+    <string name="library_empty_title">No videos yet</string>
+    <string name="library_empty_message">Videos you remove a watermark from will show up here. They are also saved to Movies/Watermark Remover.</string>
+    <string name="zones_badge">%1$d zones</string>
+    <string name="delete_title">Delete this video?</string>
+    <string name="delete_message">"%1$s" will be removed from the library and deleted from the gallery. This cannot be undone.</string>
+    <string name="rename_title">Rename video</string>
+    <string name="rename_label">File name</string>
+    <string name="snack_deleted">Video deleted</string>
+    <string name="snack_renamed">Video renamed</string>
+
+    <!-- Editor -->
+    <string name="loading_video">Opening video…</string>
+    <string name="editor_title">Frame the watermark</string>
+    <string name="editor_instructions">Move and resize the box so it fully covers the watermark. Press and hold the image to see the original.</string>
+    <string name="zones_title">Zones to process</string>
+    <string name="add_zone">Add</string>
+    <string name="remove_zone">Remove zone</string>
+    <string name="zone_label">Zone %1$d</string>
+    <string name="no_zone">Add at least one zone to process.</string>
+    <string name="preview_before">Before</string>
+    <string name="preview_after">After</string>
+    <string name="preview_crop_hint">Dark area = removed part</string>
+    <string name="method_label">Removal method</string>
+    <string name="method_inpaint">Reconstruction (recommended)</string>
+    <string name="method_inpaint_short">Reconstruction</string>
+    <string name="method_inpaint_desc">Fills the area from the surrounding pixels. Best on plain or low-detail backgrounds.</string>
+    <string name="method_blur">Blur</string>
+    <string name="method_blur_desc">Heavily blurs the area. The watermark becomes unreadable but the area stays visible.</string>
+    <string name="method_pixelate">Pixelate</string>
+    <string name="method_pixelate_desc">Replaces the area with large pixels.</string>
+    <string name="method_crop">Crop</string>
+    <string name="method_crop_desc">Cuts the video to exclude the area. Changes the video dimensions.</string>
+    <string name="crop_needs_single_zone">Crop only uses the first zone.</string>
+    <string name="strength_label">Strength</string>
+    <string name="feather_label">Edge softness</string>
+    <string name="export">Remove watermark</string>
+    <string name="content_description_video_preview">Video preview</string>
+
+    <!-- Export -->
+    <string name="export_title">Processing…</string>
+    <string name="export_preparing">Preparing the encoder…</string>
+    <string name="export_keep_open">Keep the app open while processing.</string>
+    <string name="export_done_title">Watermark removed!</string>
+    <string name="export_done_message">The video has been saved to the gallery and added to "My videos".</string>
+    <string name="export_failed_title">Oops, that didn\'t work</string>
+    <string name="export_another">Process another video</string>
+    <string name="export_retry">Retry</string>
+    <string name="go_to_library">My videos</string>
+    <string name="detail_resolution">Resolution</string>
+    <string name="detail_duration">Duration</string>
+    <string name="detail_size">Size</string>
+    <string name="detail_method">Method</string>
+    <string name="detail_zones">Zones</string>
+    <string name="detail_source">Source video</string>
+    <string name="detail_location">Location</string>
+
+    <!-- Errors -->
+    <string name="permission_needed">Storage permission is required to save the video.</string>
+    <string name="error_generic">Details: %1$s</string>
+</resources>

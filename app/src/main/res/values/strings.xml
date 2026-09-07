@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Watermark Remover</string>
+
+    <!-- Navigation -->
+    <string name="tab_home">Accueil</string>
+    <string name="tab_library">Mes vidéos</string>
+    <string name="back">Retour</string>
+    <string name="back_home">Retour à l\'accueil</string>
+    <string name="cancel">Annuler</string>
+    <string name="open">Ouvrir</string>
+    <string name="share">Partager</string>
+    <string name="delete">Supprimer</string>
+    <string name="rename">Renommer</string>
+    <string name="more">Plus d\'options</string>
+    <string name="see_all">Tout voir</string>
+
+    <!-- Home -->
+    <string name="home_title">Supprimez un filigrane en quelques secondes</string>
+    <string name="home_subtitle">Choisissez une vidéo déjà enregistrée sur cet appareil, encadrez le filigrane, puis exportez.</string>
+    <string name="pick_video">Choisir une vidéo</string>
+    <string name="pick_video_hint">La vidéo doit déjà être dans la galerie ou dans les fichiers du téléphone.</string>
+    <string name="recent_title">Récemment traitées</string>
+    <string name="how_it_works">Comment ça marche</string>
+    <string name="step1_title">Choisissez la vidéo</string>
+    <string name="step1_desc">Depuis la galerie ou via « Partager » depuis une autre app.</string>
+    <string name="step2_title">Encadrez le filigrane</string>
+    <string name="step2_desc">Déplacez le cadre, ajustez la méthode et comparez avant / après.</string>
+    <string name="step3_title">Exportez</string>
+    <string name="step3_desc">La vidéo est enregistrée dans la galerie et dans « Mes vidéos ».</string>
+    <string name="about_note">Traitement 100 % sur l\'appareil, aucune vidéo n\'est envoyée sur Internet.</string>
+    <string name="legal_note">N\'utilisez cet outil que sur des vidéos dont vous détenez les droits.</string>
+
+    <!-- Library -->
+    <string name="library_title">Mes vidéos</string>
+    <string name="library_count">%1$d vidéo(s) • %2$s</string>
+    <string name="library_empty_title">Aucune vidéo pour l\'instant</string>
+    <string name="library_empty_message">Les vidéos dont vous supprimez le filigrane apparaîtront ici. Elles sont aussi enregistrées dans Films/Watermark Remover.</string>
+    <string name="zones_badge">%1$d zones</string>
+    <string name="delete_title">Supprimer cette vidéo ?</string>
+    <string name="delete_message">« %1$s » sera retirée de la bibliothèque et supprimée de la galerie. Cette action est définitive.</string>
+    <string name="rename_title">Renommer la vidéo</string>
+    <string name="rename_label">Nom du fichier</string>
+    <string name="snack_deleted">Vidéo supprimée</string>
+    <string name="snack_renamed">Vidéo renommée</string>
+
+    <!-- Editor -->
+    <string name="loading_video">Ouverture de la vidéo…</string>
+    <string name="editor_title">Encadrez le filigrane</string>
+    <string name="editor_instructions">Déplacez et redimensionnez le cadre pour couvrir entièrement le filigrane. Maintenez l\'image appuyée pour voir l\'original.</string>
+    <string name="zones_title">Zones à traiter</string>
+    <string name="add_zone">Ajouter</string>
+    <string name="remove_zone">Supprimer la zone</string>
+    <string name="zone_label">Zone %1$d</string>
+    <string name="no_zone">Ajoutez au moins une zone à traiter.</string>
+    <string name="preview_before">Avant</string>
+    <string name="preview_after">Après</string>
+    <string name="preview_crop_hint">Zone sombre = partie supprimée</string>
+    <string name="method_label">Méthode de suppression</string>
+    <string name="method_inpaint">Reconstruction (recommandé)</string>
+    <string name="method_inpaint_short">Reconstruction</string>
+    <string name="method_inpaint_desc">Remplit la zone à partir des pixels voisins. Idéal sur les fonds unis ou peu détaillés.</string>
+    <string name="method_blur">Flou</string>
+    <string name="method_blur_desc">Floute fortement la zone. Le filigrane devient illisible mais la zone reste visible.</string>
+    <string name="method_pixelate">Pixellisation</string>
+    <string name="method_pixelate_desc">Remplace la zone par de gros pixels.</string>
+    <string name="method_crop">Recadrage</string>
+    <string name="method_crop_desc">Coupe la vidéo pour exclure la zone. Change les dimensions de la vidéo.</string>
+    <string name="crop_needs_single_zone">Le recadrage n\'utilise que la première zone.</string>
+    <string name="strength_label">Intensité</string>
+    <string name="feather_label">Adoucissement des bords</string>
+    <string name="export">Supprimer le filigrane</string>
+    <string name="content_description_video_preview">Aperçu de la vidéo</string>
+
+    <!-- Export -->
+    <string name="export_title">Traitement en cours…</string>
+    <string name="export_preparing">Préparation de l\'encodeur…</string>
+    <string name="export_keep_open">Gardez l\'application ouverte pendant le traitement.</string>
+    <string name="export_done_title">Filigrane supprimé !</string>
+    <string name="export_done_message">La vidéo a été enregistrée dans la galerie et ajoutée à « Mes vidéos ».</string>
+    <string name="export_failed_title">Oups, ça n\'a pas fonctionné</string>
+    <string name="export_another">Traiter une autre vidéo</string>
+    <string name="export_retry">Réessayer</string>
+    <string name="go_to_library">Mes vidéos</string>
+    <string name="detail_resolution">Résolution</string>
+    <string name="detail_duration">Durée</string>
+    <string name="detail_size">Taille</string>
+    <string name="detail_method">Méthode</string>
+    <string name="detail_zones">Zones</string>
+    <string name="detail_source">Vidéo d\'origine</string>
+    <string name="detail_location">Emplacement</string>
+
+    <!-- Errors -->
+    <string name="permission_needed">L\'autorisation de stockage est nécessaire pour enregistrer la vidéo.</string>
+    <string name="error_generic">Détail : %1$s</string>
+</resources>
