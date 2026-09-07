@@ -9,10 +9,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -52,7 +48,6 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -73,7 +68,6 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.souxch.watermarkremover.R
-import com.souxch.watermarkremover.model.ExportQuality
 import com.souxch.watermarkremover.model.RemovalMethod
 import com.souxch.watermarkremover.model.VideoInfo
 import com.souxch.watermarkremover.processing.WatermarkShader
@@ -250,64 +244,19 @@ fun EditorScreen(info: VideoInfo, frame: Bitmap?, state: EditorState, vm: Editor
                     AnimatedVisibility(settings.method == RemovalMethod.CROP && zones.size > 1) {
                         Text(stringResource(R.string.crop_needs_single_zone), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
                     }
-                    AnimatedVisibility(
-                        visible = settings.method.usesShader,
-                        enter = fadeIn() + expandVertically(),
-                        exit = fadeOut() + shrinkVertically(),
-                    ) {
-                        Column {
-                            Spacer(Modifier.height(8.dp))
-                            LabeledSlider(
-                                stringResource(if (settings.method == RemovalMethod.INPAINT) R.string.texture_label else R.string.strength_label),
-                                settings.strength,
-                                vm::setStrength,
-                            )
-                            LabeledSlider(stringResource(R.string.feather_label), settings.feather, vm::setFeather)
-                        }
-                    }
                 }
             }
             Spacer(Modifier.height(12.dp))
 
-            // ----- Output quality -----
-            SectionCard(Modifier.padding(horizontal = 16.dp)) {
-                Column {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.HighQuality, null, tint = MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.width(8.dp))
-                        Text(stringResource(R.string.quality_label), style = MaterialTheme.typography.titleMedium)
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                        val options = ExportQuality.entries
-                        options.forEachIndexed { index, q ->
-                            SegmentedButton(
-                                selected = settings.quality == q,
-                                onClick = { vm.setQuality(q) },
-                                shape = SegmentedButtonDefaults.itemShape(index, options.size),
-                            ) {
-                                Text(
-                                    stringResource(
-                                        when (q) {
-                                            ExportQuality.STANDARD -> R.string.quality_standard
-                                            ExportQuality.HIGH -> R.string.quality_high
-                                            ExportQuality.MAXIMUM -> R.string.quality_maximum
-                                        },
-                                    ),
-                                )
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(6.dp))
-                    val targetMbps = settings.quality.targetBitrate(info.displayWidth, info.displayHeight, info.frameRate, info.bitrate) / 1_000_000f
-                    val sourceMbps = info.bitrate / 1_000_000f
-                    Text(
-                        if (info.bitrate > 0) stringResource(R.string.quality_summary_with_source, "%.0f".format(targetMbps), "%.0f".format(sourceMbps))
-                        else stringResource(R.string.quality_summary, "%.0f".format(targetMbps)),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
+            // Quality is automatic (see ExportQuality.MAXIMUM): just tell the user.
+            Row(Modifier.padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.HighQuality, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    stringResource(R.string.quality_auto_note),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             Spacer(Modifier.height(16.dp))
 
@@ -324,15 +273,6 @@ fun EditorScreen(info: VideoInfo, frame: Bitmap?, state: EditorState, vm: Editor
             Spacer(Modifier.height(24.dp))
         }
     }
-}
-
-@Composable
-private fun LabeledSlider(label: String, value: Float, onChange: (Float) -> Unit) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        Text(label, style = MaterialTheme.typography.labelLarge)
-        Text("${(value * 100).toInt()} %", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    }
-    Slider(value = value, onValueChange = onChange)
 }
 
 @Composable

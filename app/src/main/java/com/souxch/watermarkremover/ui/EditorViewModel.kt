@@ -8,7 +8,6 @@ import androidx.lifecycle.viewModelScope
 import com.souxch.watermarkremover.data.LibraryRepository
 import com.souxch.watermarkremover.data.ProcessedVideo
 import com.souxch.watermarkremover.model.Corner
-import com.souxch.watermarkremover.model.ExportQuality
 import com.souxch.watermarkremover.model.RemovalMethod
 import com.souxch.watermarkremover.model.RemovalSettings
 import com.souxch.watermarkremover.model.VideoInfo
@@ -176,9 +175,6 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setMethod(method: RemovalMethod) = _state.update { it.copy(settings = it.settings.copy(method = method)) }
-    fun setQuality(quality: ExportQuality) = _state.update { it.copy(settings = it.settings.copy(quality = quality)) }
-    fun setStrength(v: Float) = _state.update { it.copy(settings = it.settings.copy(strength = v)) }
-    fun setFeather(v: Float) = _state.update { it.copy(settings = it.settings.copy(feather = v)) }
     fun setShowAfter(after: Boolean) = _state.update { it.copy(showAfter = after) }
 
     // ------------------------------------------------------------------------------------------

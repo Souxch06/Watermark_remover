@@ -115,6 +115,8 @@ enum class RemovalMethod(
  * Output quality preset. The encoder bitrate is derived from BOTH the source bitrate and a
  * resolution-based floor, so a low-bitrate source is never made worse and a high-bitrate source
  * keeps its detail. See [ExportQuality.targetBitrate].
+ *
+ * The app always exports with [MAXIMUM]; the other presets are kept for tests / future use only.
  */
 enum class ExportQuality(
     /** Multiplier applied to the source bitrate. */
@@ -124,7 +126,8 @@ enum class ExportQuality(
 ) {
     STANDARD(sourceFactor = 1.0f, bitsPerPixel = 0.10f),
     HIGH(sourceFactor = 1.5f, bitsPerPixel = 0.16f),
-    MAXIMUM(sourceFactor = 2.0f, bitsPerPixel = 0.24f);
+    /** ~2x the source bitrate and a generous floor: visually lossless re-encode. */
+    MAXIMUM(sourceFactor = 2.0f, bitsPerPixel = 0.30f);
 
     /**
      * Target encoder bitrate (bits/s) for a [width] x [height] video at [frameRate] fps whose
@@ -144,13 +147,17 @@ enum class ExportQuality(
     }
 }
 
+/**
+ * Processing settings. Only [method] is user-facing; everything else is tuned automatically so
+ * the app works well with zero configuration.
+ */
 data class RemovalSettings(
     val method: RemovalMethod = RemovalMethod.INPAINT,
-    val quality: ExportQuality = ExportQuality.HIGH,
-    /** 0..1 – meaning depends on the method (blur radius, block size, inpaint smoothness). */
-    val strength: Float = 0.5f,
+    val quality: ExportQuality = ExportQuality.MAXIMUM,
+    /** 0..1 – meaning depends on the method (blur radius, block size, inpaint texture amount). */
+    val strength: Float = 0.6f,
     /** 0..1 – softness of the transition around the zone. */
-    val feather: Float = 0.35f,
+    val feather: Float = 0.4f,
 ) {
     /** Feather width as a fraction of the smallest frame dimension. */
     val featherFraction: Float get() = feather * MAX_FEATHER_FRACTION

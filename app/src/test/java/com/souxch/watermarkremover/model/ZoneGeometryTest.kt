@@ -76,6 +76,14 @@ class ZoneGeometryTest {
     }
 
     @Test
+    fun `default settings export at maximum quality and at least twice the source bitrate`() {
+        val settings = RemovalSettings()
+        assertEquals(ExportQuality.MAXIMUM, settings.quality)
+        val src = 18_000_000
+        assertTrue(settings.quality.targetBitrate(1920, 1080, 30f, src) >= src * 2)
+    }
+
+    @Test
     fun `target bitrate is capped`() {
         assertEquals(ExportQuality.MAX_BITRATE.toInt(), ExportQuality.MAXIMUM.targetBitrate(7680, 4320, 60f, 400_000_000))
     }
