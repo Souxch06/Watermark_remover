@@ -1,0 +1,149 @@
+name: Release
+
+# Publishes an installable APK on the GitHub "Releases" page, so anyone can download it
+# directly from GitHub (no Android Studio needed).
+#
+# Two ways to trigger it:
+#   1. Push a tag:            git tag v1.0.0 && git push origin v1.0.0
+#   2. Manually:              Actions tab -> "Release" -> "Run workflow" -> enter a version
+#
+# Optional signing with your own key (recommended for updates without reinstalling):
+# add these repository secrets (Settings -> Secrets and variables -> Actions):
+#   KEYSTORE_BASE64   : base64 of your .jks file  (base64 -w0 my-release-key.jks)
+#   KEYSTORE_PASSWORD : keystore password
+#   KEY_ALIAS         : key alias
+#   KEY_PASSWORD      : key password
+# Without them the APK is signed with the debug key (still installable).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 1.0.0). A tag v<version> is created if missing."
+        required: true
+        default: "1.0.0"
+      prerelease:
+        description: "Mark as pre-release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # needed to create the release and upload the APK
+
+jobs:
+  release:
+    name: Build & publish APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+            VERSION="${VERSION#v}"
+          fi
+          # versionCode must be a monotonically increasing integer: use the run number.
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "code=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Publishing version ${VERSION} (versionCode ${GITHUB_RUN_NUMBER})"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle (with cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Restore release keystore (if secrets are configured)
+        if: ${{ env.KEYSTORE_BASE64 != '' }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        shell: bash
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          cat > keystore.properties <<EOF
+          storeFile=$RUNNER_TEMP/release.jks
+          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.KEY_ALIAS }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          EOF
+          echo "Release keystore restored."
+
+      - name: Unit tests
+        run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Build release APK
+        run: >
+          ./gradlew assembleRelease --no-daemon --stacktrace
+          -PversionName=${{ steps.ver.outputs.version }}
+          -PversionCode=${{ steps.ver.outputs.code }}
+
+      - name: Collect artifacts
+        id: apk
+        shell: bash
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          test -f "$APK"
+          mkdir -p dist
+          NAME="WatermarkRemover-${{ steps.ver.outputs.version }}.apk"
+          cp "$APK" "dist/$NAME"
+          (cd dist && sha256sum "$NAME" > "$NAME.sha256")
+          echo "path=dist/$NAME" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "sha=$(cut -d' ' -f1 dist/$NAME.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag (manual runs only)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists locally."
+          elif git ls-remote --exit-code --tags origin "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists on origin."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: Watermark Remover ${{ steps.ver.outputs.version }}
+          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.apk.outputs.path }}
+            ${{ steps.apk.outputs.path }}.sha256
+          body: |
+            ## 📲 Installation
+
+            1. Sur votre téléphone Android, téléchargez **`${{ steps.apk.outputs.name }}`** ci-dessous.
+            2. Ouvrez le fichier ; autorisez « Installer des applications inconnues » pour votre navigateur si Android le demande.
+            3. Lancez **Watermark Remover**.
+
+            - Android 7.0 (API 24) minimum • Traitement 100 % sur l'appareil, aucune connexion requise.
+            - SHA-256 : `${{ steps.apk.outputs.sha }}`
+
+            ---
+            _Build automatique : versionCode ${{ steps.ver.outputs.code }}, commit ${{ github.sha }}_
