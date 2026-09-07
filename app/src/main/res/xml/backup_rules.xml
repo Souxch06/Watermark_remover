@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
-    <!-- Exported / temporary videos are large and regenerable: never back them up. -->
-    <exclude domain="cache" path="exports/" />
+    <!-- The cache dir (temporary exports) is never backed up by Android. Thumbnails are large
+         and regenerable; the library index (files/library/index.json) is kept. -->
+    <exclude domain="file" path="library/thumbs/" />
 </full-backup-content>
