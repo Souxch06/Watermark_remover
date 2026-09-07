@@ -255,7 +255,11 @@ fun EditorScreen(info: VideoInfo, frame: Bitmap?, state: EditorState, vm: Editor
                     ) {
                         Column {
                             Spacer(Modifier.height(8.dp))
-                            LabeledSlider(stringResource(R.string.strength_label), settings.strength, vm::setStrength)
+                            LabeledSlider(
+                                stringResource(if (settings.method == RemovalMethod.INPAINT) R.string.texture_label else R.string.strength_label),
+                                settings.strength,
+                                vm::setStrength,
+                            )
                             LabeledSlider(stringResource(R.string.feather_label), settings.feather, vm::setFeather)
                         }
                     }

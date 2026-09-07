@@ -59,7 +59,7 @@
     <string name="method_label">Méthode de suppression</string>
     <string name="method_inpaint">Reconstruction (recommandé)</string>
     <string name="method_inpaint_short">Reconstruction</string>
-    <string name="method_inpaint_desc">Remplit la zone à partir des pixels voisins. Idéal sur les fonds unis ou peu détaillés.</string>
+    <string name="method_inpaint_desc">Reconstruit la zone à partir des couleurs et de la texture qui l\'entourent, sans effet de flou.</string>
     <string name="method_blur">Flou</string>
     <string name="method_blur_desc">Floute fortement la zone. Le filigrane devient illisible mais la zone reste visible.</string>
     <string name="method_pixelate">Pixellisation</string>
@@ -67,6 +67,7 @@
     <string name="method_crop">Recadrage</string>
     <string name="method_crop_desc">Coupe la vidéo pour exclure la zone. Change les dimensions de la vidéo.</string>
     <string name="crop_needs_single_zone">Le recadrage n\'utilise que la première zone.</string>
+    <string name="texture_label">Texture restituée</string>
     <string name="strength_label">Intensité</string>
     <string name="feather_label">Adoucissement des bords</string>
     <string name="export">Supprimer le filigrane</string>

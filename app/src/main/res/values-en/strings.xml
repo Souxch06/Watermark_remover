@@ -59,7 +59,7 @@
     <string name="method_label">Removal method</string>
     <string name="method_inpaint">Reconstruction (recommended)</string>
     <string name="method_inpaint_short">Reconstruction</string>
-    <string name="method_inpaint_desc">Fills the area from the surrounding pixels. Best on plain or low-detail backgrounds.</string>
+    <string name="method_inpaint_desc">Rebuilds the area from the surrounding colours and texture, without a blurry look.</string>
     <string name="method_blur">Blur</string>
     <string name="method_blur_desc">Heavily blurs the area. The watermark becomes unreadable but the area stays visible.</string>
     <string name="method_pixelate">Pixelate</string>
@@ -67,6 +67,7 @@
     <string name="method_crop">Crop</string>
     <string name="method_crop_desc">Cuts the video to exclude the area. Changes the video dimensions.</string>
     <string name="crop_needs_single_zone">Crop only uses the first zone.</string>
+    <string name="texture_label">Texture detail</string>
     <string name="strength_label">Strength</string>
     <string name="feather_label">Edge softness</string>
     <string name="export">Remove watermark</string>

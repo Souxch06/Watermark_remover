@@ -95,34 +95,78 @@ object WatermarkShader {
           return acc / wsum;
         }
 
-        // Reconstructs the pixel from the ring just outside the zone. For every axis direction we
-        // take the colour at the border (slightly outside so the watermark itself is never
-        // sampled), blur it a little to hide noise, and blend the four samples with inverse
-        // distance weights. This is a real-time approximation of diffusion-based inpainting.
+        // Small 3x3 tent blur used to split a sample into low / high frequencies.
+        vec4 blurSmall(vec2 uv) {
+          vec2 s = uTexelSize * 1.5;
+          vec4 acc = sampleTex(uv) * 4.0;
+          acc += (sampleTex(uv + vec2(s.x, 0.0)) + sampleTex(uv - vec2(s.x, 0.0))
+                + sampleTex(uv + vec2(0.0, s.y)) + sampleTex(uv - vec2(0.0, s.y))) * 2.0;
+          acc += sampleTex(uv + s) + sampleTex(uv - s)
+               + sampleTex(uv + vec2(s.x, -s.y)) + sampleTex(uv + vec2(-s.x, s.y));
+          return acc / 16.0;
+        }
+
+        // High-frequency content (grain, texture, fine edges) at uv.
+        vec3 detailAt(vec2 uv) {
+          return sampleTex(uv).rgb - blurSmall(uv).rgb;
+        }
+
+        // Frequency-separation inpainting.
+        //  * LOW frequencies (tones, gradients) come from a smooth blend of the colours found just
+        //    outside each edge of the zone (blurred along the edge, weighted by inverse squared
+        //    distance), so the fill always matches its surroundings without a visible seam.
+        //  * HIGH frequencies (grain, texture) are borrowed from the real pixels outside the zone,
+        //    mirrored across the nearest edges - slightly compressed and skewed so that large zones
+        //    do not show an obvious mirror image. Adding them back is what keeps the result from
+        //    looking blurry.
+        // Directions whose source would fall outside the frame (zone touching a border) fade out.
         vec4 inpaintAt(vec2 uv, vec4 r) {
-          vec2 margin = uTexelSize * (3.0 + 6.0 * uStrength);
-          vec2 stride = uTexelSize * (1.0 + 3.0 * uStrength);
+          vec2 zoneSize = vec2(r.z - r.x, r.w - r.y);
+          vec2 margin = uTexelSize * 4.0;
           float dl = uv.x - r.x;
           float dr = r.z - uv.x;
           float db = uv.y - r.y;
           float dt = r.w - uv.y;
-          vec4 cl = blurAt(vec2(r.x - margin.x, uv.y), stride);
-          vec4 cr = blurAt(vec2(r.z + margin.x, uv.y), stride);
-          vec4 cb = blurAt(vec2(uv.x, r.y - margin.y), stride);
-          vec4 ct = blurAt(vec2(uv.x, r.w + margin.y), stride);
-          // Directions that fall outside the frame contribute nothing (the clamp in sampleTex
-          // would otherwise smear the opposite edge colour).
-          float wl = (r.x - margin.x > 0.0) ? 1.0 / max(dl, 1e-4) : 0.0;
-          float wr = (r.z + margin.x < 1.0) ? 1.0 / max(dr, 1e-4) : 0.0;
-          float wb = (r.y - margin.y > 0.0) ? 1.0 / max(db, 1e-4) : 0.0;
-          float wt = (r.w + margin.y < 1.0) ? 1.0 / max(dt, 1e-4) : 0.0;
-          // Squared weights favour the nearest edge, producing a smoother gradient fill.
-          wl *= wl; wr *= wr; wb *= wb; wt *= wt;
+
+          // Mirrored source positions (k < 1 compresses, the perpendicular term skews).
+          float k = 0.8;
+          float skew = 0.25;
+          vec2 pl = vec2(r.x - margin.x - dl * k, uv.y + dl * skew);
+          vec2 pr = vec2(r.z + margin.x + dr * k, uv.y - dr * skew);
+          vec2 pb = vec2(uv.x + db * skew, r.y - margin.y - db * k);
+          vec2 pt = vec2(uv.x - dt * skew, r.w + margin.y + dt * k);
+
+          // Validity of each direction (smooth so no seam appears where a source leaves the frame).
+          float vl = smoothstep(0.0, 0.05, pl.x);
+          float vr = 1.0 - smoothstep(0.95, 1.0, pr.x);
+          float vb = smoothstep(0.0, 0.05, pb.y);
+          float vt = 1.0 - smoothstep(0.95, 1.0, pt.y);
+
+          float wl = vl / (dl * dl + 1e-5);
+          float wr = vr / (dr * dr + 1e-5);
+          float wb = vb / (db * db + 1e-5);
+          float wt = vt / (dt * dt + 1e-5);
           float wsum = wl + wr + wb + wt;
-          if (wsum <= 0.0) {
+          if (wsum <= 1e-4) {
             return blurAt(uv, uTexelSize * 8.0);
           }
-          return (cl * wl + cr * wr + cb * wb + ct * wt) / wsum;
+
+          // Low frequencies: colours just outside each edge, blurred mostly ALONG the edge (kills
+          // streaks) and kept fully outside the zone (never samples the watermark itself).
+          vec2 sLR = vec2(uTexelSize.x * 1.5, max(zoneSize.y * 0.03, uTexelSize.y * 1.5));
+          vec2 sTB = vec2(max(zoneSize.x * 0.03, uTexelSize.x * 1.5), uTexelSize.y * 1.5);
+          vec2 off = margin + uTexelSize * 6.0;
+          vec4 base = (blurAt(vec2(r.x - off.x, uv.y), sLR) * wl
+                     + blurAt(vec2(r.z + off.x, uv.y), sLR) * wr
+                     + blurAt(vec2(uv.x, r.y - off.y), sTB) * wb
+                     + blurAt(vec2(uv.x, r.w + off.y), sTB) * wt) / wsum;
+
+          // High frequencies: real texture borrowed from the mirrored sources.
+          vec3 detail = (detailAt(pl) * wl + detailAt(pr) * wr
+                       + detailAt(pb) * wb + detailAt(pt) * wt) / wsum;
+
+          float amount = clamp(uStrength * 1.4, 0.0, 1.0);
+          return vec4(clamp(base.rgb + detail * amount, 0.0, 1.0), base.a);
         }
 
         vec4 pixelateAt(vec2 uv, vec4 r) {
