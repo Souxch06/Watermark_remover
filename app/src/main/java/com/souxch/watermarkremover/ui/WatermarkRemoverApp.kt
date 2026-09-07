@@ -122,7 +122,7 @@ fun WatermarkRemoverApp(viewModel: EditorViewModel) {
                                 onOpenItem = { openVideo(context, Uri.parse(it.uri)) },
                             )
                             Tab.LIBRARY -> LibraryScreen(
-                                items = state.library,
+                                videos = state.library,
                                 loaded = state.libraryLoaded,
                                 onDelete = viewModel::deleteFromLibrary,
                                 onRename = viewModel::renameInLibrary,

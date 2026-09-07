@@ -38,7 +38,7 @@ import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.BlurOn
 import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Grid4x4
+import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -243,7 +243,7 @@ fun EditorScreen(info: VideoInfo, frame: Bitmap?, state: EditorState, vm: Editor
                     Spacer(Modifier.height(4.dp))
                     MethodOption(RemovalMethod.INPAINT, Icons.Default.AutoFixHigh, R.string.method_inpaint, R.string.method_inpaint_desc, settings.method, vm::setMethod)
                     MethodOption(RemovalMethod.BLUR, Icons.Default.BlurOn, R.string.method_blur, R.string.method_blur_desc, settings.method, vm::setMethod)
-                    MethodOption(RemovalMethod.PIXELATE, Icons.Default.Grid4x4, R.string.method_pixelate, R.string.method_pixelate_desc, settings.method, vm::setMethod)
+                    MethodOption(RemovalMethod.PIXELATE, Icons.Default.GridOn, R.string.method_pixelate, R.string.method_pixelate_desc, settings.method, vm::setMethod)
                     MethodOption(RemovalMethod.CROP, Icons.Default.Crop, R.string.method_crop, R.string.method_crop_desc, settings.method, vm::setMethod)
                     AnimatedVisibility(settings.method == RemovalMethod.CROP && zones.size > 1) {
                         Text(stringResource(R.string.crop_needs_single_zone), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)

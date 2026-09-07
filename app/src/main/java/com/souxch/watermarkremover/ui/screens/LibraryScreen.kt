@@ -73,7 +73,7 @@ import java.io.File
 /** List of all processed videos with play / share / rename / delete actions. */
 @Composable
 fun LibraryScreen(
-    items: List<ProcessedVideo>,
+    videos: List<ProcessedVideo>,
     loaded: Boolean,
     onDelete: (ProcessedVideo) -> Unit,
     onRename: (ProcessedVideo, String) -> Unit,
@@ -82,7 +82,7 @@ fun LibraryScreen(
     var pendingDelete by remember { mutableStateOf<ProcessedVideo?>(null) }
     var pendingRename by remember { mutableStateOf<ProcessedVideo?>(null) }
 
-    if (loaded && items.isEmpty()) {
+    if (loaded && videos.isEmpty()) {
         EmptyLibrary()
         return
     }
@@ -96,13 +96,13 @@ fun LibraryScreen(
             Column(Modifier.padding(bottom = 4.dp)) {
                 Text(stringResource(R.string.library_title), style = MaterialTheme.typography.headlineSmall)
                 Text(
-                    stringResource(R.string.library_count, items.size, formatSize(context, items.sumOf { it.sizeBytes })),
+                    stringResource(R.string.library_count, videos.size, formatSize(context, videos.sumOf { it.sizeBytes })),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
-        items(items, key = { it.id }) { item ->
+        items(videos, key = { it.id }) { item ->
             LibraryCard(
                 item = item,
                 onPlay = { openVideo(context, Uri.parse(item.uri)) },

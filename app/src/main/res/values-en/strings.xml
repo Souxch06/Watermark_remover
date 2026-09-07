@@ -23,11 +23,11 @@
     <string name="recent_title">Recently processed</string>
     <string name="how_it_works">How it works</string>
     <string name="step1_title">Pick the video</string>
-    <string name="step1_desc">From the gallery or via "Share" from another app.</string>
+    <string name="step1_desc">From the gallery or via \"Share\" from another app.</string>
     <string name="step2_title">Frame the watermark</string>
     <string name="step2_desc">Move the box, tune the method and compare before / after.</string>
     <string name="step3_title">Export</string>
-    <string name="step3_desc">The video is saved to the gallery and to "My videos".</string>
+    <string name="step3_desc">The video is saved to the gallery and to \"My videos\".</string>
     <string name="about_note">100% on-device processing, no video is ever uploaded.</string>
     <string name="legal_note">Only use this tool on videos you own the rights to.</string>
 
@@ -38,7 +38,7 @@
     <string name="library_empty_message">Videos you remove a watermark from will show up here. They are also saved to Movies/Watermark Remover.</string>
     <string name="zones_badge">%1$d zones</string>
     <string name="delete_title">Delete this video?</string>
-    <string name="delete_message">"%1$s" will be removed from the library and deleted from the gallery. This cannot be undone.</string>
+    <string name="delete_message">\"%1$s\" will be removed from the library and deleted from the gallery. This cannot be undone.</string>
     <string name="rename_title">Rename video</string>
     <string name="rename_label">File name</string>
     <string name="snack_deleted">Video deleted</string>
@@ -77,7 +77,7 @@
     <string name="export_preparing">Preparing the encoder…</string>
     <string name="export_keep_open">Keep the app open while processing.</string>
     <string name="export_done_title">Watermark removed!</string>
-    <string name="export_done_message">The video has been saved to the gallery and added to "My videos".</string>
+    <string name="export_done_message">The video has been saved to the gallery and added to \"My videos\".</string>
     <string name="export_failed_title">Oops, that didn\'t work</string>
     <string name="export_another">Process another video</string>
     <string name="export_retry">Retry</string>

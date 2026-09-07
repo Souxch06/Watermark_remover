@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -39,11 +39,29 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
+      # Compiler errors are echoed as GitHub annotations (::error::) so they show up in the
+      # run summary and via the API, not only in the raw log.
       - name: Unit tests
-        run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew testDebugUnitTest --no-daemon --stacktrace --console=plain 2>&1 | tee build-test.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -E "^e: |error:|What went wrong|Caused by|FAILED|Unresolved reference" build-test.log | head -80 | sed 's/^/::error::/'
+          fi
+          exit $status
 
       - name: Build debug & release APKs
-        run: ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace --console=plain 2>&1 | tee build-apk.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -E "^e: |error:|What went wrong|Caused by|FAILED|Unresolved reference" build-apk.log | head -80 | sed 's/^/::error::/'
+          fi
+          exit $status
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
@@ -59,10 +77,12 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
-      - name: Upload test reports (on failure)
+      - name: Upload logs & reports (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-reports
-          path: app/build/reports/
+          name: build-logs
+          path: |
+            build-*.log
+            app/build/reports/
           if-no-files-found: ignore
