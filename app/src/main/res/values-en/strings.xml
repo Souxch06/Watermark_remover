@@ -74,6 +74,12 @@
     <string name="content_description_video_preview">Video preview</string>
 
     <!-- Export -->
+    <string name="quality_label">Output quality</string>
+    <string name="quality_standard">Standard</string>
+    <string name="quality_high">High</string>
+    <string name="quality_maximum">Maximum</string>
+    <string name="quality_summary">H.264 encoding at %1$s Mb/s, original resolution and frame rate preserved.</string>
+    <string name="quality_summary_with_source">H.264 encoding at %1$s Mb/s (source: %2$s Mb/s), original resolution and frame rate preserved.</string>
     <string name="export_title">Processing…</string>
     <string name="export_preparing">Preparing the encoder…</string>
     <string name="export_keep_open">Keep the app open while processing.</string>

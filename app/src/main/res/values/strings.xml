@@ -74,6 +74,12 @@
     <string name="content_description_video_preview">Aperçu de la vidéo</string>
 
     <!-- Export -->
+    <string name="quality_label">Qualité de sortie</string>
+    <string name="quality_standard">Standard</string>
+    <string name="quality_high">Haute</string>
+    <string name="quality_maximum">Maximale</string>
+    <string name="quality_summary">Encodage H.264 à %1$s Mb/s, résolution et fluidité d\'origine conservées.</string>
+    <string name="quality_summary_with_source">Encodage H.264 à %1$s Mb/s (source : %2$s Mb/s), résolution et fluidité d\'origine conservées.</string>
     <string name="export_title">Traitement en cours…</string>
     <string name="export_preparing">Préparation de l\'encodeur…</string>
     <string name="export_keep_open">Gardez l\'application ouverte pendant le traitement.</string>

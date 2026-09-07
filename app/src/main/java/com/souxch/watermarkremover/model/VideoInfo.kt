@@ -15,6 +15,10 @@ data class VideoInfo(
     val durationMs: Long,
     val mimeType: String?,
     val sizeBytes: Long,
+    /** Source video bitrate in bits per second, or 0 when unknown. */
+    val bitrate: Int = 0,
+    /** Source frame rate, or 0 when unknown. */
+    val frameRate: Float = 0f,
 ) {
     /** Width as seen by the user, once the rotation metadata has been applied. */
     val displayWidth: Int get() = if (rotationDegrees % 180 == 0) width else height

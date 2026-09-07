@@ -111,8 +111,42 @@ enum class RemovalMethod(
     val usesShader: Boolean get() = shaderId >= 0
 }
 
+/**
+ * Output quality preset. The encoder bitrate is derived from BOTH the source bitrate and a
+ * resolution-based floor, so a low-bitrate source is never made worse and a high-bitrate source
+ * keeps its detail. See [ExportQuality.targetBitrate].
+ */
+enum class ExportQuality(
+    /** Multiplier applied to the source bitrate. */
+    val sourceFactor: Float,
+    /** Bits per pixel per frame used for the resolution-based floor (H.264 High, 30 fps). */
+    val bitsPerPixel: Float,
+) {
+    STANDARD(sourceFactor = 1.0f, bitsPerPixel = 0.10f),
+    HIGH(sourceFactor = 1.5f, bitsPerPixel = 0.16f),
+    MAXIMUM(sourceFactor = 2.0f, bitsPerPixel = 0.24f);
+
+    /**
+     * Target encoder bitrate (bits/s) for a [width] x [height] video at [frameRate] fps whose
+     * source bitrate is [sourceBitrate] (0 = unknown).
+     */
+    fun targetBitrate(width: Int, height: Int, frameRate: Float, sourceBitrate: Int): Int {
+        val fps = if (frameRate > 1f) frameRate else 30f
+        val floor = (width.toLong() * height * bitsPerPixel * fps).toLong()
+        val fromSource = (sourceBitrate.toLong() * sourceFactor).toLong()
+        return maxOf(floor, fromSource).coerceIn(MIN_BITRATE, MAX_BITRATE).toInt()
+    }
+
+    companion object {
+        const val MIN_BITRATE = 2_000_000L
+        /** Above this, hardware encoders start failing; also far beyond visual transparency. */
+        const val MAX_BITRATE = 120_000_000L
+    }
+}
+
 data class RemovalSettings(
     val method: RemovalMethod = RemovalMethod.INPAINT,
+    val quality: ExportQuality = ExportQuality.HIGH,
     /** 0..1 – meaning depends on the method (blur radius, block size, inpaint smoothness). */
     val strength: Float = 0.5f,
     /** 0..1 – softness of the transition around the zone. */

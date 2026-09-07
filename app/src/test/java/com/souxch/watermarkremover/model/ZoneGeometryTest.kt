@@ -57,4 +57,26 @@ class ZoneGeometryTest {
         assertEquals(0.97f, u[2], 1e-6f)
         assertEquals(0.14f, u[3], 1e-6f)
     }
+
+    @Test
+    fun `target bitrate never goes below the source bitrate`() {
+        val src = 20_000_000
+        ExportQuality.entries.forEach { q ->
+            assertTrue(q.targetBitrate(1920, 1080, 30f, src) >= src)
+        }
+    }
+
+    @Test
+    fun `target bitrate has a resolution floor when the source is poor or unknown`() {
+        val hd = ExportQuality.HIGH.targetBitrate(1920, 1080, 30f, 0)
+        val uhd = ExportQuality.HIGH.targetBitrate(3840, 2160, 30f, 0)
+        assertTrue(hd >= 8_000_000)
+        assertTrue(uhd > hd * 3)
+        assertTrue(ExportQuality.STANDARD.targetBitrate(1280, 720, 30f, 500_000) >= ExportQuality.MIN_BITRATE)
+    }
+
+    @Test
+    fun `target bitrate is capped`() {
+        assertEquals(ExportQuality.MAX_BITRATE.toInt(), ExportQuality.MAXIMUM.targetBitrate(7680, 4320, 60f, 400_000_000))
+    }
 }

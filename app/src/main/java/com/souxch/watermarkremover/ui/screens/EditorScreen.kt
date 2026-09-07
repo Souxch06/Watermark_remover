@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.BlurOn
 import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.GridOn
+import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -72,6 +73,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.souxch.watermarkremover.R
+import com.souxch.watermarkremover.model.ExportQuality
 import com.souxch.watermarkremover.model.RemovalMethod
 import com.souxch.watermarkremover.model.VideoInfo
 import com.souxch.watermarkremover.processing.WatermarkShader
@@ -263,6 +265,48 @@ fun EditorScreen(info: VideoInfo, frame: Bitmap?, state: EditorState, vm: Editor
                             LabeledSlider(stringResource(R.string.feather_label), settings.feather, vm::setFeather)
                         }
                     }
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+
+            // ----- Output quality -----
+            SectionCard(Modifier.padding(horizontal = 16.dp)) {
+                Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.HighQuality, null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.quality_label), style = MaterialTheme.typography.titleMedium)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                        val options = ExportQuality.entries
+                        options.forEachIndexed { index, q ->
+                            SegmentedButton(
+                                selected = settings.quality == q,
+                                onClick = { vm.setQuality(q) },
+                                shape = SegmentedButtonDefaults.itemShape(index, options.size),
+                            ) {
+                                Text(
+                                    stringResource(
+                                        when (q) {
+                                            ExportQuality.STANDARD -> R.string.quality_standard
+                                            ExportQuality.HIGH -> R.string.quality_high
+                                            ExportQuality.MAXIMUM -> R.string.quality_maximum
+                                        },
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    val targetMbps = settings.quality.targetBitrate(info.displayWidth, info.displayHeight, info.frameRate, info.bitrate) / 1_000_000f
+                    val sourceMbps = info.bitrate / 1_000_000f
+                    Text(
+                        if (info.bitrate > 0) stringResource(R.string.quality_summary_with_source, "%.0f".format(targetMbps), "%.0f".format(sourceMbps))
+                        else stringResource(R.string.quality_summary, "%.0f".format(targetMbps)),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
             Spacer(Modifier.height(16.dp))

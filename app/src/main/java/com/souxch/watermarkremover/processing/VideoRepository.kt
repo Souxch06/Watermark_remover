@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import com.souxch.watermarkremover.model.VideoInfo
 import kotlinx.coroutines.Dispatchers
@@ -25,7 +26,15 @@ class VideoRepository(private val context: Context) {
             val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
             val mime = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_MIMETYPE)
             val (name, size) = queryNameAndSize(uri)
-            VideoInfo(uri, name, width, height, ((rotation % 360) + 360) % 360, duration, mime, size)
+            var bitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull() ?: 0
+            if (bitrate <= 0 && size > 0 && duration > 0) {
+                // Container did not expose it: derive an overall bitrate from size / duration.
+                bitrate = (size * 8L * 1000L / duration).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            }
+            val frameRate = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull() ?: 0f
+            } else 0f
+            VideoInfo(uri, name, width, height, ((rotation % 360) + 360) % 360, duration, mime, size, bitrate, frameRate)
         } finally {
             retriever.release()
         }
