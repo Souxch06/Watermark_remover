@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: read
+  checks: write
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -39,8 +40,8 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      # Compiler errors are echoed as GitHub annotations (::error::) so they show up in the
-      # run summary and via the API, not only in the raw log.
+      # Compiler errors are copied into the job summary (readable through the API) and
+      # emitted as annotations, so failures can be diagnosed without downloading logs.
       - name: Unit tests
         shell: bash
         run: |
@@ -48,7 +49,8 @@ jobs:
           ./gradlew testDebugUnitTest --no-daemon --stacktrace --console=plain 2>&1 | tee build-test.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            grep -E "^e: |error:|What went wrong|Caused by|FAILED|Unresolved reference" build-test.log | head -80 | sed 's/^/::error::/'
+            { echo "### Unit tests failed"; echo '```'; grep -E "^e: |^w: |error:|What went wrong|Caused by|FAILED|Unresolved reference|Execution failed|Could not" build-test.log | head -120; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            grep -E "^e: |What went wrong|Execution failed" build-test.log | head -50 | sed 's/^/::error::/'
           fi
           exit $status
 
@@ -59,9 +61,31 @@ jobs:
           ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace --console=plain 2>&1 | tee build-apk.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            grep -E "^e: |error:|What went wrong|Caused by|FAILED|Unresolved reference" build-apk.log | head -80 | sed 's/^/::error::/'
+            { echo "### APK build failed"; echo '```'; grep -E "^e: |^w: |error:|What went wrong|Caused by|FAILED|Unresolved reference|Execution failed|Could not" build-apk.log | head -120; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            grep -E "^e: |What went wrong|Execution failed" build-apk.log | head -50 | sed 's/^/::error::/'
           fi
           exit $status
+
+      # Publishes the error digest as a check-run so it can be fetched via the REST API.
+      - name: Publish error digest
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let out = '';
+            for (const f of ['build-test.log', 'build-apk.log']) {
+              if (!fs.existsSync(f)) continue;
+              const lines = fs.readFileSync(f, 'utf8').split('\n')
+                .filter(l => /^e: |^w: |error:|What went wrong|Caused by|FAILED|Unresolved reference|Execution failed|Could not/.test(l));
+              out += `## ${f}\n` + lines.slice(0, 150).join('\n') + '\n\n';
+            }
+            if (!out) out = 'No matching error lines captured.';
+            await github.rest.checks.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              name: 'build-errors', head_sha: context.sha, status: 'completed', conclusion: 'neutral',
+              output: { title: 'Build error digest', summary: out.slice(0, 60000) },
+            });
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
