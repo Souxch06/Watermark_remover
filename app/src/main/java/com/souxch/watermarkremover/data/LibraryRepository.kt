@@ -25,7 +25,7 @@ import java.io.IOException
  * Persistent library of processed videos.
  *
  * - The video files live in the public gallery (`Movies/Watermark Remover`) via MediaStore.
- * - The index (`files/library/index.json`) and the thumbnails (`files/library/thumbs/*.jpg`)
+ * - The index (`files/library/index.json`) and the thumbnails (`files/library/thumbs/<id>.jpg`)
  *   live in app-private storage. JSON + atomic file replace keeps the dependency footprint at
  *   zero while being robust to crashes mid-write.
  * - On load, entries whose gallery file was deleted by the user (from another app) are pruned.
