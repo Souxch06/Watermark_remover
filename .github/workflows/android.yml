@@ -77,9 +77,13 @@ jobs:
             for (const f of ['build-test.log', 'build-apk.log']) {
               if (!fs.existsSync(f)) continue;
               const lines = fs.readFileSync(f, 'utf8').split('\n')
-                .filter(l => /^e: |^w: |error:|What went wrong|Caused by|FAILED|Unresolved reference|Execution failed|Could not/.test(l));
+                .filter(l => /^e: |^w: |error:|Error:|What went wrong|Caused by|FAILED|Unresolved reference|Execution failed|Could not|Lint found|\[[A-Za-z]+\]/.test(l));
               out += `## ${f}\n` + lines.slice(0, 150).join('\n') + '\n\n';
             }
+            // Lint text reports (lintVital writes them under app/build/intermediates or reports)
+            const path = require('path');
+            const walk = (d, acc) => { if (!fs.existsSync(d)) return acc; for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p, acc); else if (/lint.*\.txt$/.test(e.name)) acc.push(p); } return acc; };
+            for (const p of walk('app/build', [])) { out += `## ${p}\n` + fs.readFileSync(p, 'utf8').slice(0, 8000) + '\n\n'; }
             if (!out) out = 'No matching error lines captured.';
             await github.rest.checks.create({
               owner: context.repo.owner, repo: context.repo.repo,

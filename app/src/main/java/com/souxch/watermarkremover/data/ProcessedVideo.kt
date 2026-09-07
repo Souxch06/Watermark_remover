@@ -71,7 +71,7 @@ data class ProcessedVideo(
                 sizeBytes = o.optLong(KEY_SIZE, 0L),
                 method = runCatching { RemovalMethod.valueOf(o.optString(KEY_METHOD)) }.getOrDefault(RemovalMethod.INPAINT),
                 zoneCount = o.optInt(KEY_ZONES, 1),
-                thumbnailPath = if (o.isNull(KEY_THUMB)) null else o.optString(KEY_THUMB, null),
+                thumbnailPath = if (o.isNull(KEY_THUMB)) null else o.optString(KEY_THUMB, "").ifBlank { null },
             )
         } catch (e: Exception) {
             null

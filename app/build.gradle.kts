@@ -82,6 +82,10 @@ android {
         disable += "MissingTranslation"
         // Media3 Transformer/Effect are @UnstableApi; we accept that (pinned version in the catalog).
         disable += "UnsafeOptInUsageError"
+        textReport = true
+        textOutput = file("build/reports/lint-results.txt")
+        htmlReport = false
+        xmlReport = false
     }
 
     packaging {
