@@ -188,9 +188,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             // reduced to a size the UI can display.
             val rendered = runCatching {
                 val full = previewRenderer.render(frame, key.zones, key.settings, key.layer)
-                withContext(Dispatchers.Default) {
-                    repository.displayCopy(full, DISPLAY_DIMENSION).also { if (it !== full && full !== frame) full.recycle() }
-                }
+                withContext(Dispatchers.Default) { repository.displayCopy(full, DISPLAY_DIMENSION) }
             }.getOrNull()
             _state.update { s ->
                 // Ignore stale results if the editor frame changed meanwhile.

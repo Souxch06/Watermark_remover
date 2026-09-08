@@ -25,9 +25,8 @@ import kotlin.math.sin
  *     the projection of the relief on the logo colour;
  *  4. build per-pixel `c = a*W` and `a`, and check on the sample frames that the inversion
  *     `I = (J - c) / (1 - a)` really removes the logo; parts that are opaque or that fail the
- *     check are flagged for spatial filling instead;
- *  5. keep a compact "signature" of the logo (its strongest gradients) so that, at render time,
- *     every frame can be tested for the presence of the logo before it is inverted.
+ *     check are flagged for spatial filling instead.
+ * The per-frame work (presence test, inversion, temporal propagation) is done by [RegionRestorer].
  *
  * Everything is pure Kotlin (no Android types) so it runs on the JVM tests. All arrays are
  * row-major, `[y * width + x]`; frames are packed RGB bytes, maps are floats in 0..1.
@@ -38,10 +37,10 @@ object WatermarkAnalyzer {
     const val MAX_INVERT_ALPHA = 0.8f
     /** A watermark layer is only trusted if this many frames were analysed. */
     const val MIN_FRAMES = 6
+    /** Smallest subset of frames on which the logo may be analysed when it is not always there. */
+    const val MIN_PRESENT_FRAMES = 4
     /** Largest region analysed (pixels); bigger zones fall back to the spatial reconstruction. */
     const val MAX_REGION_PIXELS = 300_000
-    /** Number of gradient taps kept in the presence signature. */
-    const val MAX_SIGNATURE_TAPS = 1500
 
     /** Frames of the analysed region: each `width*height*3` RGB bytes (row-major). */
     class Frames(val width: Int, val height: Int, val frames: List<ByteArray>)
@@ -53,8 +52,6 @@ object WatermarkAnalyzer {
      *  - [fill]    : true where the pixel must be re-synthesised from its neighbours instead
      *  - [distances]: for fill pixels, distance (in pixels) to the nearest non-fill pixel to the
      *                left / right / top / bottom (255 = none in that direction)
-     *  - [signaturePairs] / [signatureDelta]: pairs of neighbouring pixel indices and the relief
-     *                difference between them, used by [presenceScore]
      */
     class Layer(
         val width: Int,
@@ -63,8 +60,6 @@ object WatermarkAnalyzer {
         val alpha: FloatArray,
         val fill: BooleanArray,
         val distances: ByteArray,
-        val signaturePairs: IntArray,
-        val signatureDelta: FloatArray,
         val stats: Stats,
     ) {
         val hasWatermark: Boolean get() = stats.maskPixels > 0
@@ -86,7 +81,7 @@ object WatermarkAnalyzer {
     private const val K_CONSISTENT = 2.0f
     private const val TAU_RELIEF = 0.05f
     private const val MIN_COMPONENT = 6
-    private const val MIN_MOTION = 0.008f
+    private const val MIN_MOTION = 0.012f
     private const val RING = 4
     private const val DILATE = 1
     private const val REFINE_PASSES = 2
@@ -104,7 +99,7 @@ object WatermarkAnalyzer {
         if (input.frames.size < MIN_FRAMES || w < 2 * RING + 4 || h < 2 * RING + 4 || w * h > MAX_REGION_PIXELS) return null
         val px = w * h
         val empty = { reason: String, motion: Float, present: Int ->
-            Layer(w, h, FloatArray(px * 3), FloatArray(px), BooleanArray(px), ByteArray(px * 4), IntArray(0), FloatArray(0),
+            Layer(w, h, FloatArray(px * 3), FloatArray(px), BooleanArray(px), ByteArray(px * 4),
                 Stats(input.frames.size, present, motion, 0, 0, 0, 0, reason))
         }
 
@@ -112,6 +107,7 @@ object WatermarkAnalyzer {
         val presentIdx = selectPresentFrames(input.frames, w, h)
         val frames = presentIdx.map { input.frames[it] }
         val n = frames.size
+        if (n < MIN_PRESENT_FRAMES) return null
 
         // --- temporal median / spread of the pixel values -----------------------------------
         val median = FloatArray(px * 3)
@@ -127,12 +123,40 @@ object WatermarkAnalyzer {
             }
             spread[i] = s / 3f
         }
-        // Motion measured on the ring around the zone (the logo never lives there).
-        val ringValues = ArrayList<Float>()
+        // Motion measured on the ring around the zone (the logo never lives there): temporal
+        // spread of the pixels once each frame's global brightness is normalised, so that a still
+        // picture with exposure changes / fades is still recognised as still.
+        val ringIdx = ArrayList<Int>()
         for (y in 0 until h) for (x in 0 until w) {
-            if (x < RING || x >= w - RING || y < RING || y >= h - RING) ringValues.add(spread[y * w + x])
+            if (x < RING || x >= w - RING || y < RING || y >= h - RING) ringIdx.add(y * w + x)
         }
-        val motion = medianOf(ringValues.toFloatArray(), ringValues.size)
+        // Per frame gain / offset of the ring w.r.t. the temporal median (exposure model).
+        val ringGain = FloatArray(n)
+        val ringOffset = FloatArray(n)
+        for (t in 0 until n) {
+            var sx = 0.0; var sy = 0.0; var sxx = 0.0; var sxy = 0.0
+            for (i in ringIdx) for (c in 0 until 3) {
+                val x = median[i * 3 + c].toDouble()
+                val y = v(frames[t], i * 3 + c).toDouble()
+                sx += x; sy += y; sxx += x * x; sxy += x * y
+            }
+            val cnt = 3.0 * ringIdx.size
+            val varX = sxx / cnt - (sx / cnt) * (sx / cnt)
+            val g = if (varX > 1e-5) ((sxy / cnt - (sx / cnt) * (sy / cnt)) / varX).coerceIn(0.3, 3.0) else 1.0
+            ringGain[t] = g.toFloat()
+            ringOffset[t] = ((sy - g * sx) / cnt).toFloat()
+        }
+        val ringValues = FloatArray(ringIdx.size)
+        val tmpRing = FloatArray(n)
+        ringIdx.forEachIndexed { k, i ->
+            var s = 0f
+            for (c in 0 until 3) {
+                for (t in 0 until n) tmpRing[t] = v(frames[t], i * 3 + c) - (ringGain[t] * median[i * 3 + c] + ringOffset[t])
+                s += medianMad(tmpRing, n).second
+            }
+            ringValues[k] = s / 3f
+        }
+        val motion = medianOf(ringValues, ringValues.size)
         if (motion < MIN_MOTION) return empty("static", motion, n)
 
         // --- 1. consistent median gradients -> divergence -----------------------------------
@@ -247,56 +271,12 @@ object WatermarkAnalyzer {
         }
         for (i in 0 until px) if (fill[i]) { alpha[i] = 0f; colour[i * 3] = 0f; colour[i * 3 + 1] = 0f; colour[i * 3 + 2] = 0f }
 
-        // --- 5. presence signature ------------------------------------------------------------
-        val (pairs, delta) = signature(gx, gy, w, h)
-
         val distances = fillDistances(fill, w, h)
         val maskCount = mask.count { it }
         val filled = fill.count { it }
         val invertedCount = alpha.count { it > 0f }
-        return Layer(w, h, colour, alpha, fill, distances, pairs, delta,
+        return Layer(w, h, colour, alpha, fill, distances,
             Stats(input.frames.size, n, motion, maskCount, invertedCount, filled, componentCount, "ok"))
-    }
-
-    /**
-     * Presence of the logo in one frame of the region: slope of the frame's gradients on the
-     * signature gradients (~1 when the logo is there, ~0 when it is not).
-     *
-     * @param rgba RGBA bytes of the region (4 bytes per pixel, rows of `width` pixels, tightly packed)
-     * @param flipY true if row 0 of [rgba] is the BOTTOM row of the region (GL read-back)
-     */
-    fun presenceScore(
-        pairs: IntArray,
-        delta: FloatArray,
-        width: Int,
-        height: Int,
-        rgba: ByteArray,
-        flipY: Boolean,
-    ): Float {
-        if (pairs.isEmpty()) return 1f
-        var num = 0.0
-        var den = 0.0
-        val taps = pairs.size / 2
-        for (k in 0 until taps) {
-            val p = pairs[2 * k]
-            val q = pairs[2 * k + 1]
-            val op = offset(p, width, height, flipY)
-            val oq = offset(q, width, height, flipY)
-            for (c in 0 until 3) {
-                val dj = ((rgba[oq + c].toInt() and 0xFF) - (rgba[op + c].toInt() and 0xFF)) * INV255
-                val dv = delta[3 * k + c]
-                num += dj * dv
-                den += dv * dv
-            }
-        }
-        return if (den > 0.0) (num / den).toFloat() else 1f
-    }
-
-    private fun offset(p: Int, width: Int, height: Int, flipY: Boolean): Int {
-        val row = p / width
-        val col = p - row * width
-        val r = if (flipY) height - 1 - row else row
-        return (r * width + col) * 4
     }
 
     // ------------------------------------------------------------------------------------------
@@ -311,52 +291,63 @@ object WatermarkAnalyzer {
     fun selectPresentFrames(frames: List<ByteArray>, w: Int, h: Int): List<Int> {
         val all = frames.indices.toList()
         val total = frames.size
-        if (total < 2 * MIN_FRAMES) return all
+        if (total < MIN_FRAMES + 2) return all
         val px = w * h
-        val gmx = FloatArray(px * 3)
-        val gmy = FloatArray(px * 3)
-        for (fr in frames) {
-            for (y in 0 until h) for (x in 0 until w) {
-                val i = y * w + x
-                if (x + 1 < w) for (c in 0 until 3) gmx[i * 3 + c] += v(fr, (i + 1) * 3 + c) - v(fr, i * 3 + c)
-                if (y + 1 < h) for (c in 0 until 3) gmy[i * 3 + c] += v(fr, (i + w) * 3 + c) - v(fr, i * 3 + c)
+        // Per-pixel MEDIAN gradient over all frames: the logo's edges survive it (present in at
+        // least half of the frames), the picture's edges do not (unless the picture is static,
+        // in which case every frame scores alike and nothing is excluded).
+        val medX = FloatArray(px * 3)
+        val medY = FloatArray(px * 3)
+        val tmp = FloatArray(total)
+        for (y in 0 until h) for (x in 0 until w) {
+            val i = y * w + x
+            for (c in 0 until 3) {
+                if (x + 1 < w) {
+                    for (t in 0 until total) tmp[t] = v(frames[t], (i + 1) * 3 + c) - v(frames[t], i * 3 + c)
+                    medX[i * 3 + c] = medianOf(tmp, total)
+                }
+                if (y + 1 < h) {
+                    for (t in 0 until total) tmp[t] = v(frames[t], (i + w) * 3 + c) - v(frames[t], i * 3 + c)
+                    medY[i * 3 + c] = medianOf(tmp, total)
+                }
             }
         }
-        val inv = 1f / total
-        for (j in gmx.indices) { gmx[j] *= inv; gmy[j] *= inv }
-        // Taps: locations with a noticeable mean gradient.
+        val magnitudes = FloatArray(px * 2)
+        for (i in 0 until px) {
+            magnitudes[i] = max(abs(medX[i * 3]), max(abs(medX[i * 3 + 1]), abs(medX[i * 3 + 2])))
+            magnitudes[px + i] = max(abs(medY[i * 3]), max(abs(medY[i * 3 + 1]), abs(medY[i * 3 + 2])))
+        }
+        val threshold = max(percentile(magnitudes, 0.98f), 0.02f)
         val tapsX = ArrayList<Int>()
         val tapsY = ArrayList<Int>()
         var den = 0.0
         for (i in 0 until px) {
-            if (max(abs(gmx[i * 3]), max(abs(gmx[i * 3 + 1]), abs(gmx[i * 3 + 2]))) > 0.01f) {
-                tapsX.add(i); for (c in 0 until 3) den += gmx[i * 3 + c] * gmx[i * 3 + c]
-            }
-            if (max(abs(gmy[i * 3]), max(abs(gmy[i * 3 + 1]), abs(gmy[i * 3 + 2]))) > 0.01f) {
-                tapsY.add(i); for (c in 0 until 3) den += gmy[i * 3 + c] * gmy[i * 3 + c]
-            }
+            if (magnitudes[i] >= threshold) { tapsX.add(i); for (c in 0 until 3) den += medX[i * 3 + c] * medX[i * 3 + c] }
+            if (magnitudes[px + i] >= threshold) { tapsY.add(i); for (c in 0 until 3) den += medY[i * 3 + c] * medY[i * 3 + c] }
         }
         if (den <= 1e-6 || tapsX.size + tapsY.size < 20) return all
+        // Score of each frame = regression of its gradients on the median ones (1 = logo there).
         val scores = FloatArray(total)
         for (t in 0 until total) {
             val fr = frames[t]
             var num = 0.0
-            for (i in tapsX) for (c in 0 until 3) num += (v(fr, (i + 1) * 3 + c) - v(fr, i * 3 + c)) * gmx[i * 3 + c]
-            for (i in tapsY) for (c in 0 until 3) num += (v(fr, (i + w) * 3 + c) - v(fr, i * 3 + c)) * gmy[i * 3 + c]
+            for (i in tapsX) for (c in 0 until 3) num += (v(fr, (i + 1) * 3 + c) - v(fr, i * 3 + c)) * medX[i * 3 + c]
+            for (i in tapsY) for (c in 0 until 3) num += (v(fr, (i + w) * 3 + c) - v(fr, i * 3 + c)) * medY[i * 3 + c]
             scores[t] = (num / den).toFloat()
         }
         val sorted = scores.copyOf().also { it.sort() }
         val top = sorted.last()
         if (top <= 0f) return all
+        // Split at the largest gap of the sorted scores, when clearly bimodal.
         var bestGap = 0f
         var bestK = -1
         for (k in 0 until total - 1) {
             val gap = sorted[k + 1] - sorted[k]
-            if (gap > bestGap && total - 1 - k >= MIN_FRAMES) { bestGap = gap; bestK = k }
+            if (gap > bestGap && total - 1 - k >= MIN_PRESENT_FRAMES) { bestGap = gap; bestK = k }
         }
         if (bestK < 0 || bestGap < 0.4f * top) return all
-        val threshold = sorted[bestK]
-        return all.filter { scores[it] > threshold }
+        val cut = sorted[bestK]
+        return all.filter { scores[it] > cut }
     }
 
     /** Median of the per-frame gradients, kept only when consistent across frames. */
@@ -465,35 +456,6 @@ object WatermarkAnalyzer {
             }
             if (maxAbs > significance * (madSum / 3f)) for (c in 0 until 3) out[i * 3 + c] = med[c]
         }
-    }
-
-    /** Strongest consistent gradients -> (pairs, deltas). */
-    private fun signature(gx: FloatArray, gy: FloatArray, w: Int, h: Int): Pair<IntArray, FloatArray> {
-        val px = w * h
-        data class Tap(val mag: Float, val p: Int, val q: Int, val src: FloatArray)
-        val taps = ArrayList<Tap>()
-        for (y in 0 until h) for (x in 0 until w) {
-            val i = y * w + x
-            if (x + 1 < w) {
-                val m = max(abs(gx[i * 3]), max(abs(gx[i * 3 + 1]), abs(gx[i * 3 + 2])))
-                if (m > 0f) taps.add(Tap(m, i, i + 1, gx))
-            }
-            if (y + 1 < h) {
-                val m = max(abs(gy[i * 3]), max(abs(gy[i * 3 + 1]), abs(gy[i * 3 + 2])))
-                if (m > 0f) taps.add(Tap(m, i, i + w, gy))
-            }
-        }
-        taps.sortByDescending { it.mag }
-        val kept = taps.take(MAX_SIGNATURE_TAPS)
-        val pairs = IntArray(kept.size * 2)
-        val delta = FloatArray(kept.size * 3)
-        kept.forEachIndexed { k, t ->
-            pairs[2 * k] = t.p
-            pairs[2 * k + 1] = t.q
-            for (c in 0 until 3) delta[3 * k + c] = t.src[t.p * 3 + c]
-        }
-        if (px == 0) return IntArray(0) to FloatArray(0)
-        return pairs to delta
     }
 
     private fun regressionAlpha(median: FloatArray, background: FloatArray, core: List<Int>): Float {

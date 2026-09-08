@@ -148,108 +148,128 @@ class WatermarkLayerBuilder(private val context: Context) {
 }
 
 /**
- * Reads back the analysed regions of the frame currently bound to a framebuffer and tells, for
- * each of them, whether the logo is there. Some apps alternate the position of their watermark
- * during the video: frames without the logo must not be "un-blended" or a negative ghost appears.
+ * Per-frame restoration on the GL thread: reads the analysed regions of the current frame back
+ * from the bound framebuffer, restores them on the CPU ([RegionRestorer]) and uploads the result
+ * as the patch atlas sampled by the shader. One instance per export / preview render.
  */
-class LayerPresence(private val layer: WatermarkLayer, private val frameHeight: Int) {
-    private val buffers = HashMap<Int, ByteBuffer>()
-    private val bytes = HashMap<Int, ByteArray>()
+class LayerPatcher(private val layer: WatermarkLayer) {
+    private val restorers = layer.newRestorers()
+    private val atlas = ByteArray(layer.atlasWidth * layer.atlasHeight * 4)
+    private val atlasBuffer: ByteBuffer = ByteBuffer.allocateDirect(atlas.size).order(ByteOrder.nativeOrder())
+    private val regionBuffers = HashMap<Int, ByteBuffer>()
+    private val regionBytes = HashMap<Int, ByteArray>()
+    var textureId = 0
+        private set
 
-    /**
-     * Must be called with the source frame bound as the READ framebuffer (GL row 0 = bottom).
-     * Returns the regions holding the logo; every region when the layer has no signature.
-     */
-    fun present(): Set<Int> {
-        if (!layer.hasSignature) return layer.regions.map { it.zoneId }.toSet()
-        val result = HashSet<Int>()
-        for (region in layer.regions) {
-            if (region.stats.maskPixels == 0) continue
-            val size = region.width * region.height * 4
-            val buffer = buffers.getOrPut(region.zoneId) { ByteBuffer.allocateDirect(size).order(ByteOrder.nativeOrder()) }
-            val array = bytes.getOrPut(region.zoneId) { ByteArray(size) }
-            buffer.rewind()
-            // GL rows start at the bottom: region top row `top` is GL row frameHeight - top - height.
-            GLES20.glPixelStorei(GLES20.GL_PACK_ALIGNMENT, 1)
-            GLES20.glReadPixels(
-                region.left, frameHeight - region.top - region.height, region.width, region.height,
-                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer,
-            )
-            GLES20.glPixelStorei(GLES20.GL_PACK_ALIGNMENT, 4)
-            buffer.rewind()
-            buffer.get(array)
-            if (region.presence(array, flipY = true) >= WatermarkLayer.PRESENCE_THRESHOLD) result.add(region.zoneId)
-        }
-        return result
-    }
+    val isEmpty: Boolean get() = restorers.isEmpty()
 
-    companion object {
-        /** Same test on a decoded frame (row 0 = top), for the preview. */
-        fun fromBitmap(layer: WatermarkLayer, frame: Bitmap): Set<Int> {
-            if (!layer.hasSignature) return layer.regions.map { it.zoneId }.toSet()
-            val result = HashSet<Int>()
-            for (region in layer.regions) {
-                if (region.stats.maskPixels == 0) continue
-                if (region.left + region.width > frame.width || region.top + region.height > frame.height) continue
-                val pixels = IntArray(region.width * region.height)
-                frame.getPixels(pixels, 0, region.width, region.left, region.top, region.width, region.height)
-                val rgba = ByteArray(pixels.size * 4)
-                for (i in pixels.indices) {
-                    val p = pixels[i]
-                    rgba[i * 4] = (p shr 16).toByte()
-                    rgba[i * 4 + 1] = (p shr 8).toByte()
-                    rgba[i * 4 + 2] = p.toByte()
-                    rgba[i * 4 + 3] = -1
-                }
-                if (region.presence(rgba, flipY = false) >= WatermarkLayer.PRESENCE_THRESHOLD) result.add(region.zoneId)
-            }
-            return result
-        }
-    }
-}
-
-/** GL side of [WatermarkLayer]: uploads the atlas as an RGBA8 texture (nearest filtering). */
-object GlLayerTexture {
-
-    fun upload(layer: WatermarkLayer): Int {
+    /** Creates the atlas texture (call on the GL thread once the context is current). */
+    fun createTexture() {
+        if (textureId != 0) return
         val ids = IntArray(1)
         GLES20.glGenTextures(1, ids, 0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ids[0])
+        textureId = ids[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 1)
-        val buffer = ByteBuffer.allocateDirect(layer.atlas.size).order(ByteOrder.nativeOrder())
-        buffer.put(layer.atlas).rewind()
-        GLES20.glTexImage2D(
-            GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, layer.atlasWidth, layer.atlasHeight, 0,
-            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer,
-        )
-        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 4)
-        GlHelpers.checkGlError("layer texImage2D")
+        GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, layer.atlasWidth, layer.atlasHeight, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
-        return ids[0]
+        GlHelpers.checkGlError("patch texture")
     }
 
+    /** Forgets the temporal state (seek / new clip). */
+    fun reset() = restorers.values.forEach { it.reset() }
+
     /**
-     * Sets every layer uniform of [program]; binds the texture on unit 1.
-     * @param present which regions hold the logo in the frame being drawn (others fall back to
-     *   the spatial reconstruction)
+     * Restores the regions of the frame bound to the READ framebuffer and uploads the atlas.
+     * @param flipY true when framebuffer row 0 is the bottom of the picture (GL textures);
+     *   false when it is the top (bitmap uploaded as-is, preview path)
      */
-    fun bind(
-        program: Int,
-        textureId: Int,
-        layer: WatermarkLayer?,
-        zones: List<WatermarkZone>,
-        yUp: Boolean,
-        present: (WatermarkLayer.Region) -> Boolean = { true },
-    ) {
+    fun update(frameHeight: Int, flipY: Boolean) {
+        if (textureId == 0) createTexture()
+        GLES20.glPixelStorei(GLES20.GL_PACK_ALIGNMENT, 1)
+        for (region in layer.regions) {
+            val restorer = restorers[region.zoneId] ?: continue
+            val size = region.width * region.height * 4
+            val buffer = regionBuffers.getOrPut(region.zoneId) { ByteBuffer.allocateDirect(size).order(ByteOrder.nativeOrder()) }
+            val bytes = regionBytes.getOrPut(region.zoneId) { ByteArray(size) }
+            buffer.rewind()
+            val glRow = if (flipY) frameHeight - region.top - region.height else region.top
+            GLES20.glReadPixels(region.left, glRow, region.width, region.height, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer)
+            buffer.rewind()
+            buffer.get(bytes)
+            restorer.process(bytes, flipY, bytes)
+            // Copy the restored region (display row order) into its atlas block.
+            for (y in 0 until region.height) {
+                System.arraycopy(bytes, y * region.width * 4, atlas, ((region.atlasRow + y) * layer.atlasWidth) * 4, region.width * 4)
+            }
+        }
+        GLES20.glPixelStorei(GLES20.GL_PACK_ALIGNMENT, 4)
+        atlasBuffer.rewind()
+        atlasBuffer.put(atlas).rewind()
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 1)
+        GLES20.glTexSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, layer.atlasWidth, layer.atlasHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, atlasBuffer)
+        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 4)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GlHelpers.checkGlError("patch upload")
+    }
+
+    /** Same restoration from a decoded bitmap (row 0 = top) instead of a framebuffer. */
+    fun update(frame: Bitmap) {
+        if (textureId == 0) createTexture()
+        for (region in layer.regions) {
+            val restorer = restorers[region.zoneId] ?: continue
+            if (region.left + region.width > frame.width || region.top + region.height > frame.height) continue
+            val size = region.width * region.height * 4
+            val bytes = regionBytes.getOrPut(region.zoneId) { ByteArray(size) }
+            val pixels = IntArray(region.width * region.height)
+            frame.getPixels(pixels, 0, region.width, region.left, region.top, region.width, region.height)
+            for (i in pixels.indices) {
+                val p = pixels[i]
+                bytes[i * 4] = (p shr 16).toByte()
+                bytes[i * 4 + 1] = (p shr 8).toByte()
+                bytes[i * 4 + 2] = p.toByte()
+                bytes[i * 4 + 3] = -1
+            }
+            restorer.process(bytes, false, bytes)
+            for (y in 0 until region.height) {
+                System.arraycopy(bytes, y * region.width * 4, atlas, ((region.atlasRow + y) * layer.atlasWidth) * 4, region.width * 4)
+            }
+        }
+        atlasBuffer.rewind()
+        atlasBuffer.put(atlas).rewind()
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 1)
+        GLES20.glTexSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, layer.atlasWidth, layer.atlasHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, atlasBuffer)
+        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 4)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GlHelpers.checkGlError("patch upload")
+    }
+
+    /** Binds the atlas on unit 1 and sets the layer uniforms of [program]. */
+    fun bind(program: Int, zones: List<WatermarkZone>, yUp: Boolean) {
+        GlLayerTexture.bind(program, textureId, layer, zones, yUp)
+    }
+
+    fun release() {
+        GlHelpers.deleteTexture(textureId)
+        textureId = 0
+    }
+}
+
+/** GL side of [WatermarkLayer]: layer uniforms + placeholder texture. */
+object GlLayerTexture {
+
+    /** Sets every layer uniform of [program]; binds [textureId] on unit 1. */
+    fun bind(program: Int, textureId: Int, layer: WatermarkLayer?, zones: List<WatermarkZone>, yUp: Boolean) {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(program, WatermarkShader.U_LAYER_SAMPLER), 1)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        val rects = layer?.rectUniforms(zones, yUp, present) ?: FloatArray(WatermarkShader.MAX_ZONES * 4)
+        val rects = layer?.rectUniforms(zones, yUp) ?: FloatArray(WatermarkShader.MAX_ZONES * 4)
         val offsets = layer?.offsetUniforms(zones) ?: FloatArray(WatermarkShader.MAX_ZONES)
         val scale = layer?.scaleUniform(yUp) ?: floatArrayOf(1f, 1f)
         GLES20.glUniform4fv(GLES20.glGetUniformLocation(program, WatermarkShader.U_LAYER_RECT), WatermarkShader.MAX_ZONES, rects, 0)

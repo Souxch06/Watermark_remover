@@ -129,12 +129,23 @@ fun EditorScreen(info: VideoInfo, frame: Bitmap?, state: EditorState, vm: Editor
                     .background(Color.Black).aspectRatio(info.aspectRatio),
                 contentAlignment = Alignment.Center,
             ) {
-                val displayed = if (showProcessed) (state.previewFrame ?: frame) else frame
-                Crossfade(targetState = displayed, label = "preview") { bmp ->
-                    if (bmp != null) {
+                // The original frame is always drawn underneath, so the video never disappears
+                // (a failed / pending render or a bitmap the GPU cannot display must not leave
+                // the user with a black box while placing the zones).
+                if (frame != null) {
+                    Image(
+                        frame.asImageBitmap(),
+                        stringResource(R.string.content_description_video_preview),
+                        Modifier.fillMaxSize(),
+                        contentScale = ContentScale.FillBounds,
+                    )
+                }
+                val processed = state.previewFrame
+                Crossfade(targetState = if (showProcessed) processed else null, label = "preview") { bmp ->
+                    if (bmp != null && !bmp.isRecycled) {
                         Image(
                             bmp.asImageBitmap(),
-                            stringResource(R.string.content_description_video_preview),
+                            null,
                             Modifier.fillMaxSize(),
                             contentScale = ContentScale.FillBounds,
                         )

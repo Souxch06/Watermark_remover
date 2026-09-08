@@ -86,6 +86,7 @@ class PreviewRenderer {
             val tex = IntArray(1)
             GLES20.glGenTextures(1, tex, 0)
             var layerTex = 0
+            var patcher: LayerPatcher? = null
             try {
                 GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[0])
                 GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
@@ -111,10 +112,15 @@ class PreviewRenderer {
                 GLES20.glUniform1i(loc(program, WatermarkShader.U_METHOD), WatermarkShader.methodId(settings, layer))
                 GLES20.glUniform1f(loc(program, WatermarkShader.U_STRENGTH), settings.strength)
                 GLES20.glUniform1f(loc(program, WatermarkShader.U_FEATHER), WatermarkShader.featherTextureUnits(settings, width, height))
-                layerTex = if (layer != null) GlLayerTexture.upload(layer) else GlLayerTexture.uploadEmpty()
-                // Zones whose logo is not in this frame are left untouched (see LayerPresence).
-                val present = layer?.let { LayerPresence.fromBitmap(it, source) }
-                GlLayerTexture.bind(program, layerTex, layer, zones, yUp = false) { present == null || it.zoneId in present }
+                if (layer != null && layer.hasWatermark) {
+                    // Restore the analysed regions of this frame on the CPU and paste them.
+                    val created = LayerPatcher(layer).also { it.update(source) }
+                    patcher = created
+                    created.bind(program, zones, yUp = false)
+                } else {
+                    layerTex = GlLayerTexture.uploadEmpty()
+                    GlLayerTexture.bind(program, layerTex, null, zones, yUp = false)
+                }
 
                 val aPos = GLES20.glGetAttribLocation(program, WatermarkShader.A_FRAME_POSITION)
                 val quad = GlHelpers.createQuadBuffer()
@@ -135,6 +141,7 @@ class PreviewRenderer {
             } finally {
                 GLES20.glDeleteTextures(1, tex, 0)
                 GlHelpers.deleteTexture(layerTex)
+                patcher?.release()
                 GLES20.glDeleteProgram(program)
             }
         }

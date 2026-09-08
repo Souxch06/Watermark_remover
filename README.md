@@ -33,14 +33,19 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   gradients sont identiques d'une image à l'autre. En prenant la médiane temporelle des gradients
   puis en l'intégrant (équation de Poisson), on obtient le relief exact du logo (couleur × opacité)
   et un masque au pixel près. Chaque pixel semi-transparent est alors **inversé**
-  (`I = (J − a·W) / (1 − a)`) : ce qui apparaît est l'image d'origine, pas une copie. Les parties
-  opaques du logo (et les vidéos immobiles, où rien n'est récupérable) sont reconstruites depuis les
-  pixels propres voisins. Une passe de raffinement mesure ensuite le « fantôme » qui subsisterait
-  après inversion (gradients résiduels médians des images inversées) et le réintègre dans le calque :
-  plus de traces pâles du logo. Enfin une signature du logo est conservée : à l'export, chaque image
-  est testée et celles où le logo est absent (filigrane qui change de place) ne sont pas touchées.
-  L'analyse tourne en arrière-plan dans l'éditeur (quelques secondes) et l'aperçu montre exactement
-  le résultat exporté.
+  (`I = (J − a·W) / (1 − a)`) : ce qui apparaît est l'image d'origine, pas une copie.
+- **Restauration image par image (`RegionRestorer`)** : pendant l'export, chaque image passe par
+  un restaurateur CPU qui (1) mesure si le logo est réellement présent dans l'image (filigranes qui
+  changent de place → les images sans logo ne sont pas touchées, plus d'apparitions fugaces),
+  (2) inverse le logo, (3) estime le mouvement du fond et **propage l'image restaurée des images
+  précédentes** le long de ce mouvement, pondérée par sa fiabilité — ce qui était caché est visible
+  quelques images plus tôt ; le bruit amplifié par l'inversion et les traces résiduelles
+  disparaissent au fil des images, et une erreur systématique de l'inversion est apprise en ligne
+  puis soustraite, (4) comble ce qui reste inconnu (parties opaques, premières images) depuis les
+  pixels restaurés voisins. Coût : ~10 ms par image pour une zone de 350×100 px.
+  Les vidéos réellement immobiles (rien à récupérer) basculent sur la reconstruction spatiale.
+  L'analyse tourne en arrière-plan dans l'éditeur (quelques secondes) et l'aperçu montre le
+  résultat de la première image.
 - **Export GPU** (décodage → shader OpenGL → encodage H.264/AAC) avec progression et annulation.
 - **Bibliothèque « Mes vidéos »** : toutes les vidéos traitées, avec miniature, durée, résolution,
   taille, méthode utilisée ; lecture, partage, renommage, suppression. Les fichiers sont dans
@@ -62,6 +67,7 @@ app/src/main/java/com/souxch/watermarkremover
 │   ├── WatermarkAnalyzer.kt        analyse temporelle : retrouve le calque du filigrane (Kotlin pur)
 │   ├── WatermarkLayer.kt           empaquetage du calque pour le GPU (atlas RGBA)
 │   ├── WatermarkLayerBuilder.kt    échantillonne les images de la vidéo et lance l'analyse
+│   ├── RegionRestorer.kt           restauration image par image : présence, inversion, propagation temporelle
 │   ├── WatermarkRemovalEffect.kt   GlEffect Media3 branché dans le Transformer
 │   ├── PreviewRenderer.kt          rendu hors-écran (EGL pbuffer) pour l'aperçu « après »
 │   ├── VideoExporter.kt            pipeline Transformer + progression

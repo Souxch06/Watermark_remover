@@ -107,22 +107,54 @@ class WatermarkAnalyzerTest {
         val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, mixed))!!
         assertTrue(layer.hasWatermark)
         assertEquals(10, layer.stats.presentFrames)
-        assertTrue(layer.signaturePairs.isNotEmpty())
-        fun rgba(frame: ByteArray, flip: Boolean): ByteArray {
-            val out = ByteArray(w * h * 4)
-            for (y in 0 until h) for (x in 0 until w) {
-                val src = (y * w + x) * 3
-                val dst = ((if (flip) h - 1 - y else y) * w + x) * 4
-                out[dst] = frame[src]; out[dst + 1] = frame[src + 1]; out[dst + 2] = frame[src + 2]; out[dst + 3] = -1
+        // The restorer measures the presence frame by frame and leaves clean frames untouched.
+        val restorer = RegionRestorer(layer)
+        val outWith = rgba(with[3], false).also { restorer.process(it, false, it) }
+        assertTrue("presence with logo ${restorer.presence}", restorer.presence > 0.7f)
+        val src = rgba(without[4], false)
+        val outWithout = src.copyOf().also { restorer.process(it, false, it) }
+        assertTrue("presence without logo ${restorer.presence}", restorer.presence < 0.3f)
+        assertTrue(outWithout.contentEquals(src))
+        // Flipped input (GL read-back) gives the same presence and an upright output.
+        val flipped = RegionRestorer(layer)
+        val outFlipped = rgba(with[3], true).also { flipped.process(it, true, it) }
+        assertTrue("flipped ${flipped.presence}", abs(flipped.presence - 1f) < 0.3f)
+        val centre = 27 * w + 30
+        for (c in 0 until 3) assertEquals(outWith[centre * 4 + c], outFlipped[centre * 4 + c])
+    }
+
+    @Test
+    fun `restoration follows the moving background and improves over frames`() {
+        val fr = frames(40)
+        val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, fr.take(16)))!!
+        val restorer = RegionRestorer(layer)
+        val errors = ArrayList<Float>()
+        for (t in 0 until 40) {
+            val out = rgba(fr[t], false).also { restorer.process(it, false, it) }
+            var err = 0f
+            var count = 0
+            for (y in 16 until 32) for (x in 22 until 38) {
+                val bg = background(x, y, t)
+                for (c in 0 until 3) { err += abs((out[(y * w + x) * 4 + c].toInt() and 0xFF) / 255f - bg[c]); count++ }
             }
-            return out
+            errors.add(err / count)
         }
-        val scoreWith = WatermarkAnalyzer.presenceScore(layer.signaturePairs, layer.signatureDelta, w, h, rgba(with[3], false), false)
-        val scoreWithout = WatermarkAnalyzer.presenceScore(layer.signaturePairs, layer.signatureDelta, w, h, rgba(without[3], false), false)
-        val scoreFlipped = WatermarkAnalyzer.presenceScore(layer.signaturePairs, layer.signatureDelta, w, h, rgba(with[3], true), true)
-        assertTrue("with $scoreWith", scoreWith > 0.7f)
-        assertTrue("without $scoreWithout", scoreWithout < 0.3f)
-        assertTrue("flipped $scoreFlipped", abs(scoreFlipped - scoreWith) < 0.05f)
+        assertTrue("first frame error ${errors[0]}", errors[0] < 0.05f)
+        val late = errors.takeLast(10).average()
+        assertTrue("late error $late vs first ${errors[0]}", late < errors[0])
+        assertTrue("motion found", restorer.motionFound)
+        // The texture is sampled at (x + 3t, y + 2t): the content moves by (-3, -2) per frame.
+        assertTrue("motion ${restorer.motionX},${restorer.motionY}", abs(restorer.motionX + 3f) < 0.6f && abs(restorer.motionY + 2f) < 0.6f)
+    }
+
+    private fun rgba(frame: ByteArray, flip: Boolean): ByteArray {
+        val out = ByteArray(w * h * 4)
+        for (y in 0 until h) for (x in 0 until w) {
+            val src = (y * w + x) * 3
+            val dst = ((if (flip) h - 1 - y else y) * w + x) * 4
+            out[dst] = frame[src]; out[dst + 1] = frame[src + 1]; out[dst + 2] = frame[src + 2]; out[dst + 3] = -1
+        }
+        return out
     }
 
     @Test
@@ -156,15 +188,13 @@ class WatermarkAnalyzerTest {
         val packed = WatermarkLayer.pack(200, 100, listOf(small), listOf(analysed))
         assertEquals(1, packed.regions.size)
         assertEquals(w, packed.atlasWidth)
-        assertEquals(2 * h, packed.atlasHeight)
+        assertEquals(h, packed.atlasHeight)
         assertTrue(packed.hasWatermark)
         assertEquals(WatermarkShader.METHOD_LAYER, WatermarkShader.methodId(RemovalSettings(), packed))
         val rects = packed.rectUniforms(listOf(small), yUp = false)
         assertEquals(0f, rects[0], 1e-6f)
         assertEquals(w.toFloat(), rects[2], 1e-6f)
         assertEquals(0f, packed.offsetUniforms(listOf(small))[0], 1e-6f)
-        // A zone whose logo is absent from the frame is flagged with width -1 (left untouched).
-        val absent = packed.rectUniforms(listOf(small), yUp = false) { false }
-        assertEquals(-1f, absent[2], 1e-6f)
+        assertEquals(1, packed.newRestorers().size)
     }
 }
