@@ -24,14 +24,21 @@ import java.nio.ByteOrder
  */
 class PreviewRenderer {
 
-    suspend fun render(source: Bitmap, zones: List<WatermarkZone>, settings: RemovalSettings): Bitmap =
+    suspend fun render(
+        source: Bitmap,
+        zones: List<WatermarkZone>,
+        settings: RemovalSettings,
+        layer: WatermarkLayer? = null,
+    ): Bitmap =
         withContext(Dispatchers.Default) {
             if (zones.isEmpty() || !settings.method.usesShader) return@withContext source
             // GLUtils.texImage2D needs a software ARGB_8888 bitmap.
             val upload = if (source.config == Bitmap.Config.ARGB_8888) source else source.copy(Bitmap.Config.ARGB_8888, false)
             val session = EglSession(upload.width, upload.height)
             try {
-                session.draw(upload, zones, settings)
+                // The layer is texel aligned with the video: only usable at the video's own size.
+                val usable = layer?.takeIf { it.frameWidth == upload.width && it.frameHeight == upload.height }
+                session.draw(upload, zones, settings, usable)
             } finally {
                 session.release()
                 if (upload !== source) upload.recycle()
@@ -74,10 +81,11 @@ class PreviewRenderer {
             if (!EGL14.eglMakeCurrent(display, surface, surface, context)) throw GlException("eglMakeCurrent failed")
         }
 
-        fun draw(source: Bitmap, zones: List<WatermarkZone>, settings: RemovalSettings): Bitmap {
+        fun draw(source: Bitmap, zones: List<WatermarkZone>, settings: RemovalSettings, layer: WatermarkLayer?): Bitmap {
             val program = GlHelpers.linkProgram(WatermarkShader.VERTEX_SHADER, WatermarkShader.FRAGMENT_SHADER_2D)
             val tex = IntArray(1)
             GLES20.glGenTextures(1, tex, 0)
+            var layerTex = 0
             try {
                 GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[0])
                 GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
@@ -100,9 +108,11 @@ class PreviewRenderer {
                 GLES20.glUniform2f(loc(program, WatermarkShader.U_TEXEL_SIZE), 1f / width, 1f / height)
                 GLES20.glUniform4fv(loc(program, WatermarkShader.U_ZONES), WatermarkShader.MAX_ZONES, WatermarkShader.zoneUniforms(zones, yUp = false), 0)
                 GLES20.glUniform1i(loc(program, WatermarkShader.U_ZONE_COUNT), WatermarkShader.zoneCount(zones))
-                GLES20.glUniform1i(loc(program, WatermarkShader.U_METHOD), WatermarkShader.methodId(settings))
+                GLES20.glUniform1i(loc(program, WatermarkShader.U_METHOD), WatermarkShader.methodId(settings, layer))
                 GLES20.glUniform1f(loc(program, WatermarkShader.U_STRENGTH), settings.strength)
                 GLES20.glUniform1f(loc(program, WatermarkShader.U_FEATHER), WatermarkShader.featherTextureUnits(settings, width, height))
+                layerTex = if (layer != null) GlLayerTexture.upload(layer) else GlLayerTexture.uploadEmpty()
+                GlLayerTexture.bind(program, layerTex, layer, zones, yUp = false)
 
                 val aPos = GLES20.glGetAttribLocation(program, WatermarkShader.A_FRAME_POSITION)
                 val quad = GlHelpers.createQuadBuffer()
@@ -122,6 +132,7 @@ class PreviewRenderer {
                 return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { it.copyPixelsFromBuffer(buffer) }
             } finally {
                 GLES20.glDeleteTextures(1, tex, 0)
+                GlHelpers.deleteTexture(layerTex)
                 GLES20.glDeleteProgram(program)
             }
         }

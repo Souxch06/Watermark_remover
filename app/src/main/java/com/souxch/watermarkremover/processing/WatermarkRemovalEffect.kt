@@ -19,10 +19,12 @@ import java.nio.FloatBuffer
 class WatermarkRemovalEffect(
     private val zones: List<WatermarkZone>,
     private val settings: RemovalSettings,
+    /** Recovered watermark layer (method [WatermarkShader.METHOD_LAYER]); null = spatial only. */
+    private val layer: WatermarkLayer? = null,
 ) : GlEffect {
 
     override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram =
-        WatermarkShaderProgram(zones, settings, useHdr)
+        WatermarkShaderProgram(zones, settings, layer, useHdr)
 
     override fun isNoOp(inputWidth: Int, inputHeight: Int): Boolean = zones.isEmpty()
 }
@@ -31,6 +33,7 @@ class WatermarkRemovalEffect(
 private class WatermarkShaderProgram(
     private val zones: List<WatermarkZone>,
     private val settings: RemovalSettings,
+    private val layer: WatermarkLayer?,
     useHdr: Boolean,
 ) : BaseGlShaderProgram(/* useHighPrecisionColorComponents= */ useHdr, /* texturePoolCapacity= */ 1) {
 
@@ -46,6 +49,7 @@ private class WatermarkShaderProgram(
     private var uMethod = 0
     private var uStrength = 0
     private var uFeather = 0
+    private var layerTexture = 0
     private var width = 0
     private var height = 0
 
@@ -68,6 +72,15 @@ private class WatermarkShaderProgram(
             uMethod = GLES20.glGetUniformLocation(program, WatermarkShader.U_METHOD)
             uStrength = GLES20.glGetUniformLocation(program, WatermarkShader.U_STRENGTH)
             uFeather = GLES20.glGetUniformLocation(program, WatermarkShader.U_FEATHER)
+            layerTexture = try {
+                if (layer != null && layer.frameWidth == inputWidth && layer.frameHeight == inputHeight) {
+                    GlLayerTexture.upload(layer)
+                } else {
+                    GlLayerTexture.uploadEmpty()
+                }
+            } catch (e: GlException) {
+                throw VideoFrameProcessingException(e)
+            }
         }
         return Size(inputWidth, inputHeight)
     }
@@ -83,9 +96,11 @@ private class WatermarkShaderProgram(
             GLES20.glUniform2f(uTexelSize, 1f / width, 1f / height)
             GLES20.glUniform4fv(uZones, WatermarkShader.MAX_ZONES, WatermarkShader.zoneUniforms(zones, yUp = true), 0)
             GLES20.glUniform1i(uZoneCount, WatermarkShader.zoneCount(zones))
-            GLES20.glUniform1i(uMethod, WatermarkShader.methodId(settings))
+            val usable = layer != null && layer.frameWidth == width && layer.frameHeight == height
+            GLES20.glUniform1i(uMethod, WatermarkShader.methodId(settings, if (usable) layer else null))
             GLES20.glUniform1f(uStrength, settings.strength)
             GLES20.glUniform1f(uFeather, WatermarkShader.featherTextureUnits(settings, width, height))
+            GlLayerTexture.bind(program, layerTexture, if (usable) layer else null, zones, yUp = true)
 
             // Client-side vertex data: make sure no VBO is bound or the pointer would be read as an offset.
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
@@ -105,5 +120,7 @@ private class WatermarkShaderProgram(
             GLES20.glDeleteProgram(program)
             program = 0
         }
+        GlHelpers.deleteTexture(layerTexture)
+        layerTexture = 0
     }
 }

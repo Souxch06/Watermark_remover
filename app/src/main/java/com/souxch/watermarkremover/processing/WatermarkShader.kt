@@ -31,7 +31,15 @@ object WatermarkShader {
     const val U_METHOD = "uMethod"
     const val U_STRENGTH = "uStrength"
     const val U_FEATHER = "uFeather"
+    const val U_LAYER_SAMPLER = "uLayerSampler"
+    const val U_LAYER_RECT = "uLayerRect"
+    const val U_LAYER_OFFSET = "uLayerOffset"
+    const val U_LAYER_SCALE = "uLayerScale"
+    const val U_LAYER_TEXEL = "uLayerTexel"
     const val A_FRAME_POSITION = "aFramePosition"
+
+    /** Shader method id of the "true picture behind the watermark" mode (see [WatermarkLayer]). */
+    const val METHOD_LAYER = 3
 
     /**
      * Vertex shader compatible with Media3's `BaseGlShaderProgram` conventions: positions come in
@@ -69,6 +77,12 @@ object WatermarkShader {
         uniform int uMethod;            // 0 = inpaint, 1 = blur, 2 = pixelate
         uniform float uStrength;        // 0..1
         uniform float uFeather;         // feather width in texture units
+        // Recovered watermark layers (uMethod == 3), see WatermarkLayer / layerAt().
+        uniform sampler2D uLayerSampler;
+        uniform vec4 uLayerRect[$MAX_ZONES];
+        uniform float uLayerOffset[$MAX_ZONES];
+        uniform vec2 uLayerScale;
+        uniform vec2 uLayerTexel;
         varying vec2 vTexSamplingCoord;
 
         vec4 sampleTex(vec2 uv) {
@@ -196,6 +210,70 @@ object WatermarkShader {
           return vec4(clamp(copy.rgb + (expected.rgb - copyLow.rgb), 0.0, 1.0), copy.a);
         }
 
+        // ---- Watermark layer mode (uMethod == 3) -------------------------------------------
+        // uLayerSampler is an atlas holding, for every zone, the recovered watermark layer of the
+        // analysed region (zone + margin) in DISPLAY row order (row 0 = top). For zone i the rows
+        // [off, off + H) hold texel A = (a*W rgb, opacity a) and rows [off + H, off + 2H) hold
+        // texel B = (fill flag, distance to the nearest clean pixel to the left / right / above,
+        // in pixels / 255); the distance below is stored in texel A's alpha of fill pixels.
+        // uLayerRect[i] = (region origin in texture space xy, region size in pixels zw),
+        // uLayerScale = video pixels per texture unit (y negative when the texture is y-up),
+        // uLayerOffset[i] = first atlas row of zone i, uLayerTexel = 1 / atlas size.
+
+        vec2 layerPixel(vec2 uv, vec4 rect) {
+          return (uv - rect.xy) * uLayerScale;
+        }
+
+        vec4 layerData(vec2 lp, vec4 rect, float off, float slot) {
+          vec2 t = vec2((floor(lp.x) + 0.5) * uLayerTexel.x,
+                        (off + slot * rect.w + floor(lp.y) + 0.5) * uLayerTexel.y);
+          return texture2D(uLayerSampler, t);
+        }
+
+        bool layerInside(vec2 lp, vec4 rect) {
+          return all(greaterThanEqual(lp, vec2(0.0))) && all(lessThan(lp, rect.zw));
+        }
+
+        // Picture behind the watermark at uv (semi-transparent parts: exact inversion).
+        vec4 restoredAt(vec2 uv, vec4 rect, float off) {
+          vec4 src = sampleTex(uv);
+          vec4 a0 = layerData(layerPixel(uv, rect), rect, off, 0.0);
+          float a = min(a0.a, 0.85);
+          vec3 rgb = (src.rgb - a0.rgb) / (1.0 - a);
+          return vec4(clamp(rgb, 0.0, 1.0), src.a);
+        }
+
+        vec4 layerAt(vec2 uv, vec4 rect, float off) {
+          vec2 lp = layerPixel(uv, rect);
+          vec4 b = layerData(lp, rect, off, 1.0);
+          if (b.r < 0.5) {
+            return restoredAt(uv, rect, off);
+          }
+          // Opaque part of the logo: rebuild the pixel from the 4 nearest clean pixels (mirrored
+          // across the logo boundary, weighted by 1/d^2). Sources go through restoredAt too.
+          vec4 a0 = layerData(lp, rect, off, 0.0);
+          vec4 dist = vec4(b.g, b.b, b.a, a0.a) * 255.0;   // left, right, above, below
+          vec2 px = 1.0 / uLayerScale;                      // one video pixel, in texture units
+          vec4 acc = vec4(0.0);
+          float wsum = 0.0;
+          for (int k = 0; k < 4; k++) {
+            float d = (k == 0) ? dist.x : (k == 1) ? dist.y : (k == 2) ? dist.z : dist.w;
+            if (d < 0.5 || d > 254.5) { continue; }
+            vec2 dir = (k == 0) ? vec2(-1.0, 0.0) : (k == 1) ? vec2(1.0, 0.0)
+                     : (k == 2) ? vec2(0.0, -1.0) : vec2(0.0, 1.0);
+            vec2 mirror = uv + dir * (2.0 * d) * px;
+            vec2 boundary = uv + dir * d * px;
+            vec2 mlp = layerPixel(mirror, rect);
+            bool clean = layerInside(mlp, rect) && layerData(mlp, rect, off, 1.0).r < 0.5;
+            vec4 c = restoredAt(clean ? mirror : boundary, rect, off);
+            float w = 1.0 / (d * d);
+            acc += c * w;
+            wsum += w;
+          }
+          if (wsum <= 0.0) { return sampleTex(uv); }
+          return acc / wsum;
+        }
+
         vec4 pixelateAt(vec2 uv, vec4 r) {
           vec2 zoneSize = vec2(r.z - r.x, r.w - r.y);
           float blocks = mix(24.0, 4.0, uStrength);
@@ -213,9 +291,16 @@ object WatermarkShader {
             if (i >= uZoneCount) { break; }
             vec4 r = uZones[i];
             float d = rectDistance(uv, r);
+            if (uMethod == 3 && uLayerRect[i].z > 0.5) {
+              // Recovered layer: pixel-exact mask, no feather; only the analysed region.
+              if (layerInside(layerPixel(uv, uLayerRect[i]), uLayerRect[i])) {
+                color = layerAt(uv, uLayerRect[i], uLayerOffset[i]);
+              }
+              continue;
+            }
             if (d > uFeather) { continue; }
             vec4 processed;
-            if (uMethod == 0) {
+            if (uMethod == 0 || uMethod == 3) {
               processed = inpaintAt(uv, r);
             } else if (uMethod == 1) {
               vec2 zoneSize = vec2(r.z - r.x, r.w - r.y);
@@ -266,8 +351,15 @@ object WatermarkShader {
 
     fun zoneCount(zones: List<WatermarkZone>): Int = zones.size.coerceAtMost(MAX_ZONES)
 
-    fun methodId(settings: RemovalSettings): Int =
-        if (settings.method.usesShader) settings.method.shaderId else RemovalMethod.INPAINT.shaderId
+    /**
+     * Shader method for [settings]. The reconstruction method switches to [METHOD_LAYER] when a
+     * recovered watermark [layer] is available (the picture behind the logo is then restored).
+     */
+    fun methodId(settings: RemovalSettings, layer: WatermarkLayer? = null): Int = when {
+        !settings.method.usesShader -> RemovalMethod.INPAINT.shaderId
+        settings.method == RemovalMethod.INPAINT && layer != null && layer.hasWatermark -> METHOD_LAYER
+        else -> settings.method.shaderId
+    }
 
     /** Feather expressed in texture units, based on the smaller dimension so it looks isotropic. */
     fun featherTextureUnits(settings: RemovalSettings, width: Int, height: Int): Float {

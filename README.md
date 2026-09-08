@@ -28,10 +28,15 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   bascule Avant/Après + « maintenir pour voir l'original ».
 - **4 méthodes** : Reconstruction (recommandée), Flou, Pixellisation, Recadrage. Aucun réglage :
   tout est automatique.
-- **Reconstruction nette** : la zone est remplie par une copie pixel à pixel (sans rééchantillonnage
-  ni moyenne) de l'image réelle en miroir du bord le plus proche, puis les tons sont raccordés aux
-  quatre bords. Le grain et les détails de la vidéo sont conservés : pas de tache floue à
-  l'emplacement du filigrane.
+- **Vraie récupération de l'image derrière le filigrane** : l'app analyse une vingtaine d'images
+  réparties sur toute la vidéo. Le logo est le seul élément immobile alors que l'image bouge : ses
+  gradients sont identiques d'une image à l'autre. En prenant la médiane temporelle des gradients
+  puis en l'intégrant (équation de Poisson), on obtient le relief exact du logo (couleur × opacité)
+  et un masque au pixel près. Chaque pixel semi-transparent est alors **inversé**
+  (`I = (J − a·W) / (1 − a)`) : ce qui apparaît est l'image d'origine, pas une copie. Les parties
+  opaques du logo (et les vidéos immobiles, où rien n'est récupérable) sont reconstruites depuis les
+  pixels propres voisins. L'analyse tourne en arrière-plan dans l'éditeur (quelques secondes) et
+  l'aperçu montre exactement le résultat exporté.
 - **Export GPU** (décodage → shader OpenGL → encodage H.264/AAC) avec progression et annulation.
 - **Bibliothèque « Mes vidéos »** : toutes les vidéos traitées, avec miniature, durée, résolution,
   taille, méthode utilisée ; lecture, partage, renommage, suppression. Les fichiers sont dans
@@ -49,7 +54,10 @@ app/src/main/java/com/souxch/watermarkremover
 │   ├── ProcessedVideo.kt           entrée de bibliothèque + (dé)sérialisation JSON (testé)
 │   └── LibraryRepository.kt        MediaStore + index JSON + miniatures
 ├── processing/
-│   ├── WatermarkShader.kt          shader GLSL (inpaint / blur / pixelate)
+│   ├── WatermarkShader.kt          shader GLSL (calque récupéré / inpaint / blur / pixelate)
+│   ├── WatermarkAnalyzer.kt        analyse temporelle : retrouve le calque du filigrane (Kotlin pur)
+│   ├── WatermarkLayer.kt           empaquetage du calque pour le GPU (atlas RGBA)
+│   ├── WatermarkLayerBuilder.kt    échantillonne les images de la vidéo et lance l'analyse
 │   ├── WatermarkRemovalEffect.kt   GlEffect Media3 branché dans le Transformer
 │   ├── PreviewRenderer.kt          rendu hors-écran (EGL pbuffer) pour l'aperçu « après »
 │   ├── VideoExporter.kt            pipeline Transformer + progression

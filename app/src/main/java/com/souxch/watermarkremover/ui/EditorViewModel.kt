@@ -20,6 +20,9 @@ import com.souxch.watermarkremover.processing.ExportEvent
 import com.souxch.watermarkremover.processing.PreviewRenderer
 import com.souxch.watermarkremover.processing.VideoExporter
 import com.souxch.watermarkremover.processing.VideoRepository
+import com.souxch.watermarkremover.processing.WatermarkLayer
+import com.souxch.watermarkremover.processing.WatermarkLayerBuilder
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -74,6 +77,12 @@ data class EditorState(
     val previewLoading: Boolean = false,
     /** true = show processed frame, false = show original (before/after toggle). */
     val showAfter: Boolean = true,
+    /** Recovered watermark layer for the current video + zones (null = not available yet). */
+    val layer: WatermarkLayer? = null,
+    /** Progress (0..100) of the watermark analysis, null when idle. */
+    val analysisProgress: Int? = null,
+    /** True when the analysis ran but found no static watermark to recover in the zone(s). */
+    val analysisFoundNothing: Boolean = false,
     val library: List<ProcessedVideo> = emptyList(),
     val libraryLoaded: Boolean = false,
     val update: UpdateState = UpdateState(),
@@ -86,6 +95,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private val exporter = VideoExporter(app)
     private val library = LibraryRepository(app)
     private val previewRenderer = PreviewRenderer()
+    private val layerBuilder = WatermarkLayerBuilder(app)
     private val updateChecker = UpdateChecker(app, BuildConfig.VERSION_NAME)
     private val updateInstaller = UpdateInstaller(app)
 
@@ -96,6 +106,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     private var exportJob: Job? = null
     private var previewJob: Job? = null
+    private var analysisJob: Job? = null
     private var nextZoneId = 2
 
     init {
@@ -108,14 +119,47 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         // Re-render the "after" preview whenever zones or settings change, debounced so dragging
         // a handle stays smooth (the overlay itself is drawn synchronously by Compose).
         viewModelScope.launch {
-            _state.map { PreviewKey(it.screen as? Screen.Editor, it.zones, it.settings) }
+            _state.map { PreviewKey(it.screen as? Screen.Editor, it.zones, it.settings, it.layer) }
                 .distinctUntilChanged()
                 .debounce(120)
                 .collect { key -> renderPreview(key) }
         }
+        // Look through the video for the watermark layer whenever the zones settle (the user
+        // stopped dragging): the preview and the export then restore the picture behind it.
+        viewModelScope.launch {
+            _state.map { AnalysisKey(it.screen as? Screen.Editor, it.zones) }
+                .distinctUntilChanged()
+                .debounce(700)
+                .collect { key -> analyzeWatermark(key) }
+        }
     }
 
-    private data class PreviewKey(val editor: Screen.Editor?, val zones: List<WatermarkZone>, val settings: RemovalSettings)
+    private data class PreviewKey(val editor: Screen.Editor?, val zones: List<WatermarkZone>, val settings: RemovalSettings, val layer: WatermarkLayer?)
+    private data class AnalysisKey(val editor: Screen.Editor?, val zones: List<WatermarkZone>)
+
+    private fun analyzeWatermark(key: AnalysisKey) {
+        analysisJob?.cancel()
+        val info = key.editor?.info
+        if (info == null || key.zones.isEmpty()) {
+            _state.update { it.copy(layer = null, analysisProgress = null, analysisFoundNothing = false) }
+            return
+        }
+        _state.update { it.copy(layer = null, analysisProgress = 0, analysisFoundNothing = false) }
+        analysisJob = viewModelScope.launch {
+            val result = try {
+                layerBuilder.build(info, key.zones) { p -> _state.update { it.copy(analysisProgress = p) } }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                null
+            }
+            _state.update { s ->
+                // Ignore stale results.
+                if ((s.screen as? Screen.Editor)?.info != info || s.zones != key.zones) s
+                else s.copy(layer = result, analysisProgress = null, analysisFoundNothing = result?.hasWatermark != true)
+            }
+        }
+    }
 
     private fun renderPreview(key: PreviewKey) {
         previewJob?.cancel()
@@ -125,7 +169,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         }
         _state.update { it.copy(previewLoading = true) }
         previewJob = viewModelScope.launch {
-            val rendered = runCatching { previewRenderer.render(frame, key.zones, key.settings) }.getOrNull()
+            val rendered = runCatching { previewRenderer.render(frame, key.zones, key.settings, key.layer) }.getOrNull()
             _state.update { s ->
                 // Ignore stale results if the editor frame changed meanwhile.
                 if ((s.screen as? Screen.Editor)?.frame !== frame) s
@@ -157,7 +201,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 val info = repository.readInfo(uri)
-                val frame = repository.loadFrame(uri, (info.durationMs * 1000L) / 3)
+                val frame = repository.loadFrame(uri, (info.durationMs * 1000L) / 3, previewDimension(info))
                 nextZoneId = 2
                 _state.update {
                     it.copy(
@@ -166,6 +210,9 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
                         selectedZoneId = 1,
                         previewFrame = null,
                         showAfter = true,
+                        layer = null,
+                        analysisProgress = null,
+                        analysisFoundNothing = false,
                     )
                 }
             } catch (e: Exception) {
@@ -173,6 +220,12 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
     }
+
+    /**
+     * The preview frame is kept at the video's own resolution (up to 4K) so the recovered layer,
+     * which is texel aligned, can be shown exactly as it will be exported.
+     */
+    private fun previewDimension(info: VideoInfo): Int = maxOf(info.displayWidth, info.displayHeight).coerceIn(1280, 3840)
 
     fun selectZone(id: Int) = _state.update { it.copy(selectedZoneId = id) }
 
@@ -209,7 +262,11 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         val output = repository.newExportFile()
         _state.update { it.copy(screen = Screen.Exporting(info, 0)) }
         exportJob = viewModelScope.launch {
-            exporter.export(info, zones, settings, output).collect { event ->
+            // If the watermark analysis is still running, let it finish first: the export must
+            // restore the picture behind the logo, not paint over it.
+            analysisJob?.takeIf { it.isActive }?.join()
+            val layer = _state.value.layer?.takeIf { settings.method == RemovalMethod.INPAINT }
+            exporter.export(info, zones, settings, output, layer).collect { event ->
                 when (event) {
                     is ExportEvent.Progress -> _state.update { it.copy(screen = Screen.Exporting(info, event.percent)) }
                     is ExportEvent.Failed -> _state.update {
@@ -236,8 +293,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     fun reopenEditor(info: VideoInfo) {
         _state.update { it.copy(screen = Screen.Loading) }
         viewModelScope.launch {
-            val frame = repository.loadFrame(info.uri, (info.durationMs * 1000L) / 3)
-            _state.update { it.copy(screen = Screen.Editor(info, frame), previewFrame = null) }
+            val frame = repository.loadFrame(info.uri, (info.durationMs * 1000L) / 3, previewDimension(info))
+            _state.update { it.copy(screen = Screen.Editor(info, frame), previewFrame = null, layer = null, analysisProgress = null, analysisFoundNothing = false) }
         }
     }
 

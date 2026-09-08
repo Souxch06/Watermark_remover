@@ -59,7 +59,10 @@
     <string name="method_label">Méthode de suppression</string>
     <string name="method_inpaint">Reconstruction (recommandé)</string>
     <string name="method_inpaint_short">Reconstruction</string>
-    <string name="method_inpaint_desc">Remplit la zone par une copie nette de l\'image qui l\'entoure (grain et détails conservés), tons raccordés automatiquement.</string>
+    <string name="method_inpaint_desc">Retrouve l\'image réelle derrière le filigrane en analysant toute la vidéo (logo semi-transparent inversé pixel par pixel) ; les parties opaques sont reconstruites à partir de leur entourage.</string>
+    <string name="analysis_running">Analyse de la vidéo pour retrouver l\'image derrière le filigrane… %1$d %%</string>
+    <string name="analysis_found">Filigrane identifié : l\'image d\'origine sera restaurée derrière.</string>
+    <string name="analysis_not_found">Aucun filigrane fixe détecté dans le cadre : la zone sera reconstruite à partir de son entourage.</string>
     <string name="method_blur">Flou</string>
     <string name="method_blur_desc">Floute fortement la zone. Le filigrane devient illisible mais la zone reste visible.</string>
     <string name="method_pixelate">Pixellisation</string>

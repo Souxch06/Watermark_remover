@@ -174,6 +174,40 @@ fun EditorScreen(info: VideoInfo, frame: Bitmap?, state: EditorState, vm: Editor
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            // Watermark analysis status (reconstruction method only).
+            if (settings.method == RemovalMethod.INPAINT && zones.isNotEmpty()) {
+                val progress = state.analysisProgress
+                val layer = state.layer
+                Row(Modifier.padding(horizontal = 20.dp).padding(bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    when {
+                        progress != null -> {
+                            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                stringResource(R.string.analysis_running, progress),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        layer != null && layer.hasWatermark -> {
+                            Icon(Icons.Default.AutoFixHigh, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                stringResource(R.string.analysis_found),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                        state.analysisFoundNothing -> {
+                            Text(
+                                stringResource(R.string.analysis_not_found),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
 
             // ----- Before / after toggle -----
             if (settings.method.usesShader) {

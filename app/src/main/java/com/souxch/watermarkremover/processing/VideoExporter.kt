@@ -36,10 +36,16 @@ sealed interface ExportEvent {
 /** Runs the Media3 Transformer: decode -> GL effect (or crop) -> H.264/AAC encode into an MP4. */
 class VideoExporter(private val context: Context) {
 
-    fun export(info: VideoInfo, zones: List<WatermarkZone>, settings: RemovalSettings, output: File): Flow<ExportEvent> =
+    fun export(
+        info: VideoInfo,
+        zones: List<WatermarkZone>,
+        settings: RemovalSettings,
+        output: File,
+        layer: WatermarkLayer? = null,
+    ): Flow<ExportEvent> =
         callbackFlow {
             val mainHandler = Handler(Looper.getMainLooper())
-            val effects: List<Effect> = buildEffects(zones, settings)
+            val effects: List<Effect> = buildEffects(zones, settings, layer)
             val item = EditedMediaItem.Builder(MediaItem.fromUri(info.uri))
                 .setEffects(Effects(/* audioProcessors= */ emptyList(), effects))
                 .build()
@@ -110,14 +116,14 @@ class VideoExporter(private val context: Context) {
         return "%.0f Mb/s".format(bps / 1_000_000f)
     }
 
-    private fun buildEffects(zones: List<WatermarkZone>, settings: RemovalSettings): List<Effect> {
+    private fun buildEffects(zones: List<WatermarkZone>, settings: RemovalSettings, layer: WatermarkLayer?): List<Effect> {
         if (zones.isEmpty()) return emptyList()
         return if (settings.method == RemovalMethod.CROP) {
             val crop = ZoneGeometry.cropRectExcluding(zones.first().rect)
             val (left, right, bottom, top) = ZoneGeometry.toNdcCrop(crop)
             listOf(Crop(left, right, bottom, top))
         } else {
-            listOf(WatermarkRemovalEffect(zones, settings))
+            listOf(WatermarkRemovalEffect(zones, settings, layer))
         }
     }
 }
