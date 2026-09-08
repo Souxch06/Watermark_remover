@@ -23,6 +23,7 @@ import com.souxch.watermarkremover.processing.VideoRepository
 import com.souxch.watermarkremover.processing.WatermarkLayer
 import com.souxch.watermarkremover.processing.WatermarkLayerBuilder
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -33,6 +34,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Which top-level destination is shown. */
 enum class Tab { HOME, LIBRARY }
@@ -41,7 +43,12 @@ sealed interface Screen {
     /** Tabs: pick a video / browse processed videos. */
     data object Main : Screen
     data object Loading : Screen
-    data class Editor(val info: VideoInfo, val frame: Bitmap?) : Screen
+    /**
+     * @param frame frame shown behind the zones (bounded size, safe for the UI toolkit)
+     * @param fullFrame the same frame at the video's own resolution, used to render the
+     *   "after" preview with the texel-aligned watermark layer (never drawn directly)
+     */
+    data class Editor(val info: VideoInfo, val frame: Bitmap?, val fullFrame: Bitmap? = frame) : Screen
     data class Exporting(val info: VideoInfo, val percent: Int) : Screen
     data class Done(val item: ProcessedVideo) : Screen
     data class Error(val message: String, val info: VideoInfo?) : Screen
@@ -90,6 +97,13 @@ data class EditorState(
 
 @OptIn(FlowPreview::class)
 class EditorViewModel(app: Application) : AndroidViewModel(app) {
+
+    private companion object {
+        /** Largest side of the bitmaps handed to the UI (safe on every GPU / view hierarchy). */
+        const val DISPLAY_DIMENSION = 1280
+        /** Largest side rendered for the preview (4K); bigger videos are previewed downscaled. */
+        const val MAX_FULL_DIMENSION = 3840
+    }
 
     private val repository = VideoRepository(app)
     private val exporter = VideoExporter(app)
@@ -163,16 +177,24 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun renderPreview(key: PreviewKey) {
         previewJob?.cancel()
-        val frame = key.editor?.frame ?: run {
+        val editor = key.editor
+        val frame = editor?.fullFrame ?: editor?.frame ?: run {
             _state.update { it.copy(previewFrame = null, previewLoading = false) }
             return
         }
         _state.update { it.copy(previewLoading = true) }
         previewJob = viewModelScope.launch {
-            val rendered = runCatching { previewRenderer.render(frame, key.zones, key.settings, key.layer) }.getOrNull()
+            // Rendered at the video's resolution (the recovered layer is texel aligned), then
+            // reduced to a size the UI can display.
+            val rendered = runCatching {
+                val full = previewRenderer.render(frame, key.zones, key.settings, key.layer)
+                withContext(Dispatchers.Default) {
+                    repository.displayCopy(full, DISPLAY_DIMENSION).also { if (it !== full && full !== frame) full.recycle() }
+                }
+            }.getOrNull()
             _state.update { s ->
                 // Ignore stale results if the editor frame changed meanwhile.
-                if ((s.screen as? Screen.Editor)?.frame !== frame) s
+                if ((s.screen as? Screen.Editor)?.fullFrame !== frame) s
                 else s.copy(previewFrame = rendered, previewLoading = false)
             }
         }
@@ -201,11 +223,11 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 val info = repository.readInfo(uri)
-                val frame = repository.loadFrame(uri, (info.durationMs * 1000L) / 3, previewDimension(info))
+                val (frame, fullFrame) = loadEditorFrames(info)
                 nextZoneId = 2
                 _state.update {
                     it.copy(
-                        screen = Screen.Editor(info, frame),
+                        screen = Screen.Editor(info, frame, fullFrame),
                         zones = listOf(WatermarkZone(1, WatermarkZone.DEFAULT_RECT)),
                         selectedZoneId = 1,
                         previewFrame = null,
@@ -222,10 +244,17 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * The preview frame is kept at the video's own resolution (up to 4K) so the recovered layer,
-     * which is texel aligned, can be shown exactly as it will be exported.
+     * Loads the editor frame twice: at the video's own resolution (up to 4K) for the preview
+     * renderer, whose recovered layer is texel aligned, and as a bounded copy for the screen
+     * (very large bitmaps exceed GPU texture limits and simply do not show up).
      */
-    private fun previewDimension(info: VideoInfo): Int = maxOf(info.displayWidth, info.displayHeight).coerceIn(1280, 3840)
+    private suspend fun loadEditorFrames(info: VideoInfo): Pair<Bitmap?, Bitmap?> {
+        val largest = maxOf(info.displayWidth, info.displayHeight)
+        val full = repository.loadFrame(info.uri, (info.durationMs * 1000L) / 3, if (largest <= MAX_FULL_DIMENSION) 0 else MAX_FULL_DIMENSION)
+            ?: return null to null
+        val display = withContext(Dispatchers.Default) { repository.displayCopy(full, DISPLAY_DIMENSION) }
+        return display to full
+    }
 
     fun selectZone(id: Int) = _state.update { it.copy(selectedZoneId = id) }
 
@@ -293,8 +322,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     fun reopenEditor(info: VideoInfo) {
         _state.update { it.copy(screen = Screen.Loading) }
         viewModelScope.launch {
-            val frame = repository.loadFrame(info.uri, (info.durationMs * 1000L) / 3, previewDimension(info))
-            _state.update { it.copy(screen = Screen.Editor(info, frame), previewFrame = null, layer = null, analysisProgress = null, analysisFoundNothing = false) }
+            val (frame, fullFrame) = loadEditorFrames(info)
+            _state.update { it.copy(screen = Screen.Editor(info, frame, fullFrame), previewFrame = null, layer = null, analysisProgress = null, analysisFoundNothing = false) }
         }
     }
 

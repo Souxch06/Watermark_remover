@@ -33,7 +33,17 @@ class WatermarkLayer(
         val height: Int,
         val atlasRow: Int,
         val stats: WatermarkAnalyzer.Stats,
-    )
+        /** Logo signature, see [WatermarkAnalyzer.presenceScore]. */
+        val signaturePairs: IntArray = IntArray(0),
+        val signatureDelta: FloatArray = FloatArray(0),
+    ) {
+        /** Presence of the logo (about 1 when there, 0 when absent) in the region pixels given. */
+        fun presence(rgba: ByteArray, flipY: Boolean): Float =
+            WatermarkAnalyzer.presenceScore(signaturePairs, signatureDelta, width, height, rgba, flipY)
+    }
+
+    /** True if at least one region can tell whether the logo is present in a given frame. */
+    val hasSignature: Boolean get() = regions.any { it.stats.maskPixels > 0 && it.signaturePairs.isNotEmpty() }
 
     /** True if at least one zone has a usable recovered layer. */
     val hasWatermark: Boolean get() = regions.any { it.stats.maskPixels > 0 }
@@ -41,14 +51,20 @@ class WatermarkLayer(
     /**
      * Uniform values for the given zones (same order as the `uZones` uniform): for each zone
      * `(originX, originY, width, height)` where the origin is in texture space and the size in
-     * pixels; zones without a layer get width 0.
+     * pixels. Zones without a layer get width 0 (the shader falls back to the spatial
+     * reconstruction); zones whose logo is absent from the frame ([present] false) get width -1
+     * (the shader leaves them untouched).
      *
      * @param yUp true for the export path (texture row 0 = visual bottom), false for the preview.
      */
-    fun rectUniforms(zones: List<WatermarkZone>, yUp: Boolean): FloatArray {
+    fun rectUniforms(zones: List<WatermarkZone>, yUp: Boolean, present: (Region) -> Boolean = { true }): FloatArray {
         val out = FloatArray(WatermarkShader.MAX_ZONES * 4)
         zones.take(WatermarkShader.MAX_ZONES).forEachIndexed { i, zone ->
             val region = regions.firstOrNull { it.zoneId == zone.id && it.stats.maskPixels > 0 } ?: return@forEachIndexed
+            if (!present(region)) {
+                out[i * 4 + 2] = -1f
+                return@forEachIndexed
+            }
             out[i * 4 + 0] = region.left.toFloat() / frameWidth
             // Origin = display top-left of the region. With a y-up texture that row is at
             // 1 - top/height; the shader then multiplies by a negative y scale.
@@ -75,6 +91,8 @@ class WatermarkLayer(
     companion object {
         /** Extra pixels analysed around each zone (the logo may slightly overflow the frame). */
         const val MARGIN = 8
+        /** Presence score below which a frame is considered free of the logo (no inversion). */
+        const val PRESENCE_THRESHOLD = 0.5f
 
         /** Largest region side analysed, in pixels (bigger zones are analysed at this scale). */
         const val MAX_REGION = 320
@@ -105,7 +123,7 @@ class WatermarkLayer(
                 val l = layer!!
                 val rect = regionOf(zone, frameWidth, frameHeight)
                 if (rect[2] != l.width || rect[3] != l.height) continue
-                regions.add(Region(zone.id, rect[0], rect[1], l.width, l.height, atlasHeight, l.stats))
+                regions.add(Region(zone.id, rect[0], rect[1], l.width, l.height, atlasHeight, l.stats, l.signaturePairs, l.signatureDelta))
                 placed.add(l to atlasHeight)
                 atlasWidth = max(atlasWidth, l.width)
                 atlasHeight += 2 * l.height

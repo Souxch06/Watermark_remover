@@ -238,7 +238,7 @@ object WatermarkShader {
         vec4 restoredAt(vec2 uv, vec4 rect, float off) {
           vec4 src = sampleTex(uv);
           vec4 a0 = layerData(layerPixel(uv, rect), rect, off, 0.0);
-          float a = min(a0.a, 0.85);
+          float a = min(a0.a, 0.8);
           vec3 rgb = (src.rgb - a0.rgb) / (1.0 - a);
           return vec4(clamp(rgb, 0.0, 1.0), src.a);
         }
@@ -291,12 +291,17 @@ object WatermarkShader {
             if (i >= uZoneCount) { break; }
             vec4 r = uZones[i];
             float d = rectDistance(uv, r);
-            if (uMethod == 3 && uLayerRect[i].z > 0.5) {
-              // Recovered layer: pixel-exact mask, no feather; only the analysed region.
-              if (layerInside(layerPixel(uv, uLayerRect[i]), uLayerRect[i])) {
-                color = layerAt(uv, uLayerRect[i], uLayerOffset[i]);
+            if (uMethod == 3) {
+              vec4 lr = uLayerRect[i];
+              // Width -1: the logo is not in this frame (it moved elsewhere): leave the zone alone.
+              if (lr.z < -0.5) { continue; }
+              if (lr.z > 0.5) {
+                // Recovered layer: pixel-exact mask, no feather; only the analysed region.
+                if (layerInside(layerPixel(uv, lr), lr)) {
+                  color = layerAt(uv, lr, uLayerOffset[i]);
+                }
+                continue;
               }
-              continue;
             }
             if (d > uFeather) { continue; }
             vec4 processed;

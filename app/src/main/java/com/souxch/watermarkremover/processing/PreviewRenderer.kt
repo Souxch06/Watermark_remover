@@ -112,7 +112,9 @@ class PreviewRenderer {
                 GLES20.glUniform1f(loc(program, WatermarkShader.U_STRENGTH), settings.strength)
                 GLES20.glUniform1f(loc(program, WatermarkShader.U_FEATHER), WatermarkShader.featherTextureUnits(settings, width, height))
                 layerTex = if (layer != null) GlLayerTexture.upload(layer) else GlLayerTexture.uploadEmpty()
-                GlLayerTexture.bind(program, layerTex, layer, zones, yUp = false)
+                // Zones whose logo is not in this frame are left untouched (see LayerPresence).
+                val present = layer?.let { LayerPresence.fromBitmap(it, source) }
+                GlLayerTexture.bind(program, layerTex, layer, zones, yUp = false) { present == null || it.zoneId in present }
 
                 val aPos = GLES20.glGetAttribLocation(program, WatermarkShader.A_FRAME_POSITION)
                 val quad = GlHelpers.createQuadBuffer()

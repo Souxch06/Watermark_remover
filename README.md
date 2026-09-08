@@ -35,8 +35,12 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   et un masque au pixel près. Chaque pixel semi-transparent est alors **inversé**
   (`I = (J − a·W) / (1 − a)`) : ce qui apparaît est l'image d'origine, pas une copie. Les parties
   opaques du logo (et les vidéos immobiles, où rien n'est récupérable) sont reconstruites depuis les
-  pixels propres voisins. L'analyse tourne en arrière-plan dans l'éditeur (quelques secondes) et
-  l'aperçu montre exactement le résultat exporté.
+  pixels propres voisins. Une passe de raffinement mesure ensuite le « fantôme » qui subsisterait
+  après inversion (gradients résiduels médians des images inversées) et le réintègre dans le calque :
+  plus de traces pâles du logo. Enfin une signature du logo est conservée : à l'export, chaque image
+  est testée et celles où le logo est absent (filigrane qui change de place) ne sont pas touchées.
+  L'analyse tourne en arrière-plan dans l'éditeur (quelques secondes) et l'aperçu montre exactement
+  le résultat exporté.
 - **Export GPU** (décodage → shader OpenGL → encodage H.264/AAC) avec progression et annulation.
 - **Bibliothèque « Mes vidéos »** : toutes les vidéos traitées, avec miniature, durée, résolution,
   taille, méthode utilisée ; lecture, partage, renommage, suppression. Les fichiers sont dans

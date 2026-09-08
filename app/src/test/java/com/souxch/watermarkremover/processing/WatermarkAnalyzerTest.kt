@@ -81,7 +81,7 @@ class WatermarkAnalyzerTest {
         for (c in 0 until 3) {
             val j = ((frame[centre * 3 + c].toInt() and 0xFF) / 255f)
             val restored = (j - layer.colour[centre * 3 + c]) / (1f - layer.alpha[centre])
-            assertTrue("channel $c restored $restored vs ${bg[c]}", abs(restored - bg[c]) < 0.06f)
+            assertTrue("channel $c restored $restored vs ${bg[c]}", abs(restored - bg[c]) < 0.05f)
         }
     }
 
@@ -96,6 +96,33 @@ class WatermarkAnalyzerTest {
         val right = layer.distances[centre * 4 + 1].toInt() and 0xFF
         assertTrue("left $left", left in 8..13)
         assertTrue("right $right", right in 8..13)
+    }
+
+    @Test
+    fun `frames without the logo are told apart from frames with it`() {
+        // Logo present in the even frames only (apps alternating the watermark position).
+        val with = frames(20)
+        val without = frames(20, alpha = 0f)
+        val mixed = with.indices.map { if (it % 2 == 0) with[it] else without[it] }
+        val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, mixed))!!
+        assertTrue(layer.hasWatermark)
+        assertEquals(10, layer.stats.presentFrames)
+        assertTrue(layer.signaturePairs.isNotEmpty())
+        fun rgba(frame: ByteArray, flip: Boolean): ByteArray {
+            val out = ByteArray(w * h * 4)
+            for (y in 0 until h) for (x in 0 until w) {
+                val src = (y * w + x) * 3
+                val dst = ((if (flip) h - 1 - y else y) * w + x) * 4
+                out[dst] = frame[src]; out[dst + 1] = frame[src + 1]; out[dst + 2] = frame[src + 2]; out[dst + 3] = -1
+            }
+            return out
+        }
+        val scoreWith = WatermarkAnalyzer.presenceScore(layer.signaturePairs, layer.signatureDelta, w, h, rgba(with[3], false), false)
+        val scoreWithout = WatermarkAnalyzer.presenceScore(layer.signaturePairs, layer.signatureDelta, w, h, rgba(without[3], false), false)
+        val scoreFlipped = WatermarkAnalyzer.presenceScore(layer.signaturePairs, layer.signatureDelta, w, h, rgba(with[3], true), true)
+        assertTrue("with $scoreWith", scoreWith > 0.7f)
+        assertTrue("without $scoreWithout", scoreWithout < 0.3f)
+        assertTrue("flipped $scoreFlipped", abs(scoreFlipped - scoreWith) < 0.05f)
     }
 
     @Test
@@ -136,5 +163,8 @@ class WatermarkAnalyzerTest {
         assertEquals(0f, rects[0], 1e-6f)
         assertEquals(w.toFloat(), rects[2], 1e-6f)
         assertEquals(0f, packed.offsetUniforms(listOf(small))[0], 1e-6f)
+        // A zone whose logo is absent from the frame is flagged with width -1 (left untouched).
+        val absent = packed.rectUniforms(listOf(small), yUp = false) { false }
+        assertEquals(-1f, absent[2], 1e-6f)
     }
 }

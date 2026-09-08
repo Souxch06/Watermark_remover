@@ -40,13 +40,16 @@ class VideoRepository(private val context: Context) {
         }
     }
 
-    /** Frame used as the editing background; already rotated as displayed by players. */
+    /**
+     * Frame used as the editing background; already rotated as displayed by players.
+     * With [maxDimension] = 0 the frame is returned at the video's own resolution.
+     */
     suspend fun loadFrame(uri: Uri, timeUs: Long, maxDimension: Int = 1280): Bitmap? = withContext(Dispatchers.IO) {
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(context, uri)
             val full = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: return@withContext null
-            val scale = maxDimension.toFloat() / maxOf(full.width, full.height)
+            val scale = if (maxDimension <= 0) 1f else maxDimension.toFloat() / maxOf(full.width, full.height)
             if (scale >= 1f) full
             else Bitmap.createScaledBitmap(full, (full.width * scale).toInt(), (full.height * scale).toInt(), true)
                 .also { if (it !== full) full.recycle() }
@@ -55,6 +58,22 @@ class VideoRepository(private val context: Context) {
         } finally {
             retriever.release()
         }
+    }
+
+    /**
+     * Copy of [source] small enough to be drawn by the UI toolkit (GPU texture limits make very
+     * large bitmaps disappear from the screen). Returns [source] itself when already small.
+     */
+    fun displayCopy(source: Bitmap, maxDimension: Int = 1280): Bitmap {
+        val largest = maxOf(source.width, source.height)
+        if (largest <= maxDimension) return source
+        val scale = maxDimension.toFloat() / largest
+        return Bitmap.createScaledBitmap(
+            source,
+            (source.width * scale).toInt().coerceAtLeast(1),
+            (source.height * scale).toInt().coerceAtLeast(1),
+            true,
+        )
     }
 
     private fun queryNameAndSize(uri: Uri): Pair<String, Long> {

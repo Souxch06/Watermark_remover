@@ -52,6 +52,9 @@ private class WatermarkShaderProgram(
     private var layerTexture = 0
     private var width = 0
     private var height = 0
+    /** Tells, frame by frame, which zones actually hold the logo (null = no gating). */
+    private var presence: LayerPresence? = null
+    private var readFbo = 0
 
     override fun configure(inputWidth: Int, inputHeight: Int): Size {
         width = inputWidth
@@ -81,12 +84,47 @@ private class WatermarkShaderProgram(
             } catch (e: GlException) {
                 throw VideoFrameProcessingException(e)
             }
+            if (layer != null && layer.frameWidth == inputWidth && layer.frameHeight == inputHeight && layer.hasSignature) {
+                val ids = IntArray(1)
+                GLES20.glGenFramebuffers(1, ids, 0)
+                readFbo = ids[0]
+                presence = LayerPresence(layer, inputHeight)
+            }
         }
         return Size(inputWidth, inputHeight)
     }
 
+    /**
+     * Reads the analysed regions of the input frame and returns the zones holding the logo.
+     * Any GL problem disables the gating for the rest of the export (every zone treated as
+     * present, i.e. the v1.6 behaviour) instead of failing the export.
+     */
+    private fun presentZones(inputTexId: Int): Set<Int>? {
+        val p = presence ?: return null
+        val previous = IntArray(1)
+        GLES20.glGetIntegerv(GLES20.GL_FRAMEBUFFER_BINDING, previous, 0)
+        var result: Set<Int>? = null
+        try {
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, readFbo)
+            GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, inputTexId, 0)
+            if (GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER) == GLES20.GL_FRAMEBUFFER_COMPLETE) {
+                result = p.present()
+            }
+        } finally {
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, previous[0])
+        }
+        var failed = false
+        while (GLES20.glGetError() != GLES20.GL_NO_ERROR) failed = true
+        if (failed || result == null) {
+            presence = null
+            return null
+        }
+        return result
+    }
+
     override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
         try {
+            val present = presentZones(inputTexId)
             GLES20.glUseProgram(program)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, inputTexId)
@@ -100,7 +138,7 @@ private class WatermarkShaderProgram(
             GLES20.glUniform1i(uMethod, WatermarkShader.methodId(settings, if (usable) layer else null))
             GLES20.glUniform1f(uStrength, settings.strength)
             GLES20.glUniform1f(uFeather, WatermarkShader.featherTextureUnits(settings, width, height))
-            GlLayerTexture.bind(program, layerTexture, if (usable) layer else null, zones, yUp = true)
+            GlLayerTexture.bind(program, layerTexture, if (usable) layer else null, zones, yUp = true) { present == null || it.zoneId in present }
 
             // Client-side vertex data: make sure no VBO is bound or the pointer would be read as an offset.
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
@@ -122,5 +160,10 @@ private class WatermarkShaderProgram(
         }
         GlHelpers.deleteTexture(layerTexture)
         layerTexture = 0
+        if (readFbo != 0) {
+            GLES20.glDeleteFramebuffers(1, intArrayOf(readFbo), 0)
+            readFbo = 0
+        }
+        presence = null
     }
 }

@@ -138,11 +138,72 @@ class WatermarkLayerBuilder(private val context: Context) {
 
         /** Number of frames sampled: enough for a robust median, bounded for speed. */
         fun frameCountFor(durationMs: Long): Int = when {
-            durationMs <= 0 -> 12
-            durationMs < 4_000 -> 8
-            durationMs < 15_000 -> 12
-            durationMs < 60_000 -> 16
-            else -> 20
+            durationMs <= 0 -> 16
+            durationMs < 4_000 -> 10
+            durationMs < 15_000 -> 16
+            durationMs < 60_000 -> 20
+            else -> 24
+        }
+    }
+}
+
+/**
+ * Reads back the analysed regions of the frame currently bound to a framebuffer and tells, for
+ * each of them, whether the logo is there. Some apps alternate the position of their watermark
+ * during the video: frames without the logo must not be "un-blended" or a negative ghost appears.
+ */
+class LayerPresence(private val layer: WatermarkLayer, private val frameHeight: Int) {
+    private val buffers = HashMap<Int, ByteBuffer>()
+    private val bytes = HashMap<Int, ByteArray>()
+
+    /**
+     * Must be called with the source frame bound as the READ framebuffer (GL row 0 = bottom).
+     * Returns the regions holding the logo; every region when the layer has no signature.
+     */
+    fun present(): Set<Int> {
+        if (!layer.hasSignature) return layer.regions.map { it.zoneId }.toSet()
+        val result = HashSet<Int>()
+        for (region in layer.regions) {
+            if (region.stats.maskPixels == 0) continue
+            val size = region.width * region.height * 4
+            val buffer = buffers.getOrPut(region.zoneId) { ByteBuffer.allocateDirect(size).order(ByteOrder.nativeOrder()) }
+            val array = bytes.getOrPut(region.zoneId) { ByteArray(size) }
+            buffer.rewind()
+            // GL rows start at the bottom: region top row `top` is GL row frameHeight - top - height.
+            GLES20.glPixelStorei(GLES20.GL_PACK_ALIGNMENT, 1)
+            GLES20.glReadPixels(
+                region.left, frameHeight - region.top - region.height, region.width, region.height,
+                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer,
+            )
+            GLES20.glPixelStorei(GLES20.GL_PACK_ALIGNMENT, 4)
+            buffer.rewind()
+            buffer.get(array)
+            if (region.presence(array, flipY = true) >= WatermarkLayer.PRESENCE_THRESHOLD) result.add(region.zoneId)
+        }
+        return result
+    }
+
+    companion object {
+        /** Same test on a decoded frame (row 0 = top), for the preview. */
+        fun fromBitmap(layer: WatermarkLayer, frame: Bitmap): Set<Int> {
+            if (!layer.hasSignature) return layer.regions.map { it.zoneId }.toSet()
+            val result = HashSet<Int>()
+            for (region in layer.regions) {
+                if (region.stats.maskPixels == 0) continue
+                if (region.left + region.width > frame.width || region.top + region.height > frame.height) continue
+                val pixels = IntArray(region.width * region.height)
+                frame.getPixels(pixels, 0, region.width, region.left, region.top, region.width, region.height)
+                val rgba = ByteArray(pixels.size * 4)
+                for (i in pixels.indices) {
+                    val p = pixels[i]
+                    rgba[i * 4] = (p shr 16).toByte()
+                    rgba[i * 4 + 1] = (p shr 8).toByte()
+                    rgba[i * 4 + 2] = p.toByte()
+                    rgba[i * 4 + 3] = -1
+                }
+                if (region.presence(rgba, flipY = false) >= WatermarkLayer.PRESENCE_THRESHOLD) result.add(region.zoneId)
+            }
+            return result
         }
     }
 }
@@ -171,13 +232,24 @@ object GlLayerTexture {
         return ids[0]
     }
 
-    /** Sets every layer uniform of [program]; binds the texture on unit 1. */
-    fun bind(program: Int, textureId: Int, layer: WatermarkLayer?, zones: List<WatermarkZone>, yUp: Boolean) {
+    /**
+     * Sets every layer uniform of [program]; binds the texture on unit 1.
+     * @param present which regions hold the logo in the frame being drawn (others fall back to
+     *   the spatial reconstruction)
+     */
+    fun bind(
+        program: Int,
+        textureId: Int,
+        layer: WatermarkLayer?,
+        zones: List<WatermarkZone>,
+        yUp: Boolean,
+        present: (WatermarkLayer.Region) -> Boolean = { true },
+    ) {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(program, WatermarkShader.U_LAYER_SAMPLER), 1)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        val rects = layer?.rectUniforms(zones, yUp) ?: FloatArray(WatermarkShader.MAX_ZONES * 4)
+        val rects = layer?.rectUniforms(zones, yUp, present) ?: FloatArray(WatermarkShader.MAX_ZONES * 4)
         val offsets = layer?.offsetUniforms(zones) ?: FloatArray(WatermarkShader.MAX_ZONES)
         val scale = layer?.scaleUniform(yUp) ?: floatArrayOf(1f, 1f)
         GLES20.glUniform4fv(GLES20.glGetUniformLocation(program, WatermarkShader.U_LAYER_RECT), WatermarkShader.MAX_ZONES, rects, 0)
