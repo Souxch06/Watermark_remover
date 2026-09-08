@@ -87,4 +87,12 @@ class ZoneGeometryTest {
     fun `target bitrate is capped`() {
         assertEquals(ExportQuality.MAX_BITRATE.toInt(), ExportQuality.MAXIMUM.targetBitrate(7680, 4320, 60f, 400_000_000))
     }
+
+    @Test
+    fun `reconstruction uses a tight anti-aliasing band, other methods a soft feather`() {
+        val inpaint = WatermarkShader.featherTextureUnits(RemovalSettings(method = RemovalMethod.INPAINT), 1920, 1080)
+        assertEquals(WatermarkShader.INPAINT_EDGE_PIXELS / 1920f, inpaint, 1e-6f)
+        val blur = WatermarkShader.featherTextureUnits(RemovalSettings(method = RemovalMethod.BLUR), 1920, 1080)
+        assertTrue(blur > inpaint * 4)
+    }
 }

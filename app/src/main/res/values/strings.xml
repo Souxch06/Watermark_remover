@@ -59,7 +59,7 @@
     <string name="method_label">Méthode de suppression</string>
     <string name="method_inpaint">Reconstruction (recommandé)</string>
     <string name="method_inpaint_short">Reconstruction</string>
-    <string name="method_inpaint_desc">Reconstruit la zone à partir des couleurs et de la texture qui l\'entourent, sans effet de flou.</string>
+    <string name="method_inpaint_desc">Remplit la zone par une copie nette de l\'image qui l\'entoure (grain et détails conservés), tons raccordés automatiquement.</string>
     <string name="method_blur">Flou</string>
     <string name="method_blur_desc">Floute fortement la zone. Le filigrane devient illisible mais la zone reste visible.</string>
     <string name="method_pixelate">Pixellisation</string>

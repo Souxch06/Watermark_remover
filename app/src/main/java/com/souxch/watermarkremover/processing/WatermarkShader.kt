@@ -18,6 +18,9 @@ object WatermarkShader {
     /** Maximum number of zones processed in a single pass. */
     const val MAX_ZONES = 6
 
+    /** Anti-aliasing band (in pixels) around a reconstructed zone. */
+    const val INPAINT_EDGE_PIXELS = 2.5f
+
     // ---- Uniform / attribute names ----
     const val U_TEX_SAMPLER = "uTexSampler"
     const val U_TRANSFORMATION_MATRIX = "uTransformationMatrix"
@@ -95,78 +98,102 @@ object WatermarkShader {
           return acc / wsum;
         }
 
-        // Small 3x3 tent blur used to split a sample into low / high frequencies.
-        vec4 blurSmall(vec2 uv) {
-          vec2 s = uTexelSize * 1.5;
-          vec4 acc = sampleTex(uv) * 4.0;
-          acc += (sampleTex(uv + vec2(s.x, 0.0)) + sampleTex(uv - vec2(s.x, 0.0))
-                + sampleTex(uv + vec2(0.0, s.y)) + sampleTex(uv - vec2(0.0, s.y))) * 2.0;
-          acc += sampleTex(uv + s) + sampleTex(uv - s)
-               + sampleTex(uv + vec2(s.x, -s.y)) + sampleTex(uv + vec2(-s.x, s.y));
-          return acc / 16.0;
+        // Wide, low-pass average of the picture around `p` (in texel units), with every tap kept
+        // OUTSIDE the zone on the given side so the watermark itself is never sampled:
+        // side 0 = left of the zone, 1 = right, 2 = below, 3 = above.
+        vec4 lowPassOutside(vec2 p, float stepPx, int side, vec4 r) {
+          vec2 m = uTexelSize * 2.0;
+          vec4 acc = vec4(0.0);
+          float wsum = 0.0;
+          for (int x = -3; x <= 3; x++) {
+            for (int y = -3; y <= 3; y++) {
+              float w = exp(-float(x * x + y * y) / 4.5);
+              vec2 q = p + vec2(float(x), float(y)) * stepPx * uTexelSize;
+              if (side == 0) { q.x = min(q.x, r.x - m.x); }
+              else if (side == 1) { q.x = max(q.x, r.z + m.x); }
+              else if (side == 2) { q.y = min(q.y, r.y - m.y); }
+              else { q.y = max(q.y, r.w + m.y); }
+              acc += sampleTex(q) * w;
+              wsum += w;
+            }
+          }
+          return acc / wsum;
         }
 
-        // High-frequency content (grain, texture, fine edges) at uv.
-        vec3 detailAt(vec2 uv) {
-          return sampleTex(uv).rgb - blurSmall(uv).rgb;
-        }
-
-        // Frequency-separation inpainting.
-        //  * LOW frequencies (tones, gradients) come from a smooth blend of the colours found just
-        //    outside each edge of the zone (blurred along the edge, weighted by inverse squared
-        //    distance), so the fill always matches its surroundings without a visible seam.
-        //  * HIGH frequencies (grain, texture) are borrowed from the real pixels outside the zone,
-        //    mirrored across the nearest edges - slightly compressed and skewed so that large zones
-        //    do not show an obvious mirror image. Adding them back is what keeps the result from
-        //    looking blurry.
+        // Sharp reconstruction of the zone.
+        //  1. Every pixel is a straight COPY of the real, untouched pixel mirrored across the
+        //     nearest edge of the zone (texel-aligned, no resampling): the fill keeps 100 % of the
+        //     grain, texture and fine edges of the surroundings - nothing is averaged or blurred.
+        //     Only in the narrow band where two edges are equally close do the two candidates
+        //     cross-fade, which hides the diagonal seam.
+        //  2. The mirrored copy is then tone-matched: the large-scale colour/brightness of the
+        //     patch is replaced by the colour expected at this point from the four edges (weighted
+        //     by inverse squared distance), so gradients continue smoothly through the zone while
+        //     the detail stays crisp.
         // Directions whose source would fall outside the frame (zone touching a border) fade out.
         vec4 inpaintAt(vec2 uv, vec4 r) {
           vec2 zoneSize = vec2(r.z - r.x, r.w - r.y);
-          vec2 margin = uTexelSize * 4.0;
-          float dl = uv.x - r.x;
-          float dr = r.z - uv.x;
-          float db = uv.y - r.y;
-          float dt = r.w - uv.y;
+          vec2 m = uTexelSize * 2.0;
+          // Work from a point clamped inside the zone so the feather band simply continues the
+          // edge reconstruction instead of sampling the watermark.
+          vec2 q = clamp(uv, r.xy + uTexelSize * 0.5, r.zw - uTexelSize * 0.5);
+          float dl = q.x - r.x;
+          float dr = r.z - q.x;
+          float db = q.y - r.y;
+          float dt = r.w - q.y;
 
-          // Mirrored source positions (k < 1 compresses, the perpendicular term skews).
-          float k = 0.8;
-          float skew = 0.25;
-          vec2 pl = vec2(r.x - margin.x - dl * k, uv.y + dl * skew);
-          vec2 pr = vec2(r.z + margin.x + dr * k, uv.y - dr * skew);
-          vec2 pb = vec2(uv.x + db * skew, r.y - margin.y - db * k);
-          vec2 pt = vec2(uv.x - dt * skew, r.w + margin.y + dt * k);
+          // Mirrored source positions, snapped to texel centres (exact copy, no bilinear blur).
+          vec2 pl = (floor(vec2(r.x - m.x - dl, q.y) / uTexelSize) + 0.5) * uTexelSize;
+          vec2 pr = (floor(vec2(r.z + m.x + dr, q.y) / uTexelSize) + 0.5) * uTexelSize;
+          vec2 pb = (floor(vec2(q.x, r.y - m.y - db) / uTexelSize) + 0.5) * uTexelSize;
+          vec2 pt = (floor(vec2(q.x, r.w + m.y + dt) / uTexelSize) + 0.5) * uTexelSize;
 
           // Validity of each direction (smooth so no seam appears where a source leaves the frame).
-          float vl = smoothstep(0.0, 0.05, pl.x);
-          float vr = 1.0 - smoothstep(0.95, 1.0, pr.x);
-          float vb = smoothstep(0.0, 0.05, pb.y);
-          float vt = 1.0 - smoothstep(0.95, 1.0, pt.y);
-
-          float wl = vl / (dl * dl + 1e-5);
-          float wr = vr / (dr * dr + 1e-5);
-          float wb = vb / (db * db + 1e-5);
-          float wt = vt / (dt * dt + 1e-5);
-          float wsum = wl + wr + wb + wt;
-          if (wsum <= 1e-4) {
+          vec2 v8 = uTexelSize * 8.0;
+          float vl = smoothstep(0.0, v8.x, pl.x);
+          float vr = 1.0 - smoothstep(1.0 - v8.x, 1.0, pr.x);
+          float vb = smoothstep(0.0, v8.y, pb.y);
+          float vt = 1.0 - smoothstep(1.0 - v8.y, 1.0, pt.y);
+          if (vl + vr + vb + vt <= 1e-4) {
             return blurAt(uv, uTexelSize * 8.0);
           }
 
-          // Low frequencies: colours just outside each edge, blurred mostly ALONG the edge (kills
-          // streaks) and kept fully outside the zone (never samples the watermark itself).
-          vec2 sLR = vec2(uTexelSize.x * 1.5, max(zoneSize.y * 0.03, uTexelSize.y * 1.5));
-          vec2 sTB = vec2(max(zoneSize.x * 0.03, uTexelSize.x * 1.5), uTexelSize.y * 1.5);
-          vec2 off = margin + uTexelSize * 6.0;
-          vec4 base = (blurAt(vec2(r.x - off.x, uv.y), sLR) * wl
-                     + blurAt(vec2(r.z + off.x, uv.y), sLR) * wr
-                     + blurAt(vec2(uv.x, r.y - off.y), sTB) * wb
-                     + blurAt(vec2(uv.x, r.w + off.y), sTB) * wt) / wsum;
+          // Nearest-edge selection (distances measured in texels so it is aspect-correct;
+          // invalid directions are pushed far away - values kept small enough for mediump).
+          vec2 px = 1.0 / uTexelSize;
+          vec4 dp = vec4(dl * px.x, dr * px.x, db * px.y, dt * px.y);
+          float el = dp.x + (1.0 - vl) * 4096.0;
+          float er = dp.y + (1.0 - vr) * 4096.0;
+          float eb = dp.z + (1.0 - vb) * 4096.0;
+          float et = dp.w + (1.0 - vt) * 4096.0;
+          float emin = min(min(el, er), min(eb, et));
+          float tau = max(0.05 * min(zoneSize.x * px.x, zoneSize.y * px.y), 2.0);
+          float nl = exp(-(el - emin) / tau);
+          float nr = exp(-(er - emin) / tau);
+          float nb = exp(-(eb - emin) / tau);
+          float nt = exp(-(et - emin) / tau);
+          float nsum = nl + nr + nb + nt;
 
-          // High frequencies: real texture borrowed from the mirrored sources.
-          vec3 detail = (detailAt(pl) * wl + detailAt(pr) * wr
-                       + detailAt(pb) * wb + detailAt(pt) * wt) / wsum;
+          vec4 copy = (sampleTex(pl) * nl + sampleTex(pr) * nr
+                     + sampleTex(pb) * nb + sampleTex(pt) * nt) / nsum;
 
-          float amount = clamp(uStrength * 1.4, 0.0, 1.0);
-          return vec4(clamp(base.rgb + detail * amount, 0.0, 1.0), base.a);
+          // Tone matching: large-scale colour of the copied patch vs. the colour expected here.
+          float radiusPx = clamp(0.5 * min(zoneSize.x * px.x, zoneSize.y * px.y), 6.0, 48.0);
+          float stepPx = radiusPx / 3.0;
+          vec4 copyLow = (lowPassOutside(pl, stepPx, 0, r) * nl + lowPassOutside(pr, stepPx, 1, r) * nr
+                        + lowPassOutside(pb, stepPx, 2, r) * nb + lowPassOutside(pt, stepPx, 3, r) * nt) / nsum;
+
+          float wl = vl / (dp.x * dp.x + 1.0);
+          float wr = vr / (dp.y * dp.y + 1.0);
+          float wb = vb / (dp.z * dp.z + 1.0);
+          float wt = vt / (dp.w * dp.w + 1.0);
+          float wsum = wl + wr + wb + wt;
+          vec4 expected = (lowPassOutside(vec2(r.x - m.x, q.y), stepPx, 0, r) * wl
+                         + lowPassOutside(vec2(r.z + m.x, q.y), stepPx, 1, r) * wr
+                         + lowPassOutside(vec2(q.x, r.y - m.y), stepPx, 2, r) * wb
+                         + lowPassOutside(vec2(q.x, r.w + m.y), stepPx, 3, r) * wt) / wsum;
+
+          return vec4(clamp(copy.rgb + (expected.rgb - copyLow.rgb), 0.0, 1.0), copy.a);
         }
 
         vec4 pixelateAt(vec2 uv, vec4 r) {
@@ -246,7 +273,13 @@ object WatermarkShader {
     fun featherTextureUnits(settings: RemovalSettings, width: Int, height: Int): Float {
         if (width <= 0 || height <= 0) return 0f
         val minDim = minOf(width, height).toFloat()
-        val pixels = settings.featherFraction * minDim
+        // The reconstruction is a seamless copy of the surroundings, so it only needs a few
+        // pixels of anti-aliasing at the border; a wide feather would just smear the result.
+        val pixels = if (methodId(settings) == RemovalMethod.INPAINT.shaderId) {
+            INPAINT_EDGE_PIXELS
+        } else {
+            settings.featherFraction * minDim
+        }
         // Convert pixel count to texture units using the larger axis so it's never bigger than
         // the fraction on either axis.
         return pixels / maxOf(width, height).toFloat()

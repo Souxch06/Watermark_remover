@@ -26,8 +26,12 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   jusqu'à 6 zones, guides d'alignement.
 - **Aperçu avant / après** rendu par le *même shader* que l'export (fidèle au résultat final),
   bascule Avant/Après + « maintenir pour voir l'original ».
-- **4 méthodes** : Reconstruction (inpainting), Flou, Pixellisation, Recadrage – avec curseurs
-  d'intensité et d'adoucissement des bords.
+- **4 méthodes** : Reconstruction (recommandée), Flou, Pixellisation, Recadrage. Aucun réglage :
+  tout est automatique.
+- **Reconstruction nette** : la zone est remplie par une copie pixel à pixel (sans rééchantillonnage
+  ni moyenne) de l'image réelle en miroir du bord le plus proche, puis les tons sont raccordés aux
+  quatre bords. Le grain et les détails de la vidéo sont conservés : pas de tache floue à
+  l'emplacement du filigrane.
 - **Export GPU** (décodage → shader OpenGL → encodage H.264/AAC) avec progression et annulation.
 - **Bibliothèque « Mes vidéos »** : toutes les vidéos traitées, avec miniature, durée, résolution,
   taille, méthode utilisée ; lecture, partage, renommage, suppression. Les fichiers sont dans

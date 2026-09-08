@@ -59,7 +59,7 @@
     <string name="method_label">Removal method</string>
     <string name="method_inpaint">Reconstruction (recommended)</string>
     <string name="method_inpaint_short">Reconstruction</string>
-    <string name="method_inpaint_desc">Rebuilds the area from the surrounding colours and texture, without a blurry look.</string>
+    <string name="method_inpaint_desc">Fills the area with a sharp copy of the surrounding picture (grain and detail preserved), tones matched automatically.</string>
     <string name="method_blur">Blur</string>
     <string name="method_blur_desc">Heavily blurs the area. The watermark becomes unreadable but the area stays visible.</string>
     <string name="method_pixelate">Pixelate</string>
