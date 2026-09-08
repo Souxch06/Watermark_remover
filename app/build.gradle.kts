@@ -7,17 +7,29 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-// Release signing.
-// - Locally: create `keystore.properties` at the repo root (git-ignored) with
-//   storeFile / storePassword / keyAlias / keyPassword.
-// - CI: the "Release" workflow writes the same file from repository secrets.
-// - Without either, release builds fall back to the debug key so `assembleRelease`
-//   always produces an installable APK.
+// Release signing. A STABLE key is what lets Android install an update over the previous
+// version instead of demanding an uninstall. Lookup order:
+//   1. `keystore.properties` at the repo root (git-ignored) – private key, written by the
+//      Release workflow when the KEYSTORE_* secrets are configured, or by hand locally.
+//   2. `signing/keystore.properties` + `signing/release.jks` – public key committed in the repo,
+//      so builds from GitHub Actions are always consistently signed with zero configuration.
+//   3. Debug key (local `assembleRelease` only, never on CI).
+val keystorePropsFile: File? = listOf(
+    rootProject.file("keystore.properties"),
+    rootProject.file("signing/keystore.properties"),
+).firstOrNull { it.exists() }
 val keystoreProps = Properties().apply {
-    val f = rootProject.file("keystore.properties")
-    if (f.exists()) f.inputStream().use { load(it) }
+    keystorePropsFile?.inputStream()?.use { load(it) }
 }
-val hasReleaseKeystore = keystoreProps.getProperty("storeFile")?.let { rootProject.file(it).exists() } == true
+val keystoreFile: File? = keystoreProps.getProperty("storeFile")?.let { path ->
+    val direct = File(path)
+    when {
+        direct.isAbsolute -> direct
+        File(keystorePropsFile!!.parentFile, path).exists() -> File(keystorePropsFile.parentFile, path)
+        else -> rootProject.file(path)
+    }
+}
+val hasReleaseKeystore = keystoreFile?.exists() == true
 
 android {
     namespace = "com.souxch.watermarkremover"
@@ -40,7 +52,7 @@ android {
     signingConfigs {
         if (hasReleaseKeystore) {
             create("release") {
-                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                storeFile = keystoreFile
                 storePassword = keystoreProps.getProperty("storePassword")
                 keyAlias = keystoreProps.getProperty("keyAlias")
                 keyPassword = keystoreProps.getProperty("keyPassword")
@@ -71,6 +83,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true // BuildConfig.VERSION_NAME is used by the in-app update check
     }
 
     testOptions {

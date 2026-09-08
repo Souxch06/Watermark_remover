@@ -5,7 +5,11 @@ import android.graphics.Bitmap
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.souxch.watermarkremover.BuildConfig
+import com.souxch.watermarkremover.data.AppUpdate
 import com.souxch.watermarkremover.data.LibraryRepository
+import com.souxch.watermarkremover.data.UpdateChecker
+import com.souxch.watermarkremover.data.UpdateInstaller
 import com.souxch.watermarkremover.data.ProcessedVideo
 import com.souxch.watermarkremover.model.Corner
 import com.souxch.watermarkremover.model.RemovalMethod
@@ -44,8 +48,20 @@ sealed interface Screen {
 sealed interface UiMessage {
     data object Deleted : UiMessage
     data object Renamed : UiMessage
+    data object UpToDate : UiMessage
+    data object UpdateDownloadFailed : UiMessage
     data class Error(val text: String) : UiMessage
 }
+
+/** State of the in-app update banner. */
+data class UpdateState(
+    val available: AppUpdate? = null,
+    val checking: Boolean = false,
+    /** 0..100 while downloading, null otherwise. */
+    val downloadProgress: Int? = null,
+    /** Android 8+: the user must allow this app to install packages first. */
+    val needsInstallPermission: Boolean = false,
+)
 
 data class EditorState(
     val screen: Screen = Screen.Main,
@@ -60,6 +76,7 @@ data class EditorState(
     val showAfter: Boolean = true,
     val library: List<ProcessedVideo> = emptyList(),
     val libraryLoaded: Boolean = false,
+    val update: UpdateState = UpdateState(),
 )
 
 @OptIn(FlowPreview::class)
@@ -69,6 +86,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private val exporter = VideoExporter(app)
     private val library = LibraryRepository(app)
     private val previewRenderer = PreviewRenderer()
+    private val updateChecker = UpdateChecker(app, BuildConfig.VERSION_NAME)
+    private val updateInstaller = UpdateInstaller(app)
 
     private val _state = MutableStateFlow(EditorState())
     val state: StateFlow<EditorState> = _state
@@ -81,6 +100,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         viewModelScope.launch { library.items.collect { items -> _state.update { it.copy(library = items) } } }
+        checkForUpdate(force = false, manual = false)
         viewModelScope.launch {
             runCatching { library.refresh() }
             _state.update { it.copy(libraryLoaded = true) }
@@ -219,6 +239,62 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             val frame = repository.loadFrame(info.uri, (info.durationMs * 1000L) / 3)
             _state.update { it.copy(screen = Screen.Editor(info, frame), previewFrame = null) }
         }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Updates
+    // ------------------------------------------------------------------------------------------
+
+    fun checkForUpdate(force: Boolean = true, manual: Boolean = true) {
+        if (_state.value.update.checking) return
+        _state.update { it.copy(update = it.update.copy(checking = true)) }
+        viewModelScope.launch {
+            val found = updateChecker.check(force)
+            val show = found != null && (manual || !updateChecker.isDismissed(found.version))
+            _state.update { it.copy(update = it.update.copy(checking = false, available = if (show) found else null)) }
+            if (manual && found == null) messages.tryEmit(UiMessage.UpToDate)
+        }
+    }
+
+    fun dismissUpdate() {
+        _state.value.update.available?.let { updateChecker.dismiss(it.version) }
+        _state.update { it.copy(update = it.update.copy(available = null, needsInstallPermission = false)) }
+    }
+
+    /** Called when the user comes back from the "install unknown apps" settings screen. */
+    fun onResumed() {
+        if (_state.value.update.needsInstallPermission && updateInstaller.canInstallPackages()) {
+            _state.update { it.copy(update = it.update.copy(needsInstallPermission = false)) }
+            installUpdate()
+        }
+    }
+
+    fun openInstallPermissionSettings() = updateInstaller.openInstallPermissionSettings()
+
+    fun installUpdate() {
+        val update = _state.value.update.available ?: return
+        if (_state.value.update.downloadProgress != null) return
+        if (!updateInstaller.canInstallPackages()) {
+            _state.update { it.copy(update = it.update.copy(needsInstallPermission = true)) }
+            return
+        }
+        _state.update { it.copy(update = it.update.copy(downloadProgress = 0)) }
+        updateInstaller.downloadAndInstall(
+            update,
+            onProgress = { p -> _state.update { it.copy(update = it.update.copy(downloadProgress = p)) } },
+            onDone = { ok ->
+                _state.update { it.copy(update = it.update.copy(downloadProgress = null)) }
+                if (!ok) {
+                    messages.tryEmit(UiMessage.UpdateDownloadFailed)
+                    updateInstaller.openInBrowser(update)
+                }
+            },
+        )
+    }
+
+    override fun onCleared() {
+        updateInstaller.unregister()
+        super.onCleared()
     }
 
     // ------------------------------------------------------------------------------------------

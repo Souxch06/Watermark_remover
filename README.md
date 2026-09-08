@@ -88,17 +88,19 @@ git push origin v1.0.0
 Le `versionCode` Android est incrémenté automatiquement (numéro d'exécution), la release est
 créée avec des notes générées, l'APK et son empreinte SHA-256.
 
-### Signature (optionnelle mais recommandée)
+### Mises à jour sans désinstaller
 
-Par défaut l'APK est signé avec la clé *debug* : il s'installe sans problème, mais pour que les
-futures mises à jour s'installent **par-dessus** l'ancienne version sans la désinstaller, utilisez
-une clé stable :
+Android n'accepte une mise à jour par-dessus une application installée que si les deux sont
+signées avec **la même clé**. Toutes les releases (à partir de la 1.4.0) sont donc signées avec la
+clé stable `signing/release.jks`, committée dans le dépôt : chaque nouvel APK s'installe
+directement par-dessus le précédent, en conservant la bibliothèque et les réglages.
 
-```bash
-keytool -genkeypair -v -keystore release.jks -alias watermark -keyalg RSA -keysize 2048 -validity 10000
-base64 -w0 release.jks      # copier la sortie dans le secret KEYSTORE_BASE64
-```
+L'application vérifie aussi elle-même (au plus une fois toutes les 6 h, une seule requête vers
+l'API GitHub) si une nouvelle release existe et propose de la **télécharger et l'installer en un
+appui** depuis l'écran d'accueil.
 
-Puis ajoutez dans *Settings → Secrets and variables → Actions* : `KEYSTORE_BASE64`,
-`KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`. En local, créez un fichier `keystore.properties`
-(ignoré par git) avec `storeFile`, `storePassword`, `keyAlias`, `keyPassword`.
+> Cette clé est publique par nature (le dépôt l'est). Pour passer à une clé privée, ajoutez les
+> secrets `KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD` dans
+> *Settings → Secrets and variables → Actions* (ou un `keystore.properties` à la racine en local) :
+> ils ont priorité sur la clé committée. Attention : changer de clé oblige les utilisateurs à
+> désinstaller une fois.

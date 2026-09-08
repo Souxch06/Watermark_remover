@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -44,23 +45,38 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.souxch.watermarkremover.BuildConfig
 import com.souxch.watermarkremover.R
 import com.souxch.watermarkremover.data.ProcessedVideo
+import com.souxch.watermarkremover.ui.UpdateState
 import com.souxch.watermarkremover.ui.components.SectionCard
+import com.souxch.watermarkremover.ui.components.UpdateBanner
 import com.souxch.watermarkremover.ui.components.StepRow
 import com.souxch.watermarkremover.ui.theme.heroGradient
 
 @Composable
 fun HomeScreen(
     recent: List<ProcessedVideo>,
+    update: UpdateState,
     onPick: (Uri) -> Unit,
     onOpenLibrary: () -> Unit,
     onOpenItem: (ProcessedVideo) -> Unit,
+    onInstallUpdate: () -> Unit,
+    onOpenInstallPermission: () -> Unit,
+    onDismissUpdate: () -> Unit,
+    onCheckUpdate: () -> Unit,
 ) {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri -> uri?.let(onPick) }
     val pick = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)) }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        UpdateBanner(
+            state = update,
+            onInstall = onInstallUpdate,
+            onOpenPermissionSettings = onOpenInstallPermission,
+            onDismiss = onDismissUpdate,
+            modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp),
+        )
         // Hero header
         Box(
             Modifier.fillMaxWidth().padding(16.dp).clip(MaterialTheme.shapes.large).background(heroGradient()).padding(24.dp),
@@ -136,6 +152,22 @@ fun HomeScreen(
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                stringResource(R.string.version_label, BuildConfig.VERSION_NAME),
+                Modifier.padding(start = 8.dp),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = onCheckUpdate, enabled = !update.checking) {
+                if (update.checking) {
+                    CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text(stringResource(R.string.check_updates))
+            }
+        }
         Spacer(Modifier.height(96.dp)) // room for the bottom bar
     }
 }

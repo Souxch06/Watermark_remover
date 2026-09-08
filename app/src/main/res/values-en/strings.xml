@@ -89,6 +89,20 @@
     <string name="detail_source">Source video</string>
     <string name="detail_location">Location</string>
 
+    <!-- Updates -->
+    <string name="update_available_title">New version %1$s available</string>
+    <string name="update_available_size">%1$s update • installs over the current version, your videos are kept.</string>
+    <string name="update_available_message">Installs over the current version, your videos are kept.</string>
+    <string name="update_install">Update</string>
+    <string name="update_later">Later</string>
+    <string name="update_downloading">Downloading… %1$d %%</string>
+    <string name="update_permission_message">Android asks for a one-time permission so the app can install its own updates.</string>
+    <string name="update_permission_button">Allow, then come back</string>
+    <string name="check_updates">Check for updates</string>
+    <string name="version_label">Version %1$s</string>
+    <string name="snack_up_to_date">You already have the latest version.</string>
+    <string name="snack_update_failed">Download failed, opening the GitHub page…</string>
+
     <!-- Errors -->
     <string name="permission_needed">Storage permission is required to save the video.</string>
     <string name="error_generic">Details: %1$s</string>

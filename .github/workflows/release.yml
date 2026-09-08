@@ -7,13 +7,14 @@ name: Release
 #   1. Push a tag:            git tag v1.0.0 && git push origin v1.0.0
 #   2. Manually:              Actions tab -> "Release" -> "Run workflow" -> enter a version
 #
-# Optional signing with your own key (recommended for updates without reinstalling):
-# add these repository secrets (Settings -> Secrets and variables -> Actions):
+# Signing: by default the APK is signed with the public key committed in signing/ (stable, so
+# updates install over the previous version). To use a private key instead, add these
+# repository secrets (Settings -> Secrets and variables -> Actions):
 #   KEYSTORE_BASE64   : base64 of your .jks file  (base64 -w0 my-release-key.jks)
 #   KEYSTORE_PASSWORD : keystore password
 #   KEY_ALIAS         : key alias
 #   KEY_PASSWORD      : key password
-# Without them the APK is signed with the debug key (still installable).
+# (Switching keys forces existing users to uninstall once.)
 
 on:
   push:
@@ -37,6 +38,8 @@ jobs:
     name: Build & publish APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -71,10 +74,8 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: Restore release keystore (if secrets are configured)
+      - name: Restore private release keystore (only if secrets are configured)
         if: ${{ env.KEYSTORE_BASE64 != '' }}
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         shell: bash
         run: |
           echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
@@ -94,6 +95,17 @@ jobs:
           ./gradlew assembleRelease --no-daemon --stacktrace
           -PversionName=${{ steps.ver.outputs.version }}
           -PversionCode=${{ steps.ver.outputs.code }}
+
+      - name: Verify signing certificate
+        shell: bash
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n1)
+          "$APKSIGNER" verify --print-certs "$APK" | tee cert.txt
+          if grep -q "Android Debug" cert.txt; then
+            echo "::error::APK is signed with a debug key – updates would not install over previous versions."
+            exit 1
+          fi
 
       - name: Collect artifacts
         id: apk
@@ -142,7 +154,9 @@ jobs:
             2. Ouvrez le fichier ; autorisez « Installer des applications inconnues » pour votre navigateur si Android le demande.
             3. Lancez **Watermark Remover**.
 
-            - Android 7.0 (API 24) minimum • Traitement 100 % sur l'appareil, aucune connexion requise.
+            - Android 7.0 (API 24) minimum • Vos vidéos ne quittent jamais l'appareil.
+            - Les mises à jour s'installent **par-dessus** la version précédente (même clé de signature depuis la 1.4.0).
+              Si vous avez une version ≤ 1.3.0, désinstallez-la une dernière fois avant d'installer celle-ci.
             - SHA-256 : `${{ steps.apk.outputs.sha }}`
 
             ---

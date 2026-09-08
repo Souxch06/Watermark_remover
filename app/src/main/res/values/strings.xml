@@ -89,6 +89,20 @@
     <string name="detail_source">Vidéo d\'origine</string>
     <string name="detail_location">Emplacement</string>
 
+    <!-- Updates -->
+    <string name="update_available_title">Nouvelle version %1$s disponible</string>
+    <string name="update_available_size">Mise à jour de %1$s • s\'installe par-dessus la version actuelle, vos vidéos sont conservées.</string>
+    <string name="update_available_message">S\'installe par-dessus la version actuelle, vos vidéos sont conservées.</string>
+    <string name="update_install">Mettre à jour</string>
+    <string name="update_later">Plus tard</string>
+    <string name="update_downloading">Téléchargement… %1$d %%</string>
+    <string name="update_permission_message">Android demande une autorisation unique pour que l\'application puisse installer ses mises à jour.</string>
+    <string name="update_permission_button">Autoriser puis revenir</string>
+    <string name="check_updates">Rechercher une mise à jour</string>
+    <string name="version_label">Version %1$s</string>
+    <string name="snack_up_to_date">Vous avez déjà la dernière version.</string>
+    <string name="snack_update_failed">Téléchargement impossible, ouverture de la page GitHub…</string>
+
     <!-- Errors -->
     <string name="permission_needed">L\'autorisation de stockage est nécessaire pour enregistrer la vidéo.</string>
     <string name="error_generic">Détail : %1$s</string>

@@ -51,12 +51,16 @@ fun WatermarkRemoverApp(viewModel: EditorViewModel) {
 
     val deletedText = stringResource(R.string.snack_deleted)
     val renamedText = stringResource(R.string.snack_renamed)
+    val upToDateText = stringResource(R.string.snack_up_to_date)
+    val updateFailedText = stringResource(R.string.snack_update_failed)
     LaunchedEffect(Unit) {
         viewModel.messages.collect { msg ->
             snackbar.showSnackbar(
                 when (msg) {
                     UiMessage.Deleted -> deletedText
                     UiMessage.Renamed -> renamedText
+                    UiMessage.UpToDate -> upToDateText
+                    UiMessage.UpdateDownloadFailed -> updateFailedText
                     is UiMessage.Error -> msg.text
                 },
             )
@@ -117,9 +121,14 @@ fun WatermarkRemoverApp(viewModel: EditorViewModel) {
                         when (tab) {
                             Tab.HOME -> HomeScreen(
                                 recent = state.library,
+                                update = state.update,
                                 onPick = viewModel::openVideo,
                                 onOpenLibrary = { viewModel.selectTab(Tab.LIBRARY) },
                                 onOpenItem = { openVideo(context, Uri.parse(it.uri)) },
+                                onInstallUpdate = viewModel::installUpdate,
+                                onOpenInstallPermission = viewModel::openInstallPermissionSettings,
+                                onDismissUpdate = viewModel::dismissUpdate,
+                                onCheckUpdate = { viewModel.checkForUpdate() },
                             )
                             Tab.LIBRARY -> LibraryScreen(
                                 videos = state.library,

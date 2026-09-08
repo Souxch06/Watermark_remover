@@ -27,6 +27,11 @@ class MainActivity : ComponentActivity() {
         if (savedInstanceState == null) handleIncoming(intent)
     }
 
+    override fun onResume() {
+        super.onResume()
+        viewModel.onResumed()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleIncoming(intent)
