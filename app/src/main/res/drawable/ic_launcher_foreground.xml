@@ -1,32 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Launcher icon: a rounded video frame whose bottom-right corner (the watermark spot)
-     is being wiped clean by a sparkle. Drawn inside the 66dp safe zone of the 108dp canvas. -->
+<!-- Launcher foreground: a video frame whose bottom-right corner (where watermarks live) has
+     been wiped away by a sparkle. Everything sits inside the 66dp safe zone of the 108dp canvas. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Frame body -->
+    <!-- Frame, open at the bottom-right -->
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="5.5"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M58,71 H37 A8,8 0 0 1 29,63 V43 A8,8 0 0 1 37,35 H67 A8,8 0 0 1 75,43 V56" />
+    <!-- Big sparkle -->
     <path
         android:fillColor="#FFFFFFFF"
-        android:pathData="M30,34 h48 a6,6 0 0 1 6,6 v28 a6,6 0 0 1 -6,6 h-48 a6,6 0 0 1 -6,-6 v-28 a6,6 0 0 1 6,-6 z" />
-    <!-- Screen -->
+        android:pathData="M72,57 Q72,68 83,68 Q72,68 72,79 Q72,68 61,68 Q72,68 72,57 Z" />
+    <!-- Small sparkles -->
     <path
-        android:fillColor="#FF0B5A78"
-        android:pathData="M31,40 h46 v28 h-46 z" />
-    <!-- Play glyph -->
+        android:fillColor="#F2FFFFFF"
+        android:pathData="M60,55 Q60,59.5 64.5,59.5 Q60,59.5 60,64 Q60,59.5 55.5,59.5 Q60,59.5 60,55 Z" />
     <path
-        android:fillColor="#FF5FD0F0"
-        android:pathData="M48,47 l12,7 -12,7 z" />
-    <!-- Watermark being erased: faded stripes bottom-right -->
-    <path
-        android:fillColor="#66FFFFFF"
-        android:pathData="M60,60 h14 v2 h-14 z M60,64 h9 v2 h-9 z" />
-    <!-- Sparkle -->
-    <path
-        android:fillColor="#FFFFB454"
-        android:pathData="M78,56 l2.4,5.6 5.6,2.4 -5.6,2.4 -2.4,5.6 -2.4,-5.6 -5.6,-2.4 5.6,-2.4 z" />
-    <path
-        android:fillColor="#FFFFB454"
-        android:pathData="M70,68 l1.2,2.8 2.8,1.2 -2.8,1.2 -1.2,2.8 -1.2,-2.8 -2.8,-1.2 2.8,-1.2 z" />
+        android:fillColor="#E6FFFFFF"
+        android:pathData="M83,54 Q83,57 86,57 Q83,57 83,60 Q83,57 80,57 Q83,57 83,54 Z" />
 </vector>

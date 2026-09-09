@@ -5,21 +5,25 @@ import android.content.Intent
 import android.net.Uri
 import android.text.format.DateUtils
 import android.text.format.Formatter
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -28,36 +32,76 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.souxch.watermarkremover.R
 import com.souxch.watermarkremover.model.RemovalMethod
+import com.souxch.watermarkremover.ui.theme.brandGradient
 
-/** Card with a subtle container colour, used for all grouped content. */
+/** White (or dark) card with a hairline border, used for all grouped content. */
 @Composable
-fun SectionCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
-    Card(
+fun SectionCard(
+    modifier: Modifier = Modifier,
+    contentPadding: PaddingValues = PaddingValues(18.dp),
+    content: @Composable () -> Unit,
+) {
+    Surface(
         modifier = modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.medium,
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+        tonalElevation = 0.dp,
+        shadowElevation = 0.dp,
     ) {
-        Box(Modifier.padding(16.dp)) { content() }
+        Box(Modifier.padding(contentPadding)) { content() }
+    }
+}
+
+/** Small uppercase-ish section header with an optional trailing action. */
+@Composable
+fun SectionHeader(title: String, modifier: Modifier = Modifier, trailing: @Composable (() -> Unit)? = null) {
+    Row(modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+        trailing?.invoke()
+    }
+}
+
+/** Round icon badge filled with the brand gradient (hero header, "done" screen). */
+@Composable
+fun GradientBadge(icon: ImageVector, size: Dp = 56.dp, iconSize: Dp = 30.dp) {
+    Box(Modifier.size(size).clip(CircleShape).background(brandGradient()), contentAlignment = Alignment.Center) {
+        Icon(icon, null, tint = Color.White, modifier = Modifier.size(iconSize))
     }
 }
 
 /** Numbered step row used on the home screen. */
 @Composable
-fun StepRow(number: Int, icon: ImageVector, title: String, subtitle: String) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(
-            Modifier.size(40.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(icon, null, tint = MaterialTheme.colorScheme.onPrimaryContainer)
+fun StepRow(number: Int, icon: ImageVector, title: String, subtitle: String, last: Boolean = false) {
+    Row(verticalAlignment = Alignment.Top) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Box(
+                Modifier.size(40.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(icon, null, tint = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.size(20.dp))
+            }
+            if (!last) {
+                Box(Modifier.padding(vertical = 4.dp).width(2.dp).height(22.dp).clip(CircleShape).background(MaterialTheme.colorScheme.outlineVariant))
+            }
         }
         Spacer(Modifier.width(14.dp))
-        Column(Modifier.weight(1f)) {
-            Text("$number. $title", style = MaterialTheme.typography.titleSmall)
+        Column(Modifier.weight(1f).padding(top = 2.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    number.toString(),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.clip(RoundedCornerShape(6.dp)).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)).padding(horizontal = 6.dp, vertical = 1.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(title, style = MaterialTheme.typography.titleSmall)
+            }
+            Spacer(Modifier.height(2.dp))
             Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
@@ -65,20 +109,45 @@ fun StepRow(number: Int, icon: ImageVector, title: String, subtitle: String) {
 
 /** Small rounded label (used for method / resolution badges). */
 @Composable
-fun Pill(text: String, container: Color = MaterialTheme.colorScheme.secondaryContainer, content: Color = MaterialTheme.colorScheme.onSecondaryContainer) {
-    Box(
-        Modifier.clip(MaterialTheme.shapes.extraSmall).background(container).padding(horizontal = 8.dp, vertical = 3.dp),
+fun Pill(
+    text: String,
+    container: Color = MaterialTheme.colorScheme.secondaryContainer,
+    content: Color = MaterialTheme.colorScheme.onSecondaryContainer,
+    icon: ImageVector? = null,
+) {
+    Row(
+        Modifier.clip(CircleShape).background(container).padding(horizontal = 10.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
+        if (icon != null) {
+            Icon(icon, null, Modifier.size(13.dp), tint = content)
+            Spacer(Modifier.width(5.dp))
+        }
         Text(text, style = MaterialTheme.typography.labelSmall, color = content, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+/** Translucent chip drawn over video content (status labels on the preview). */
+@Composable
+fun OverlayChip(text: String, modifier: Modifier = Modifier, leading: @Composable (() -> Unit)? = null) {
+    Row(
+        modifier.clip(CircleShape).background(Color.Black.copy(alpha = 0.55f))
+            .border(1.dp, Color.White.copy(alpha = 0.12f), CircleShape)
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        leading?.let { it(); Spacer(Modifier.width(6.dp)) }
+        Text(text, style = MaterialTheme.typography.labelMedium, color = Color.White)
     }
 }
 
 /** Row of a title and a value in a details list. */
 @Composable
 fun DetailRow(label: String, value: String) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
         Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Spacer(Modifier.width(16.dp))
+        Text(value, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
     }
 }
 

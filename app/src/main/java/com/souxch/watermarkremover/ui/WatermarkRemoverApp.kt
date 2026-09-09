@@ -31,6 +31,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.souxch.watermarkremover.R
@@ -82,7 +83,7 @@ fun WatermarkRemoverApp(viewModel: EditorViewModel) {
         snackbarHost = { SnackbarHost(snackbar) },
         bottomBar = {
             if (screen is Screen.Main) {
-                NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer) {
+                NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer, tonalElevation = 0.dp) {
                     NavigationBarItem(
                         selected = state.tab == Tab.HOME,
                         onClick = { viewModel.selectTab(Tab.HOME) },

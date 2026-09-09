@@ -19,6 +19,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ErrorOutline
@@ -30,7 +31,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -44,6 +44,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
@@ -58,15 +59,19 @@ import com.souxch.watermarkremover.ui.components.formatSize
 import com.souxch.watermarkremover.ui.components.methodLabel
 import com.souxch.watermarkremover.ui.components.openVideo
 import com.souxch.watermarkremover.ui.components.shareVideo
-import com.souxch.watermarkremover.ui.theme.heroGradient
+import com.souxch.watermarkremover.ui.components.GradientBadge
+import com.souxch.watermarkremover.ui.theme.brandGradient
 
 @Composable
 fun LoadingScreen() {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            CircularProgressIndicator()
-            Spacer(Modifier.height(16.dp))
-            Text(stringResource(R.string.loading_video), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Box(contentAlignment = Alignment.Center) {
+                GradientBadge(Icons.Default.AutoAwesome, size = 64.dp, iconSize = 30.dp)
+                CircularProgressIndicator(Modifier.size(84.dp), strokeWidth = 3.dp, trackColor = MaterialTheme.colorScheme.surfaceContainerHighest)
+            }
+            Spacer(Modifier.height(24.dp))
+            Text(stringResource(R.string.loading_video), style = MaterialTheme.typography.titleMedium)
         }
     }
 }
@@ -82,28 +87,29 @@ fun ExportingScreen(percent: Int, sourceName: String, onCancel: () -> Unit) {
         Box(contentAlignment = Alignment.Center) {
             CircularProgressIndicator(
                 progress = { if (percent <= 0) 0f else animated },
-                modifier = Modifier.size(140.dp),
-                strokeWidth = 10.dp,
+                modifier = Modifier.size(168.dp),
+                strokeWidth = 12.dp,
+                strokeCap = StrokeCap.Round,
                 trackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
             )
             if (percent <= 0) {
-                CircularProgressIndicator(Modifier.size(140.dp), strokeWidth = 10.dp)
+                CircularProgressIndicator(Modifier.size(168.dp), strokeWidth = 12.dp, strokeCap = StrokeCap.Round)
             }
-            Text(
-                if (percent <= 0) "…" else "$percent %",
-                style = MaterialTheme.typography.headlineMedium,
-            )
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    if (percent <= 0) "…" else "$percent %",
+                    style = MaterialTheme.typography.headlineMedium,
+                )
+                Text(
+                    stringResource(R.string.export_title),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
-        Spacer(Modifier.height(28.dp))
-        Text(stringResource(R.string.export_title), style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(6.dp))
-        Text(sourceName, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
-        Spacer(Modifier.height(20.dp))
-        LinearProgressIndicator(
-            progress = { if (percent <= 0) 0f else animated },
-            modifier = Modifier.fillMaxWidth().height(6.dp).clip(CircleShape),
-        )
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(32.dp))
+        Text(sourceName, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(8.dp))
         Text(
             if (percent <= 0) stringResource(R.string.export_preparing) else stringResource(R.string.export_keep_open),
             style = MaterialTheme.typography.bodySmall,
@@ -111,7 +117,7 @@ fun ExportingScreen(percent: Int, sourceName: String, onCancel: () -> Unit) {
             textAlign = TextAlign.Center,
         )
         Spacer(Modifier.height(32.dp))
-        OutlinedButton(onClick = onCancel) { Text(stringResource(R.string.cancel)) }
+        OutlinedButton(onClick = onCancel, shape = MaterialTheme.shapes.small) { Text(stringResource(R.string.cancel)) }
     }
 }
 
@@ -127,10 +133,10 @@ fun DoneScreen(
     var confirmDelete by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
-        Box(Modifier.fillMaxWidth().clip(MaterialTheme.shapes.large).background(heroGradient()).padding(24.dp)) {
+        Box(Modifier.fillMaxWidth().clip(MaterialTheme.shapes.large).background(brandGradient()).padding(24.dp)) {
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-                Box(Modifier.size(64.dp).clip(CircleShape).background(Color.White), contentAlignment = Alignment.Center) {
-                    Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(36.dp))
+                Box(Modifier.size(68.dp).clip(CircleShape).background(Color.White), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.Check, null, tint = Color(0xFF4A31B8), modifier = Modifier.size(38.dp))
                 }
                 Spacer(Modifier.height(14.dp))
                 Text(stringResource(R.string.export_done_title), style = MaterialTheme.typography.headlineSmall, color = Color.White)
@@ -146,7 +152,7 @@ fun DoneScreen(
         Spacer(Modifier.height(16.dp))
 
         Box(Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium)) {
-            VideoThumbnail(item, Modifier.fillMaxWidth().height(200.dp))
+            VideoThumbnail(item, Modifier.fillMaxWidth().height(210.dp))
         }
         Spacer(Modifier.height(16.dp))
 
@@ -168,10 +174,10 @@ fun DoneScreen(
         Spacer(Modifier.height(16.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
-            Button(onClick = { openVideo(context, uri) }, modifier = Modifier.weight(1f).height(48.dp), shape = MaterialTheme.shapes.small) {
+            Button(onClick = { openVideo(context, uri) }, modifier = Modifier.weight(1f).height(50.dp), shape = MaterialTheme.shapes.small) {
                 Icon(Icons.Default.PlayArrow, null); Spacer(Modifier.width(6.dp)); Text(stringResource(R.string.open))
             }
-            OutlinedButton(onClick = { shareVideo(context, uri) }, modifier = Modifier.weight(1f).height(48.dp), shape = MaterialTheme.shapes.small) {
+            OutlinedButton(onClick = { shareVideo(context, uri) }, modifier = Modifier.weight(1f).height(50.dp), shape = MaterialTheme.shapes.small) {
                 Icon(Icons.Default.Share, null); Spacer(Modifier.width(6.dp)); Text(stringResource(R.string.share))
             }
         }
@@ -187,8 +193,10 @@ fun DoneScreen(
             }
         }
         Spacer(Modifier.height(8.dp))
-        Button(onClick = onAnother, modifier = Modifier.fillMaxWidth().height(48.dp), shape = MaterialTheme.shapes.small) {
-            Text(stringResource(R.string.export_another))
+        Button(onClick = onAnother, modifier = Modifier.fillMaxWidth().height(54.dp), shape = MaterialTheme.shapes.small) {
+            Icon(Icons.Default.AutoAwesome, null)
+            Spacer(Modifier.width(8.dp))
+            Text(stringResource(R.string.export_another), style = MaterialTheme.typography.titleSmall)
         }
         Spacer(Modifier.height(24.dp))
     }
@@ -216,8 +224,8 @@ fun ErrorScreen(message: String, canRetry: Boolean, onRetry: () -> Unit, onHome:
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Box(Modifier.size(80.dp).clip(CircleShape).background(MaterialTheme.colorScheme.errorContainer), contentAlignment = Alignment.Center) {
-            Icon(Icons.Default.ErrorOutline, null, tint = MaterialTheme.colorScheme.onErrorContainer, modifier = Modifier.size(40.dp))
+        Box(Modifier.size(96.dp).clip(CircleShape).background(MaterialTheme.colorScheme.errorContainer), contentAlignment = Alignment.Center) {
+            Icon(Icons.Default.ErrorOutline, null, tint = MaterialTheme.colorScheme.onErrorContainer, modifier = Modifier.size(44.dp))
         }
         Spacer(Modifier.height(20.dp))
         Text(stringResource(R.string.export_failed_title), style = MaterialTheme.typography.headlineSmall)
@@ -229,7 +237,7 @@ fun ErrorScreen(message: String, canRetry: Boolean, onRetry: () -> Unit, onHome:
         )
         Spacer(Modifier.height(28.dp))
         if (canRetry) {
-            Button(onClick = onRetry, shape = MaterialTheme.shapes.small) { Text(stringResource(R.string.export_retry)) }
+            Button(onClick = onRetry, shape = MaterialTheme.shapes.small, modifier = Modifier.height(50.dp)) { Text(stringResource(R.string.export_retry)) }
             Spacer(Modifier.height(8.dp))
         }
         TextButton(onClick = onHome) { Text(stringResource(R.string.back_home)) }

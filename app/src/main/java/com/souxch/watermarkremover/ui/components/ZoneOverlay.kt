@@ -8,6 +8,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -92,10 +93,11 @@ fun ZoneOverlay(
             val color = if (selected) ZoneColors.selected else ZoneColors.idle
             val strokePx = if (selected) 3.dp.toPx() else 2.dp.toPx()
             // Soft tint + dark outline underneath for legibility on any video content.
-            drawRect(color.copy(alpha = if (selected) 0.16f else 0.10f), topLeft, rectSize)
-            drawRect(Color.Black.copy(alpha = 0.45f), topLeft, rectSize, style = Stroke(width = strokePx + 2.dp.toPx()))
-            drawRect(
-                color, topLeft, rectSize,
+            val corner = CornerRadius(6.dp.toPx())
+            drawRoundRect(color.copy(alpha = if (selected) 0.16f else 0.10f), topLeft, rectSize, corner)
+            drawRoundRect(Color.Black.copy(alpha = 0.45f), topLeft, rectSize, corner, style = Stroke(width = strokePx + 2.dp.toPx()))
+            drawRoundRect(
+                color, topLeft, rectSize, corner,
                 style = Stroke(
                     width = strokePx,
                     pathEffect = if (selected) null else PathEffect.dashPathEffect(floatArrayOf(10f, 8f)),

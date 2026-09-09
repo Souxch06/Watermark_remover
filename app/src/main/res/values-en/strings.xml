@@ -63,6 +63,7 @@
     <string name="analysis_running">Analysing the video to recover the picture behind the watermark… %1$d %%</string>
     <string name="analysis_found">Watermark identified: the original picture behind it will be restored.</string>
     <string name="analysis_not_found">No static watermark detected in the frame: the area will be rebuilt from its surroundings.</string>
+    <string name="analysis_pending">The video analysis starts as soon as the frame is in place.</string>
     <string name="method_blur">Blur</string>
     <string name="method_blur_desc">Heavily blurs the area. The watermark becomes unreadable but the area stays visible.</string>
     <string name="method_pixelate">Pixelate</string>

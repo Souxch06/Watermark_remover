@@ -93,8 +93,9 @@ fun LibraryScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         item {
-            Column(Modifier.padding(bottom = 4.dp)) {
+            Column(Modifier.padding(start = 4.dp, top = 6.dp, bottom = 6.dp)) {
                 Text(stringResource(R.string.library_title), style = MaterialTheme.typography.headlineSmall)
+                Spacer(Modifier.height(2.dp))
                 Text(
                     stringResource(R.string.library_count, videos.size, formatSize(context, videos.sumOf { it.sizeBytes })),
                     style = MaterialTheme.typography.bodySmall,
@@ -156,10 +157,10 @@ fun LibraryScreen(
 private fun EmptyLibrary() {
     Column(Modifier.fillMaxSize().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Box(
-            Modifier.size(96.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceContainerHigh),
+            Modifier.size(104.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(Icons.Default.VideoLibrary, null, Modifier.size(44.dp), tint = MaterialTheme.colorScheme.primary)
+            Icon(Icons.Default.VideoLibrary, null, Modifier.size(46.dp), tint = MaterialTheme.colorScheme.onPrimaryContainer)
         }
         Spacer(Modifier.height(20.dp))
         Text(stringResource(R.string.library_empty_title), style = MaterialTheme.typography.titleLarge)
@@ -187,10 +188,11 @@ private fun LibraryCard(
         shape = MaterialTheme.shapes.medium,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
         modifier = Modifier.fillMaxWidth().clickable(onClick = onPlay),
     ) {
         Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-            VideoThumbnail(item, Modifier.width(128.dp).height(80.dp))
+            VideoThumbnail(item, Modifier.width(132.dp).height(84.dp))
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(item.displayName, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -208,7 +210,7 @@ private fun LibraryCard(
                 )
                 Spacer(Modifier.height(6.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Pill(methodLabel(context, item.method))
+                    Pill(methodLabel(context, item.method), container = MaterialTheme.colorScheme.primaryContainer, content = MaterialTheme.colorScheme.onPrimaryContainer)
                     if (item.zoneCount > 1) {
                         Pill(
                             stringResource(R.string.zones_badge, item.zoneCount),
@@ -264,14 +266,14 @@ fun VideoThumbnail(item: ProcessedVideo, modifier: Modifier = Modifier) {
         } else {
             Icon(Icons.Default.Movie, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        Box(Modifier.size(32.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.45f)), contentAlignment = Alignment.Center) {
-            Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(20.dp))
+        Box(Modifier.size(34.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.92f)), contentAlignment = Alignment.Center) {
+            Icon(Icons.Default.PlayArrow, null, tint = Color(0xFF24107A), modifier = Modifier.size(20.dp))
         }
         if (item.durationMs > 0) {
             Text(
                 formatDuration(item.durationMs),
-                Modifier.align(Alignment.BottomEnd).padding(6.dp).clip(MaterialTheme.shapes.extraSmall)
-                    .background(Color.Black.copy(alpha = 0.6f)).padding(horizontal = 6.dp, vertical = 2.dp),
+                Modifier.align(Alignment.BottomEnd).padding(6.dp).clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.65f)).padding(horizontal = 7.dp, vertical = 2.dp),
                 style = MaterialTheme.typography.labelSmall,
                 color = Color.White,
             )

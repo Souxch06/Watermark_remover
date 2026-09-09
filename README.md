@@ -46,6 +46,11 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   Les vidéos réellement immobiles (rien à récupérer) basculent sur la reconstruction spatiale.
   L'analyse tourne en arrière-plan dans l'éditeur (quelques secondes) et l'aperçu montre le
   résultat de la première image.
+- **Interface Material 3 épurée** : palette indigo → violet → bleu ciel identique à l'icône
+  (mode clair et sombre), cartes blanches à liseré fin, tuiles de méthode, bascule Avant / Après
+  flottante sur l'aperçu, bouton d'export épinglé en bas de l'éditeur, écrans d'attente / de
+  succès / d'erreur harmonisés. Icône adaptative vectorielle (cadre vidéo dont le coin est effacé
+  par une étincelle) + PNG hérités pour Android 7.
 - **Aperçu fidèle dans l'éditeur** : l'aperçu « Après » restaure la zone sur le CPU avec le même
   `RegionRestorer` que l'export (aucun état OpenGL en jeu) ; seules les méthodes spatiales passent
   par le shader, et tout échec GL retombe sur l'image d'origine — la vidéo reste toujours visible

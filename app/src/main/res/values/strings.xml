@@ -63,6 +63,7 @@
     <string name="analysis_running">Analyse de la vidéo pour retrouver l\'image derrière le filigrane… %1$d %%</string>
     <string name="analysis_found">Filigrane identifié : l\'image d\'origine sera restaurée derrière.</string>
     <string name="analysis_not_found">Aucun filigrane fixe détecté dans le cadre : la zone sera reconstruite à partir de son entourage.</string>
+    <string name="analysis_pending">L\'analyse de la vidéo démarre dès que le cadre est en place.</string>
     <string name="method_blur">Flou</string>
     <string name="method_blur_desc">Floute fortement la zone. Le filigrane devient illisible mais la zone reste visible.</string>
     <string name="method_pixelate">Pixellisation</string>
