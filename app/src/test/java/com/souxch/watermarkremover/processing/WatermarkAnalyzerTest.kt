@@ -109,6 +109,7 @@ class WatermarkAnalyzerTest {
         assertEquals(10, layer.stats.presentFrames)
         // The restorer measures the presence frame by frame and leaves clean frames untouched.
         val restorer = RegionRestorer(layer)
+        assertTrue("gating enabled for a moving logo", restorer.gated)
         val outWith = rgba(with[3], false).also { restorer.process(it, false, it) }
         assertTrue("presence with logo ${restorer.presence}", restorer.presence > 0.7f)
         val src = rgba(without[4], false)
@@ -127,7 +128,10 @@ class WatermarkAnalyzerTest {
     fun `restoration follows the moving background and improves over frames`() {
         val fr = frames(40)
         val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, fr.take(16)))!!
+        assertEquals("logo in every sampled frame", layer.stats.frames, layer.stats.presentFrames)
         val restorer = RegionRestorer(layer)
+        // A logo seen in every sampled frame is always removed (no per-frame gating).
+        assertTrue("no gating for a fixed logo", !restorer.gated)
         val errors = ArrayList<Float>()
         for (t in 0 until 40) {
             val out = rgba(fr[t], false).also { restorer.process(it, false, it) }

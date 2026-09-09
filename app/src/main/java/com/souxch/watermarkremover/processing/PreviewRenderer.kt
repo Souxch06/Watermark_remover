@@ -8,6 +8,7 @@ import android.opengl.EGLDisplay
 import android.opengl.EGLSurface
 import android.opengl.GLES20
 import android.opengl.GLUtils
+import com.souxch.watermarkremover.model.RemovalMethod
 import com.souxch.watermarkremover.model.RemovalSettings
 import com.souxch.watermarkremover.model.WatermarkZone
 import kotlinx.coroutines.Dispatchers
@@ -16,11 +17,11 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * Renders a single frame through the exact same shader used for the export, off-screen, and
- * returns the result as a Bitmap. This gives the editor a faithful "after" preview.
- *
- * Runs on a dedicated pbuffer EGL context created on demand; work is dispatched on
- * [Dispatchers.Default] so it never blocks the UI. A whole preview at 720p takes a few ms.
+ * Renders the editor's "after" preview of a single frame: zones with a recovered watermark layer
+ * are restored on the CPU with the very same [RegionRestorer] the export uses; the other zones go
+ * through the export shader, off-screen, on a short-lived pbuffer EGL context. Work is dispatched
+ * on [Dispatchers.Default] so it never blocks the UI, and any GL failure falls back to the input
+ * frame (the video must always stay visible while the zones are being placed).
  */
 class PreviewRenderer {
 
@@ -32,18 +33,54 @@ class PreviewRenderer {
     ): Bitmap =
         withContext(Dispatchers.Default) {
             if (zones.isEmpty() || !settings.method.usesShader) return@withContext source
-            // GLUtils.texImage2D needs a software ARGB_8888 bitmap.
-            val upload = if (source.config == Bitmap.Config.ARGB_8888) source else source.copy(Bitmap.Config.ARGB_8888, false)
-            val session = EglSession(upload.width, upload.height)
-            try {
-                // The layer is texel aligned with the video: only usable at the video's own size.
-                val usable = layer?.takeIf { it.frameWidth == upload.width && it.frameHeight == upload.height }
-                session.draw(upload, zones, settings, usable)
-            } finally {
-                session.release()
-                if (upload !== source) upload.recycle()
+            // 1. Zones with a recovered watermark layer are restored on the CPU, exactly like the
+            //    export does frame after frame (RegionRestorer), straight into a copy of the
+            //    bitmap: no GL state involved, so this part can never come out black.
+            val usable = layer?.takeIf {
+                settings.method == RemovalMethod.INPAINT && it.hasWatermark &&
+                    it.frameWidth == source.width && it.frameHeight == source.height
             }
+            val restored = if (usable != null) BitmapRestorer(usable).restore(source) else null
+            val remaining = if (usable == null) zones else zones.filter { z -> usable.regions.none { it.zoneId == z.id && it.stats.maskPixels > 0 } }
+            if (remaining.isEmpty()) return@withContext restored ?: source
+            // 2. The other zones go through the shader used by the export (spatial methods).
+            val input = restored ?: source
+            // GLUtils.texImage2D needs a software ARGB_8888 bitmap.
+            val upload = if (input.config == Bitmap.Config.ARGB_8888) input else input.copy(Bitmap.Config.ARGB_8888, false)
+            val result = try {
+                val session = EglSession(upload.width, upload.height)
+                try {
+                    session.draw(upload, remaining, settings)
+                } finally {
+                    session.release()
+                }
+            } catch (e: Exception) {
+                null
+            } finally {
+                if (upload !== input) upload.recycle()
+            }
+            // A GL failure (or a driver handing back an empty frame) must never hide the video:
+            // fall back to what we have rather than to a black box.
+            if (result == null || looksBlank(result, input)) input else result
         }
+
+    /** True when [rendered] is uniformly black while [reference] is not (a broken GL draw). */
+    private fun looksBlank(rendered: Bitmap, reference: Bitmap): Boolean {
+        val w = rendered.width
+        val h = rendered.height
+        if (w == 0 || h == 0) return true
+        var renderedBlack = true
+        var referenceBlack = true
+        val steps = 8
+        for (j in 0 until steps) for (i in 0 until steps) {
+            val x = (w * (2 * i + 1)) / (2 * steps)
+            val y = (h * (2 * j + 1)) / (2 * steps)
+            if ((rendered.getPixel(x, y) and 0xFFFFFF) != 0) renderedBlack = false
+            if (x < reference.width && y < reference.height && (reference.getPixel(x, y) and 0xFFFFFF) != 0) referenceBlack = false
+            if (!renderedBlack) return false
+        }
+        return renderedBlack && !referenceBlack
+    }
 
     /** Short-lived pbuffer context; creating one per render keeps the code simple and leak-free. */
     private class EglSession(private val width: Int, private val height: Int) {
@@ -81,12 +118,12 @@ class PreviewRenderer {
             if (!EGL14.eglMakeCurrent(display, surface, surface, context)) throw GlException("eglMakeCurrent failed")
         }
 
-        fun draw(source: Bitmap, zones: List<WatermarkZone>, settings: RemovalSettings, layer: WatermarkLayer?): Bitmap {
+        /** Spatial methods only (zones with a recovered layer are restored on the CPU, see [render]). */
+        fun draw(source: Bitmap, zones: List<WatermarkZone>, settings: RemovalSettings): Bitmap {
             val program = GlHelpers.linkProgram(WatermarkShader.VERTEX_SHADER, WatermarkShader.FRAGMENT_SHADER_2D)
             val tex = IntArray(1)
             GLES20.glGenTextures(1, tex, 0)
             var layerTex = 0
-            var patcher: LayerPatcher? = null
             try {
                 GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[0])
                 GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
@@ -98,6 +135,10 @@ class PreviewRenderer {
 
                 GLES20.glViewport(0, 0, width, height)
                 GLES20.glUseProgram(program)
+                // Placeholder layer texture first (it lives on unit 1), then the video on unit 0:
+                // nothing may rebind unit 0 afterwards or the shader samples nothing (black frame).
+                layerTex = GlLayerTexture.uploadEmpty()
+                GlLayerTexture.bind(program, layerTex, null, zones, yUp = false)
                 GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
                 GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[0])
                 GLES20.glUniform1i(loc(program, WatermarkShader.U_TEX_SAMPLER), 0)
@@ -109,18 +150,9 @@ class PreviewRenderer {
                 GLES20.glUniform2f(loc(program, WatermarkShader.U_TEXEL_SIZE), 1f / width, 1f / height)
                 GLES20.glUniform4fv(loc(program, WatermarkShader.U_ZONES), WatermarkShader.MAX_ZONES, WatermarkShader.zoneUniforms(zones, yUp = false), 0)
                 GLES20.glUniform1i(loc(program, WatermarkShader.U_ZONE_COUNT), WatermarkShader.zoneCount(zones))
-                GLES20.glUniform1i(loc(program, WatermarkShader.U_METHOD), WatermarkShader.methodId(settings, layer))
+                GLES20.glUniform1i(loc(program, WatermarkShader.U_METHOD), WatermarkShader.methodId(settings, null))
                 GLES20.glUniform1f(loc(program, WatermarkShader.U_STRENGTH), settings.strength)
                 GLES20.glUniform1f(loc(program, WatermarkShader.U_FEATHER), WatermarkShader.featherTextureUnits(settings, width, height))
-                if (layer != null && layer.hasWatermark) {
-                    // Restore the analysed regions of this frame on the CPU and paste them.
-                    val created = LayerPatcher(layer).also { it.update(source) }
-                    patcher = created
-                    created.bind(program, zones, yUp = false)
-                } else {
-                    layerTex = GlLayerTexture.uploadEmpty()
-                    GlLayerTexture.bind(program, layerTex, null, zones, yUp = false)
-                }
 
                 val aPos = GLES20.glGetAttribLocation(program, WatermarkShader.A_FRAME_POSITION)
                 val quad = GlHelpers.createQuadBuffer()
@@ -141,7 +173,6 @@ class PreviewRenderer {
             } finally {
                 GLES20.glDeleteTextures(1, tex, 0)
                 GlHelpers.deleteTexture(layerTex)
-                patcher?.release()
                 GLES20.glDeleteProgram(program)
             }
         }

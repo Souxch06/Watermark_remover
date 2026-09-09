@@ -88,10 +88,13 @@ class WatermarkLayerBuilder(private val context: Context) {
 
     private fun getFrame(retriever: MediaMetadataRetriever, timeUs: Long, width: Int, height: Int, exact: Boolean): Bitmap? {
         val option = if (exact) MediaMetadataRetriever.OPTION_CLOSEST else MediaMetadataRetriever.OPTION_CLOSEST_SYNC
-        val frame = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-            retriever.getScaledFrameAtTime(timeUs, option, width, height)
-        } else {
-            retriever.getFrameAtTime(timeUs, option)
+        val frame = when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
+                val params = MediaMetadataRetriever.BitmapParams().apply { preferredConfig = Bitmap.Config.ARGB_8888 }
+                retriever.getScaledFrameAtTime(timeUs, option, width, height, params)
+            }
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 -> retriever.getScaledFrameAtTime(timeUs, option, width, height)
+            else -> retriever.getFrameAtTime(timeUs, option)
         } ?: return null
         if (frame.width == width && frame.height == height) return frame
         // Exact size matters: the layer is texel aligned with the video.
@@ -163,20 +166,38 @@ class LayerPatcher(private val layer: WatermarkLayer) {
 
     val isEmpty: Boolean get() = restorers.isEmpty()
 
-    /** Creates the atlas texture (call on the GL thread once the context is current). */
+    /**
+     * Creates the atlas texture (call on the GL thread once the context is current).
+     * Everything here happens on texture unit 1: unit 0 holds the video frame and must never be
+     * disturbed (rebinding on unit 0 is what made the preview black in earlier versions).
+     */
     fun createTexture() {
         if (textureId != 0) return
         val ids = IntArray(1)
         GLES20.glGenTextures(1, ids, 0)
         textureId = ids[0]
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, layer.atlasWidth, layer.atlasHeight, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GlHelpers.checkGlError("patch texture")
+    }
+
+    /** Uploads the atlas bytes (unit 1; the atlas stays bound there). */
+    private fun uploadAtlas() {
+        atlasBuffer.rewind()
+        atlasBuffer.put(atlas).rewind()
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 1)
+        GLES20.glTexSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, layer.atlasWidth, layer.atlasHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, atlasBuffer)
+        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 4)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GlHelpers.checkGlError("patch upload")
     }
 
     /** Forgets the temporal state (seek / new clip). */
@@ -207,46 +228,7 @@ class LayerPatcher(private val layer: WatermarkLayer) {
             }
         }
         GLES20.glPixelStorei(GLES20.GL_PACK_ALIGNMENT, 4)
-        atlasBuffer.rewind()
-        atlasBuffer.put(atlas).rewind()
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
-        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 1)
-        GLES20.glTexSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, layer.atlasWidth, layer.atlasHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, atlasBuffer)
-        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 4)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
-        GlHelpers.checkGlError("patch upload")
-    }
-
-    /** Same restoration from a decoded bitmap (row 0 = top) instead of a framebuffer. */
-    fun update(frame: Bitmap) {
-        if (textureId == 0) createTexture()
-        for (region in layer.regions) {
-            val restorer = restorers[region.zoneId] ?: continue
-            if (region.left + region.width > frame.width || region.top + region.height > frame.height) continue
-            val size = region.width * region.height * 4
-            val bytes = regionBytes.getOrPut(region.zoneId) { ByteArray(size) }
-            val pixels = IntArray(region.width * region.height)
-            frame.getPixels(pixels, 0, region.width, region.left, region.top, region.width, region.height)
-            for (i in pixels.indices) {
-                val p = pixels[i]
-                bytes[i * 4] = (p shr 16).toByte()
-                bytes[i * 4 + 1] = (p shr 8).toByte()
-                bytes[i * 4 + 2] = p.toByte()
-                bytes[i * 4 + 3] = -1
-            }
-            restorer.process(bytes, false, bytes)
-            for (y in 0 until region.height) {
-                System.arraycopy(bytes, y * region.width * 4, atlas, ((region.atlasRow + y) * layer.atlasWidth) * 4, region.width * 4)
-            }
-        }
-        atlasBuffer.rewind()
-        atlasBuffer.put(atlas).rewind()
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
-        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 1)
-        GLES20.glTexSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, layer.atlasWidth, layer.atlasHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, atlasBuffer)
-        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 4)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
-        GlHelpers.checkGlError("patch upload")
+        uploadAtlas()
     }
 
     /** Binds the atlas on unit 1 and sets the layer uniforms of [program]. */
@@ -257,6 +239,44 @@ class LayerPatcher(private val layer: WatermarkLayer) {
     fun release() {
         GlHelpers.deleteTexture(textureId)
         textureId = 0
+    }
+}
+
+/**
+ * CPU-only counterpart of [LayerPatcher] for the editor preview: restores the analysed regions of
+ * a decoded frame with the same [RegionRestorer]s and writes them into a copy of the bitmap.
+ * Nothing here touches OpenGL, so the preview of the reconstruction cannot depend on GL state.
+ */
+class BitmapRestorer(private val layer: WatermarkLayer) {
+    private val restorers = layer.newRestorers()
+
+    /** Returns a new ARGB_8888 bitmap: [frame] with every analysed region restored. */
+    fun restore(frame: Bitmap): Bitmap {
+        val out = frame.copy(Bitmap.Config.ARGB_8888, true)
+        for (region in layer.regions) {
+            val restorer = restorers[region.zoneId] ?: continue
+            if (region.left + region.width > out.width || region.top + region.height > out.height) continue
+            val n = region.width * region.height
+            val pixels = IntArray(n)
+            out.getPixels(pixels, 0, region.width, region.left, region.top, region.width, region.height)
+            val bytes = ByteArray(n * 4)
+            for (i in 0 until n) {
+                val p = pixels[i]
+                bytes[i * 4] = (p shr 16).toByte()
+                bytes[i * 4 + 1] = (p shr 8).toByte()
+                bytes[i * 4 + 2] = p.toByte()
+                bytes[i * 4 + 3] = -1
+            }
+            restorer.process(bytes, false, bytes)
+            for (i in 0 until n) {
+                pixels[i] = (0xFF shl 24) or
+                    ((bytes[i * 4].toInt() and 0xFF) shl 16) or
+                    ((bytes[i * 4 + 1].toInt() and 0xFF) shl 8) or
+                    (bytes[i * 4 + 2].toInt() and 0xFF)
+            }
+            out.setPixels(pixels, 0, region.width, region.left, region.top, region.width, region.height)
+        }
+        return out
     }
 }
 
@@ -280,16 +300,17 @@ object GlLayerTexture {
         GLES20.glUniform2f(GLES20.glGetUniformLocation(program, WatermarkShader.U_LAYER_TEXEL), 1f / tw, 1f / th)
     }
 
-    /** A 1x1 placeholder so the sampler is always bound to something valid. */
+    /** A 1x1 placeholder so the sampler is always bound to something valid (created on unit 1). */
     fun uploadEmpty(): Int {
         val ids = IntArray(1)
         GLES20.glGenTextures(1, ids, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ids[0])
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
         val buffer = ByteBuffer.allocateDirect(4).order(ByteOrder.nativeOrder())
         GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, 1, 1, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         return ids[0]
     }
 }

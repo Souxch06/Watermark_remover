@@ -48,7 +48,14 @@ class VideoRepository(private val context: Context) {
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(context, uri)
-            val full = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: return@withContext null
+            // Ask for ARGB_8888: without it the retriever hands out RGB_565 frames, whose coarse
+            // quantisation ruins the per-pixel restoration (and banding shows in the preview).
+            val full = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val params = MediaMetadataRetriever.BitmapParams().apply { preferredConfig = Bitmap.Config.ARGB_8888 }
+                retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, params)
+            } else {
+                retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            }) ?: return@withContext null
             val scale = if (maxDimension <= 0) 1f else maxDimension.toFloat() / maxOf(full.width, full.height)
             if (scale >= 1f) full
             else Bitmap.createScaledBitmap(full, (full.width * scale).toInt(), (full.height * scale).toInt(), true)

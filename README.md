@@ -46,6 +46,10 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   Les vidéos réellement immobiles (rien à récupérer) basculent sur la reconstruction spatiale.
   L'analyse tourne en arrière-plan dans l'éditeur (quelques secondes) et l'aperçu montre le
   résultat de la première image.
+- **Aperçu fidèle dans l'éditeur** : l'aperçu « Après » restaure la zone sur le CPU avec le même
+  `RegionRestorer` que l'export (aucun état OpenGL en jeu) ; seules les méthodes spatiales passent
+  par le shader, et tout échec GL retombe sur l'image d'origine — la vidéo reste toujours visible
+  pour placer la zone.
 - **Export GPU** (décodage → shader OpenGL → encodage H.264/AAC) avec progression et annulation.
 - **Bibliothèque « Mes vidéos »** : toutes les vidéos traitées, avec miniature, durée, résolution,
   taille, méthode utilisée ; lecture, partage, renommage, suppression. Les fichiers sont dans

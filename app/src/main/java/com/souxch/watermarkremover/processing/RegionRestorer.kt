@@ -36,6 +36,13 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     private val mask = BooleanArray(px) { layer.alpha[it] > 0f || layer.fill[it] }
     val hasLogo: Boolean = mask.any { it }
 
+    /**
+     * Per-frame presence gating is only enabled when the analysis itself saw sampled frames
+     * without the logo (watermarks that move around). A logo found in every sampled frame is
+     * always removed: a noisy presence score must never silently leave the watermark in place.
+     */
+    val gated: Boolean = layer.stats.presentFrames < layer.stats.frames
+
     // Presence taps: pairs of neighbouring pixels with the logo's colour / opacity steps.
     private val tapP: IntArray
     private val tapQ: IntArray
@@ -131,8 +138,13 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         unpack(rgba, flipY)
         presence = if (tapP.isEmpty()) 1f else measurePresence()
         // Hysteresis: a logo does not blink, so a present logo needs a clear drop to be declared
-        // gone (and vice versa); the ramp keeps fades smooth.
-        val s = if (wasPresent) ((presence - 0.15f) / 0.3f).coerceIn(0f, 1f) else ((presence - 0.45f) / 0.3f).coerceIn(0f, 1f)
+        // gone (and vice versa); the ramp keeps fades smooth. Biased towards "present": a logo
+        // that is there but modelled imperfectly still scores well above 0.3, a missing one ~0.
+        val s = when {
+            !gated -> 1f
+            wasPresent -> ((presence - 0.10f) / 0.20f).coerceIn(0f, 1f)
+            else -> ((presence - 0.35f) / 0.20f).coerceIn(0f, 1f)
+        }
         wasPresent = s >= 0.5f
         val active = s > 0f
 

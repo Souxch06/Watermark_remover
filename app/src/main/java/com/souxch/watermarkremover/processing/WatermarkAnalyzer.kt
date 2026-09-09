@@ -347,6 +347,10 @@ object WatermarkAnalyzer {
         }
         if (bestK < 0 || bestGap < 0.4f * top) return all
         val cut = sorted[bestK]
+        // The low cluster must really look like "no logo" (scores near zero): a logo that is
+        // always there but sits on backgrounds of varying brightness spreads its scores
+        // continuously and must not be split (that would enable per-frame gating for nothing).
+        if (cut > 0.3f * top) return all
         return all.filter { scores[it] > cut }
     }
 
