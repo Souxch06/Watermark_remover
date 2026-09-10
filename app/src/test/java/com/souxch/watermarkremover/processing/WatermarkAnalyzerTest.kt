@@ -359,6 +359,57 @@ class WatermarkAnalyzerTest {
     }
 
     @Test
+    fun `a video with a very slow background is still cleaned up`() {
+        // Real videos often pan much slower than the other tests (0.15 px/frame): over the
+        // whole clip the background barely travels, its gradients stay "consistent" and the
+        // analysis used to flag almost the whole zone as watermark (a giant blur). The mask
+        // must stay on the glyphs, and the slow motion must still be measured well enough for
+        // the temporal passes to clean the text up.
+        fun bgSlow(x: Int, y: Int, t: Int): FloatArray {
+            val xx = x + 0.15f * t
+            val yy = y + 0.10f * t
+            val r = 0.35f + 0.25f * sin(xx * 0.31f) + 0.15f * sin(yy * 0.17f)
+            val g = 0.40f + 0.20f * sin(xx * 0.23f + 1f) + 0.10f * sin((xx + yy) * 0.11f)
+            val b = 0.45f + 0.20f * sin(yy * 0.27f + 2f) + 0.10f * sin(xx * 0.13f)
+            return floatArrayOf(r.coerceIn(0f, 1f), g.coerceIn(0f, 1f), b.coerceIn(0f, 1f))
+        }
+        val rnd = Random(11)
+        fun framesSlow(n: Int): List<ByteArray> = (0 until n).map { t ->
+            val out = ByteArray(w * h * 3)
+            for (y in 0 until h) for (x in 0 until w) {
+                val bg = bgSlow(x, y, t)
+                val a = when (strokeDist(x, y)) { 0 -> 1f; 1 -> 0.65f; 2 -> 0.25f; 3 -> 0.07f; else -> 0f }
+                for (c in 0 until 3) {
+                    val v = (a + (1f - a) * bg[c] + (rnd.nextFloat() - 0.5f) * 2f * 0.008f).coerceIn(0f, 1f)
+                    out[(y * w + x) * 3 + c] = (v * 255f + 0.5f).toInt().toByte()
+                }
+            }
+            out
+        }
+        val all = framesSlow(80)
+        // The app analyses frames spread over the video, not consecutive ones.
+        val sample = all.indices.filter { it % 5 == 1 }.map { all[it] }
+        val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, sample))!!
+        assertTrue(layer.hasWatermark)
+        val restorer = RegionRestorer(layer)
+        val errors = ArrayList<Float>()
+        for (t in 0 until 80) {
+            val out = rgba(all[t], false).also { restorer.process(it, false, it) }
+            var err = 0f
+            var n = 0
+            for (y in 0 until h) for (x in 0 until w) {
+                if (strokeDist(x, y) > 3) continue
+                val bg = bgSlow(x, y, t)
+                for (c in 0 until 3) { err += abs((out[(y * w + x) * 4 + c].toInt() and 0xFF) / 255f - bg[c]); n++ }
+            }
+            errors.add(err / n)
+        }
+        assertTrue("first frame error ${errors[0]} (the zone must not be a giant blur)", errors[0] < 0.12f)
+        val late = errors.takeLast(10).average()
+        assertTrue("late error $late (slow motion must still be followed)", late < 0.12f)
+    }
+
+    @Test
     fun `layer packing keeps regions texel aligned and method switches to layer mode`() {
         val zone = WatermarkZone(1, NormalizedRect(0.5f, 0.5f, 0.6f, 0.6f))
         val region = WatermarkLayer.regionOf(zone, 1920, 1080)

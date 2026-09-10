@@ -62,6 +62,12 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     private val weight = FloatArray(px)
     private val lumCur = FloatArray(px)
     private val lumPrev = FloatArray(px)
+    private var lumBase = lumPrev // the frame the motion search matches against
+    // Luminance of the frames t-2 and t-3: with a slow background, the sub-pixel estimate over
+    // one frame is biased by the resampling; over three frames the same bias is divided by three.
+    private val lumPrev2 = FloatArray(px)
+    private val lumPrev3 = FloatArray(px)
+    private var prevCount = 0
     private val prevIn = FloatArray(px * 3)
     private val prevOut = FloatArray(px * 3)
     private val prevWeight = FloatArray(px)
@@ -163,6 +169,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     /** Forgets the previous frames (seek, new export); the learned ghost is kept. */
     fun reset() {
         hasPrevious = false
+        prevCount = 0
         wasPresent = true
         presence = 1f
         motionFound = false
@@ -222,6 +229,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
             harmonicFill()
             if (motionFound) propagate()
             motionFill()
+            textureFill()
         }
 
         // ---- keep state for the next frame ----
@@ -293,6 +301,32 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
             lumCur[p] = (cur[p * 3] + cur[p * 3 + 1] + cur[p * 3 + 2]) * (1f / 3f)
             lumPrev[p] = (prevIn[p * 3] + prevIn[p * 3 + 1] + prevIn[p * 3 + 2]) * (1f / 3f)
         }
+        // Slow-motion baseline: match against t-3 as well and keep the estimate whose motion is
+        // small enough to be trustworthy at sub-pixel scale (bias divided by the frame distance).
+        if (prevCount >= 2) {
+            if (searchMotion(lumPrev3, factor = 3f)) {
+                shiftLumHistory()
+                return
+            }
+        }
+        searchMotion(lumPrev, factor = 1f)
+        shiftLumHistory()
+    }
+
+    /** Shifts the luminance history ring (t-1 -> t-2 -> t-3). */
+    private fun shiftLumHistory() {
+        System.arraycopy(lumPrev2, 0, lumPrev3, 0, px)
+        System.arraycopy(lumPrev, 0, lumPrev2, 0, px)
+        prevCount++
+    }
+
+    /**
+     * Searches the global motion between the current frame and [base] (a previous frame),
+     * [factor] frame distances away, and records it per frame. Returns false when the match is
+     * not trusted (then the caller falls back to a shorter baseline).
+     */
+    private fun searchMotion(base: FloatArray, factor: Float): Boolean {
+        lumBase = base
         // Stage 1: coarse search (step 2) over the whole range.
         var bestX = 0
         var bestY = 0
@@ -316,16 +350,23 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
             if (e < best) { best = e; bestX = cx + ddx; bestY = cy + ddy }
         }
         motionError = best
-        if (best > MAX_MATCH_ERROR) return
+        // A multi-frame baseline sees more change for the same misalignment: relax the gate.
+        if (best > MAX_MATCH_ERROR * (1f + 0.25f * (factor - 1f))) return false
         // Sub-pixel refinement by a parabola through the neighbours.
         val ex0 = matchError(bestX - 1, bestY)
         val ex1 = matchError(bestX + 1, bestY)
         val ey0 = matchError(bestX, bestY - 1)
         val ey1 = matchError(bestX, bestY + 1)
-        motionX = bestX + parabolicOffset(ex0, best, ex1)
-        motionY = bestY + parabolicOffset(ey0, best, ey1)
+        val mx = (bestX + parabolicOffset(ex0, best, ex1)) / factor
+        val my = (bestY + parabolicOffset(ey0, best, ey1)) / factor
+        // With a far baseline a slow drift (accelerating camera) would be exaggerated: refuse
+        // speeds the one-frame search could not have missed.
+        if (abs(mx) > MAX_PER_FRAME_MOTION || abs(my) > MAX_PER_FRAME_MOTION) return false
+        motionX = mx
+        motionY = my
         motionFound = true
         estimateTone()
+        return true
     }
 
     private fun parabolicOffset(e0: Float, e1: Float, e2: Float): Float {
@@ -348,7 +389,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
             if (x < 0 || y < 0 || x >= width || y >= height) continue
             val q = y * width + x
             if (mask[q]) continue
-            val d = (lumCur[p] - lumPrev[q]).toDouble()
+            val d = (lumCur[p] - lumBase[q]).toDouble()
             sum += d
             sum2 += d * d
             count++
@@ -596,6 +637,58 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         }
     }
 
+    /**
+     * The "content-aware" finish of the pro tools: a pixel that nothing has ever revealed (still
+     * at the bare fill confidence) would otherwise stay a smooth, visibly blurry patch. Instead,
+     * the REAL texture of the nearest clean pixel is grafted on it: the detail comes from the
+     * actual picture (grain, edges, noise) and only the large-scale colour is kept from the
+     * harmonic fill, so gradients continue smoothly while the area stops looking like blur.
+     * As soon as the motion reveals the true background, the pixel is already above this
+     * confidence and keeps the real thing.
+     */
+    private fun textureFill() {
+        if (fillIdx.isEmpty()) return
+        for (p in fillIdx) {
+            if (weight[p] > W_FILL * 1.01f) continue
+            // Nearest clean pixel (the four stored distances), most likely to look alike.
+            var bestQ = -1
+            var bestD = Int.MAX_VALUE
+            for (k in 0 until 4) {
+                val d = layer.distances[p * 4 + k].toInt() and 0xFF
+                if (d == 0 || d == 255 || d >= bestD) continue
+                val q = when (k) {
+                    0 -> p - d
+                    1 -> p + d
+                    2 -> p - d * width
+                    else -> p + d * width
+                }
+                if (q < 0 || q >= px) continue
+                bestD = d
+                bestQ = q
+            }
+            if (bestQ < 0) continue
+            // Local mean of the real picture around the donor (skip fill pixels).
+            val qx = bestQ % width
+            val qy = bestQ / width
+            var mr = 0f; var mg = 0f; var mb = 0f
+            var cnt = 0
+            for (yy in max(0, qy - 1)..min(height - 1, qy + 1)) {
+                for (xx in max(0, qx - 1)..min(width - 1, qx + 1)) {
+                    val s = yy * width + xx
+                    if (fillMask[s]) continue
+                    mr += out[s * 3]; mg += out[s * 3 + 1]; mb += out[s * 3 + 2]; cnt++
+                }
+            }
+            if (cnt < 4) continue
+            mr /= cnt; mg /= cnt; mb /= cnt
+            // Graft: donor detail + harmonic colour, matched to the donor's local mean.
+            out[p * 3] = (out[bestQ * 3] + fillState[p * 3] - mr).coerceIn(0f, 1f)
+            out[p * 3 + 1] = (out[bestQ * 3 + 1] + fillState[p * 3 + 1] - mg).coerceIn(0f, 1f)
+            out[p * 3 + 2] = (out[bestQ * 3 + 2] + fillState[p * 3 + 2] - mb).coerceIn(0f, 1f)
+            weight[p] = W_TEXTURE
+        }
+    }
+
     /** Stores the restored frame (and its confidences) for the motion fill lookups. */
     private fun pushHistory() {
         val idx: Int
@@ -640,6 +733,8 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         private const val SEARCH = 16
         /** Largest deviation accepted for a motion match. */
         private const val MAX_MATCH_ERROR = 0.06f
+        /** Motion per frame beyond which the far (multi-frame) baseline is not trusted. */
+        private const val MAX_PER_FRAME_MOTION = 4f
         /** Noise of the source pixels (8-bit + compression), before amplification by the inversion. */
         private const val SIGMA_NOISE = 0.02f
         /** Error added by one frame of propagation (motion / interpolation). */
@@ -663,6 +758,8 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         private const val MOTION_FILL_STRONG = 2_600f
         /** Motion fill: pixels at least this certain are not looked up any more. */
         private const val MOTION_FILL_DONE = 3_000f
+        /** Confidence of a texture-grafted pixel: real detail, but not the real background. */
+        private const val W_TEXTURE = 250f
         /** Gauss-Seidel iterations of the harmonic fill, on the first (cold) frame. */
         private const val FILL_ITERS = 26
         /**

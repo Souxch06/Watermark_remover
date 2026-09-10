@@ -49,9 +49,16 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   recopie : le mouvement du fond est mesuré, la source la plus fiable de l'historique des images
   est recalée dessus (interpolation bilinéaire, correction d'exposition, rejet des échantillons
   contradictoires), ce qui rétablit la vraie texture là où seule la couleur était connue.
-- **Remplissage harmonique** : les zones jamais révélées par le mouvement (cœur opaque, toutes
-  premières images) sont comblées par une résolution de l'équation de Laplace sur les bords
-  restaurés — une dégradation douce qui respecte les dégradés, au lieu de l'ancien flou linéaire.
+- **Remplissage harmonique + greffe de texture** : les zones jamais révélées par le mouvement
+  (cœur opaque, toutes premières images) sont comblées par une résolution de l'équation de
+  Laplace sur les bords restaurés — puis la vraie texture du pixel propre le plus proche est
+  greffée par-dessus (le grain et les détails du décor, seul le ton vient du remplissage) :
+  la zone cesse d'être une tache floue, comme avec le « content-aware fill » des logiciels pro.
+- **Vidéos à fond lent ou courte** : le mouvement du décor est aussi mesuré sur trois images
+  (l'erreur sous-pixel est divisée d'autant), et l'analyse ne se laisse plus abuser par un décor
+  qui bouge à peine — ses gradients restent « cohérents » et faisaient croire que tout le cadre
+  était du filigrane, d'où une énorme tache floue. Seules les structures réellement fortes sont
+  retenues, et l'intérieur des glyphes est reconstruit.
 - **Restauration image par image (`RegionRestorer`)** : pendant l'export, chaque image passe par
   un restaurateur CPU qui (1) mesure si le logo est réellement présent dans l'image (filigranes qui
   changent de place → les images sans logo ne sont pas touchées, plus d'apparitions fugaces),

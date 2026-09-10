@@ -82,6 +82,12 @@ object WatermarkAnalyzer {
     private const val TAU_GRADIENT = 0.02f
     private const val K_CONSISTENT = 2.0f
     private const val TAU_RELIEF = 0.05f
+    /** Local contrast (5x5 range) required in the relief: a slow background plateaus smoothly. */
+    private const val TAU_RELIEF_HF = 0.10f
+    /** Mask covering more than this fraction of the zone = the analysis failed, keep the strongest. */
+    private const val OVERMASK_FRACTION = 0.60f
+    /** Quantile of the relief kept when the zone is over-masked. */
+    private const val OVERMASK_KEEP = 0.70f
     private const val MIN_COMPONENT = 6
     private const val MIN_MOTION = 0.012f
     private const val RING = 4
@@ -218,9 +224,34 @@ object WatermarkAnalyzer {
         val reliefMax = FloatArray(px) { i -> max(abs(relief[i * 3]), max(abs(relief[i * 3 + 1]), abs(relief[i * 3 + 2]))) }
 
         // --- mask -------------------------------------------------------------------------
-        val mask = BooleanArray(px) { reliefMax[it] > TAU_RELIEF }
+        // A slowly moving background leaves a smooth, elevated plateau in the relief (its
+        // gradients stay "consistent" for the whole analysis window); a real watermark has
+        // sharp edges. Require local contrast in the relief, then fill the enclosed interiors
+        // (glyph cores, thick logo centres) so only genuinely flat plateaus are rejected.
+        val reliefRange = localRange(reliefMax, w, h, 2)
+        var tauRelief = TAU_RELIEF
+        // Guard against a barely moving background: its own texture survives the temporal
+        // median and inflates the relief over the WHOLE zone, which would flag the entire
+        // picture as watermark. When that happens, only the strongest structures are kept
+        // (a real watermark is the high-relief outlier, not the floor).
+        run {
+            var inner = 0
+            var above = 0
+            for (y in RING until h - RING) for (x in RING until w - RING) {
+                inner++
+                if (reliefMax[y * w + x] > tauRelief) above++
+            }
+            if (inner > 0 && above > inner * OVERMASK_FRACTION) {
+                val values = ArrayList<Float>(inner)
+                for (y in RING until h - RING) for (x in RING until w - RING) values.add(reliefMax[y * w + x])
+                values.sort()
+                tauRelief = max(tauRelief, percentileOfSorted(values, OVERMASK_KEEP))
+            }
+        }
+        val mask = BooleanArray(px) { reliefMax[it] > tauRelief && reliefRange[it] > TAU_RELIEF_HF }
         var labels = Components.label(mask, w, h)
         Components.removeSmall(mask, labels, MIN_COMPONENT)
+        fillHoles(mask, w, h)
         repeat(DILATE) { dilate(mask, w, h) }
         for (y in 0 until h) for (x in 0 until w) {
             if (x < RING || x >= w - RING || y < RING || y >= h - RING) mask[y * w + x] = false
@@ -416,6 +447,48 @@ object WatermarkAnalyzer {
         // continuously and must not be split (that would enable per-frame gating for nothing).
         if (cut > 0.3f * top) return all
         return all.filter { scores[it] > cut }
+    }
+
+    /** Max-minus-min of [v] in a (2r+1)x(2r+1) window (local contrast, edge aware). */
+    private fun localRange(v: FloatArray, w: Int, h: Int, r: Int): FloatArray {
+        val out = FloatArray(v.size)
+        for (y in 0 until h) {
+            val from = max(0, y - r)
+            val to = min(h - 1, y + r)
+            for (x in 0 until w) {
+                var mn = Float.MAX_VALUE
+                var mx = -Float.MAX_VALUE
+                for (yy in from..to) for (xx in max(0, x - r)..min(w - 1, x + r)) {
+                    val s = v[yy * w + xx]
+                    if (s < mn) mn = s
+                    if (s > mx) mx = s
+                }
+                out[y * w + x] = mx - mn
+            }
+        }
+        return out
+    }
+
+    /** Adds to [mask] the pixels that [mask] fully encloses (glyph cores, logo centres). */
+    private fun fillHoles(mask: BooleanArray, w: Int, h: Int) {
+        val visited = BooleanArray(mask.size)
+        val stack = IntArray(mask.size)
+        var sp = 0
+        fun push(i: Int) {
+            if (!visited[i] && !mask[i]) { visited[i] = true; stack[sp++] = i }
+        }
+        for (x in 0 until w) { push(x); push((h - 1) * w + x) }
+        for (y in 0 until h) { push(y * w); push(y * w + w - 1) }
+        while (sp > 0) {
+            val i = stack[--sp]
+            val x = i % w
+            val y = i / w
+            if (x > 0) push(i - 1)
+            if (x < w - 1) push(i + 1)
+            if (y > 0) push(i - w)
+            if (y < h - 1) push(i + w)
+        }
+        for (i in mask.indices) if (!visited[i]) mask[i] = true
     }
 
     /** Median of the per-frame gradients, kept only when consistent across frames. */
@@ -908,6 +981,12 @@ object WatermarkAnalyzer {
         val a = values.copyOf(n)
         a.sort()
         return if (n % 2 == 1) a[n / 2] else 0.5f * (a[n / 2 - 1] + a[n / 2])
+    }
+
+    private fun percentileOfSorted(values: ArrayList<Float>, q: Float): Float {
+        if (values.isEmpty()) return 0f
+        val i = (q * (values.size - 1)).toInt().coerceIn(0, values.size - 1)
+        return values[i]
     }
 
     private fun percentile(values: FloatArray, q: Float): Float {
