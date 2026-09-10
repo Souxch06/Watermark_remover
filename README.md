@@ -43,6 +43,15 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   (l'amortissement du fond mesure l'opacité, sans passer par un fond interpolé), et l'export
   apprend le résidu systématique restant image par image : le décor net arrive derrière la zone
   avec le mouvement et le corrige, de plus en plus propre au fil de la vidéo.
+- **Remplacement des zones opaques par le vrai décor (« motion fill »)** : quand le filigrane est
+  opaque (texte plein, logo solide), rien ne peut y être inversé — comme les logiciels
+  professionnels, l'app attend que le décor défile derrière la zone au fil de la vidéo et le
+  recopie : le mouvement du fond est mesuré, la source la plus fiable de l'historique des images
+  est recalée dessus (interpolation bilinéaire, correction d'exposition, rejet des échantillons
+  contradictoires), ce qui rétablit la vraie texture là où seule la couleur était connue.
+- **Remplissage harmonique** : les zones jamais révélées par le mouvement (cœur opaque, toutes
+  premières images) sont comblées par une résolution de l'équation de Laplace sur les bords
+  restaurés — une dégradation douce qui respecte les dégradés, au lieu de l'ancien flou linéaire.
 - **Restauration image par image (`RegionRestorer`)** : pendant l'export, chaque image passe par
   un restaurateur CPU qui (1) mesure si le logo est réellement présent dans l'image (filigranes qui
   changent de place → les images sans logo ne sont pas touchées, plus d'apparitions fugaces),
@@ -50,8 +59,9 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   précédentes** le long de ce mouvement, pondérée par sa fiabilité — ce qui était caché est visible
   quelques images plus tôt ; le bruit amplifié par l'inversion et les traces résiduelles
   disparaissent au fil des images, et une erreur systématique de l'inversion est apprise en ligne
-  puis soustraite, (4) comble ce qui reste inconnu (parties opaques, premières images) depuis les
-  pixels restaurés voisins. Coût : ~10 ms par image pour une zone de 350×100 px.
+  puis soustraite, (4) comble ce qui reste inconnu (parties opaques, premières images) par le
+  « motion fill » ci-dessus puis l'interpolation harmonique. Coût : ~10 ms par image pour une
+  zone de 350×100 px, jusqu'à ~2× pour un filigrane entièrement opaque (zone à remplacer).
   Les vidéos réellement immobiles (rien à récupérer) basculent sur la reconstruction spatiale.
   L'analyse tourne en arrière-plan dans l'éditeur (quelques secondes) et l'aperçu montre le
   résultat de la première image.

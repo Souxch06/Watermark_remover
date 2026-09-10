@@ -281,7 +281,10 @@ object WatermarkAnalyzer {
                 val wVar = ((spreadRef[p] - 0.02f) / 0.05f).coerceIn(0f, 1f)
                 val ap = if (aVar[p] >= 0f && wVar > 0f) (aProj + wVar * aVar[p]) / (1f + wVar) else aProj
                 val a = ap.coerceIn(0f, min(1f, aComp + 0.15f))
-                if (aComp > MAX_INVERT_ALPHA || a > MAX_INVERT_ALPHA) {
+                // Only the pixels that are REALLY opaque are filled: a logo with an opaque
+                // core (aComp ~ 1) still has anti-aliased edges whose semi-transparent pixels
+                // are invertible - filling them would blur the whole glyph contour.
+                if (a > MAX_INVERT_ALPHA) {
                     fill[p] = true
                 } else {
                     alpha[p] = a

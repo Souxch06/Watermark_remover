@@ -2,8 +2,11 @@ package com.souxch.watermarkremover.processing
 
 import kotlin.math.abs
 import kotlin.math.floor
+import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
@@ -66,6 +69,42 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     private val offset = FloatArray(3)
     private var hasPrevious = false
     private var wasPresent = true
+
+    // ---- motion fill: ring buffer of the last frames (the "motion fill" of pro tools) ----
+    // The background moves while the logo does not, so what is hidden now was visible a few
+    // frames ago (or in a frame without the logo). Instead of chaining one-frame hops, each
+    // masked pixel directly looks up its background in the stored frames at the position given
+    // by the accumulated motion, and adopts it when the source there is trusted and clean.
+    private val historyDepth: Int = when {
+        px > 100_000 -> 6
+        px > 40_000 -> 10
+        else -> 14
+    }
+    private val histOut = Array(historyDepth) { ByteArray(px * 3) }
+    private val histWeight = Array(historyDepth) { ByteArray(px) } // log-quantized confidence
+    private val histCumX = FloatArray(historyDepth)
+    private val histCumY = FloatArray(historyDepth)
+    private val histMean = Array(historyDepth) { FloatArray(3) } // clean mean, per channel
+    private var histStart = 0
+    private var histCount = 0
+    private var cumX = 0f
+    private var cumY = 0f
+    private val cleanMean = FloatArray(3) { 0.5f }
+
+    // ---- harmonic fill state (warm-started across frames) ----
+    private val fillIdx: IntArray = run {
+        var n = 0
+        for (i in 0 until px) if (mask[i] && layer.fill[i]) n++
+        val idx = IntArray(n)
+        var k = 0
+        for (i in 0 until px) if (mask[i] && layer.fill[i]) idx[k++] = i
+        idx
+    }
+    private val fillMask = BooleanArray(px) { mask[it] && layer.fill[it] }
+    private var fillWarm = false
+    private var fillColdDone = false
+    private val fillState = FloatArray(px * 3)
+
     // On-line estimate of the systematic error of the inversion (per pixel): whatever is left of
     // the logo after inversion shows up as a constant difference with the picture carried from
     // clean pixels. Learned during the export, it also absorbs colour-conversion differences
@@ -127,6 +166,12 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         wasPresent = true
         presence = 1f
         motionFound = false
+        histStart = 0
+        histCount = 0
+        cumX = 0f
+        cumY = 0f
+        fillWarm = false
+        fillColdDone = false
     }
 
     /**
@@ -136,6 +181,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
      */
     fun process(rgba: ByteArray, flipY: Boolean, output: ByteArray) {
         unpack(rgba, flipY)
+        computeCleanMean()
         presence = if (tapP.isEmpty()) 1f else measurePresence()
         // Hysteresis: a logo does not blink, so a present logo needs a clear drop to be declared
         // gone (and vice versa); the ramp keeps fades smooth. Biased towards "present": a logo
@@ -151,6 +197,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         // ---- motion of the background since the previous frame ----
         motionFound = false
         if (hasPrevious) estimateMotion()
+        if (motionFound) { cumX += motionX; cumY += motionY }
 
         // ---- base estimate: raw / inverted / fill, with confidences ----
         for (p in 0 until px) {
@@ -172,32 +219,9 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
             weight[p] = 1f / (sigma * sigma)
         }
         if (active) {
-            // Fill pixels: distance-weighted average of the nearest restored pixels (L, R, T, B).
-            for (y in 0 until height) for (x in 0 until width) {
-                val p = y * width + x
-                if (!mask[p] || !layer.fill[p]) continue
-                var r = 0f; var g = 0f; var b = 0f; var ws = 0f
-                for (k in 0 until 4) {
-                    val d = layer.distances[p * 4 + k].toInt() and 0xFF
-                    if (d == 0 || d == 255) continue
-                    val q = when (k) {
-                        0 -> p - d
-                        1 -> p + d
-                        2 -> p - d * width
-                        else -> p + d * width
-                    }
-                    val wq = 1f / (d.toFloat() * d)
-                    r += out[q * 3] * wq; g += out[q * 3 + 1] * wq; b += out[q * 3 + 2] * wq; ws += wq
-                }
-                if (ws > 0f) {
-                    out[p * 3] = r / ws; out[p * 3 + 1] = g / ws; out[p * 3 + 2] = b / ws
-                    weight[p] = W_FILL
-                } else {
-                    weight[p] = W_FILL * 0.25f
-                }
-            }
-            // ---- temporal propagation ----
+            harmonicFill()
             if (motionFound) propagate()
+            motionFill()
         }
 
         // ---- keep state for the next frame ----
@@ -205,6 +229,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         System.arraycopy(out, 0, prevOut, 0, px * 3)
         System.arraycopy(weight, 0, prevWeight, 0, px)
         hasPrevious = true
+        pushHistory()
         pack(output, flipY)
     }
 
@@ -411,6 +436,199 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         }
     }
 
+    /** Per-channel mean of the clean (unmasked) pixels of the current frame (exposure tracking). */
+    private fun computeCleanMean() {
+        var r = 0.0; var g = 0.0; var b = 0.0
+        var count = 0
+        for (p in 0 until px) {
+            if (mask[p]) continue
+            r += cur[p * 3].toDouble(); g += cur[p * 3 + 1].toDouble(); b += cur[p * 3 + 2].toDouble()
+            count++
+        }
+        if (count > 0) {
+            cleanMean[0] = (r / count).toFloat()
+            cleanMean[1] = (g / count).toFloat()
+            cleanMean[2] = (b / count).toFloat()
+        }
+    }
+
+    /**
+     * Fills the opaque pixels by solving Laplace's equation over them (harmonic inpainting),
+     * with the restored pixels around as boundary. Much smoother than a per-pixel average and
+     * warm-started from the previous frame, so it converges in a few iterations; the temporal
+     * passes then overwrite it wherever the real background has been seen.
+     */
+    private fun harmonicFill() {
+        if (fillIdx.isEmpty()) return
+        // Cold start: initialise from the nearest restored pixels (L, R, T, B).
+        if (!fillWarm) {
+            for (p in fillIdx) {
+                var r = 0f; var g = 0f; var b = 0f; var ws = 0f
+                for (k in 0 until 4) {
+                    val d = layer.distances[p * 4 + k].toInt() and 0xFF
+                    if (d == 0 || d == 255) continue
+                    val q = when (k) {
+                        0 -> p - d
+                        1 -> p + d
+                        2 -> p - d * width
+                        else -> p + d * width
+                    }
+                    val wq = 1f / (d.toFloat() * d)
+                    r += out[q * 3] * wq; g += out[q * 3 + 1] * wq; b += out[q * 3 + 2] * wq; ws += wq
+                }
+                if (ws > 0f) {
+                    fillState[p * 3] = r / ws; fillState[p * 3 + 1] = g / ws; fillState[p * 3 + 2] = b / ws
+                } else {
+                    fillState[p * 3] = cleanMean[0]; fillState[p * 3 + 1] = cleanMean[1]; fillState[p * 3 + 2] = cleanMean[2]
+                }
+                weight[p] = W_FILL * 0.25f
+            }
+            fillWarm = true
+        }
+        // Gauss-Seidel: neighbours come from the restored pixels (boundary) or the fill state.
+        val iters = if (fillColdDone) FILL_ITERS_WARM else FILL_ITERS
+        fillColdDone = true
+        for (it in 0 until iters) {
+            val forward = it % 2 == 0
+            var maxDelta = 0f
+            for (kk in fillIdx.indices) {
+                val p = if (forward) fillIdx[kk] else fillIdx[fillIdx.size - 1 - kk]
+                val x = p % width
+                val y = p / width
+                val l = if (x > 0) p - 1 else p
+                val r = if (x < width - 1) p + 1 else p
+                val u = if (y > 0) p - width else p
+                val d = if (y < height - 1) p + width else p
+                for (c in 0 until 3) {
+                    val vl = if (fillMask[l]) fillState[l * 3 + c] else out[l * 3 + c]
+                    val vr = if (fillMask[r]) fillState[r * 3 + c] else out[r * 3 + c]
+                    val vu = if (fillMask[u]) fillState[u * 3 + c] else out[u * 3 + c]
+                    val vd = if (fillMask[d]) fillState[d * 3 + c] else out[d * 3 + c]
+                    val newV = 0.25f * (vl + vr + vu + vd)
+                    maxDelta = max(maxDelta, abs(newV - fillState[p * 3 + c]))
+                    fillState[p * 3 + c] = newV
+                }
+            }
+            if (maxDelta < 1e-4f) break
+        }
+        for (p in fillIdx) {
+            if (weight[p] < W_FILL) {
+                out[p * 3] = fillState[p * 3]
+                out[p * 3 + 1] = fillState[p * 3 + 1]
+                out[p * 3 + 2] = fillState[p * 3 + 2]
+                weight[p] = W_FILL
+            }
+        }
+    }
+
+    /**
+     * The "motion fill" of the pro tools: every masked pixel that is not yet established looks
+     * up its own background in the stored frames, at the position given by the accumulated
+     * motion, and adopts it when the source there is trusted (clean or well established). The
+     * candidate is exposure-corrected towards the current frame and outlier-checked against the
+     * running estimate, so a wrong motion or an occlusion never drags garbage in.
+     */
+    private fun motionFill() {
+        if (histCount == 0) return
+        for (p in 0 until px) {
+            if (!mask[p] || weight[p] >= MOTION_FILL_DONE) continue
+            val x = p % width
+            val y = p / width
+            var bestW = 0f
+            var bestR = 0f; var bestG = 0f; var bestB = 0f
+            var bestAge = 1
+            for (h in 0 until histCount) {
+                val age = h + 1
+                val idx = (histStart + histCount - 1 - h) % historyDepth
+                // Where the content now at (x, y) was, `age` frames ago.
+                val sx = x - (cumX - histCumX[idx])
+                val sy = y - (cumY - histCumY[idx])
+                if (sx < 0f || sy < 0f || sx > width - 1f || sy > height - 1f) continue
+                val x0 = floor(sx).toInt()
+                val y0 = floor(sy).toInt()
+                val x1 = min(x0 + 1, width - 1)
+                val y1 = min(y0 + 1, height - 1)
+                val fx = sx - x0
+                val fy = sy - y0
+                val i00 = y0 * width + x0; val i10 = y0 * width + x1
+                val i01 = y1 * width + x0; val i11 = y1 * width + x1
+                val wSrc = (decodeWeight(histWeight[idx][i00]) * (1f - fx) * (1f - fy) +
+                    decodeWeight(histWeight[idx][i10]) * fx * (1f - fy) +
+                    decodeWeight(histWeight[idx][i01]) * (1f - fx) * fy +
+                    decodeWeight(histWeight[idx][i11]) * fx * fy)
+                if (wSrc < MOTION_FILL_MIN_SRC) continue
+                // Motion error accumulates with the frame distance; one resampling.
+                val sigma = sqrt(SIGMA_HOP * SIGMA_HOP * age + 1e-4f)
+                val wT = 1f / (1f / wSrc + sigma * sigma)
+                if (wT <= bestW) continue
+                val ob = histOut[idx]
+                var r = ((ob[i00 * 3].toInt() and 0xFF) * (1f - fx) * (1f - fy) +
+                    (ob[i10 * 3].toInt() and 0xFF) * fx * (1f - fy) +
+                    (ob[i01 * 3].toInt() and 0xFF) * (1f - fx) * fy +
+                    (ob[i11 * 3].toInt() and 0xFF) * fx * fy) * INV255
+                var g = ((ob[i00 * 3 + 1].toInt() and 0xFF) * (1f - fx) * (1f - fy) +
+                    (ob[i10 * 3 + 1].toInt() and 0xFF) * fx * (1f - fy) +
+                    (ob[i01 * 3 + 1].toInt() and 0xFF) * (1f - fx) * fy +
+                    (ob[i11 * 3 + 1].toInt() and 0xFF) * fx * fy) * INV255
+                var b = ((ob[i00 * 3 + 2].toInt() and 0xFF) * (1f - fx) * (1f - fy) +
+                    (ob[i10 * 3 + 2].toInt() and 0xFF) * fx * (1f - fy) +
+                    (ob[i01 * 3 + 2].toInt() and 0xFF) * (1f - fx) * fy +
+                    (ob[i11 * 3 + 2].toInt() and 0xFF) * fx * fy) * INV255
+                // Exposure correction towards the current frame.
+                r *= (cleanMean[0] / max(histMean[idx][0], 0.02f)).coerceIn(0.6f, 1.6f)
+                g *= (cleanMean[1] / max(histMean[idx][1], 0.02f)).coerceIn(0.6f, 1.6f)
+                b *= (cleanMean[2] / max(histMean[idx][2], 0.02f)).coerceIn(0.6f, 1.6f)
+                bestR = r.coerceIn(0f, 1f); bestG = g.coerceIn(0f, 1f); bestB = b.coerceIn(0f, 1f)
+                bestW = wT
+                bestAge = age
+                if (wT >= MOTION_FILL_STRONG) break // recent and strong: stop looking further
+            }
+            if (bestW <= 0f) continue
+            val wB = weight[p]
+            // Outlier test: the candidate must agree with the running estimate.
+            val tol = 3f * sqrt(1f / bestW + 1f / max(wB, 1f)) + 0.02f + 0.01f * bestAge
+            if (max(abs(bestR - out[p * 3]), max(abs(bestG - out[p * 3 + 1]), abs(bestB - out[p * 3 + 2]))) > tol) continue
+            val total = wB + bestW
+            out[p * 3] = (out[p * 3] * wB + bestR * bestW) / total
+            out[p * 3 + 1] = (out[p * 3 + 1] * wB + bestG * bestW) / total
+            out[p * 3 + 2] = (out[p * 3 + 2] * wB + bestB * bestW) / total
+            weight[p] = min(total, W_MAX)
+        }
+    }
+
+    /** Stores the restored frame (and its confidences) for the motion fill lookups. */
+    private fun pushHistory() {
+        val idx: Int
+        if (histCount < historyDepth) {
+            idx = (histStart + histCount) % historyDepth
+            histCount++
+        } else {
+            idx = histStart
+            histStart = (histStart + 1) % historyDepth
+        }
+        val ob = histOut[idx]
+        val wb = histWeight[idx]
+        for (i in 0 until px) {
+            ob[i * 3] = toByte(out[i * 3])
+            ob[i * 3 + 1] = toByte(out[i * 3 + 1])
+            ob[i * 3 + 2] = toByte(out[i * 3 + 2])
+            wb[i] = encodeWeight(weight[i])
+        }
+        histCumX[idx] = cumX
+        histCumY[idx] = cumY
+        histMean[idx][0] = cleanMean[0]
+        histMean[idx][1] = cleanMean[1]
+        histMean[idx][2] = cleanMean[2]
+    }
+
+    private fun encodeWeight(w: Float): Byte {
+        if (w <= 1f) return 0
+        val v = (32f * log10(w)).roundToInt().coerceIn(1, 255)
+        return v.toByte()
+    }
+
+    private fun decodeWeight(b: Byte): Float = WEIGHT_DECODE[b.toInt() and 0xFF]
+
     private fun toByte(v: Float): Byte = (v.coerceIn(0f, 1f) * 255f + 0.5f).toInt().toByte()
 
     companion object {
@@ -435,6 +653,26 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         private const val GHOST_MIN_TOTAL = 2_500f
         /** Forgetting horizon of the ghost estimate (keeps adapting to slow drifts). */
         private const val GHOST_MAX_TOTAL = 200_000f
+        /** Motion fill: minimum source confidence for a stored frame to be used. */
+        private const val MOTION_FILL_MIN_SRC = 600f
+        /**
+         * Motion fill: stop scanning older frames once a source this strong is found. With
+         * SIGMA_HOP, a source older than one frame cannot reach this weight, so breaking is
+         * provably optimal - and it keeps the common case (recent clean source) at one entry.
+         */
+        private const val MOTION_FILL_STRONG = 2_600f
+        /** Motion fill: pixels at least this certain are not looked up any more. */
+        private const val MOTION_FILL_DONE = 3_000f
+        /** Gauss-Seidel iterations of the harmonic fill, on the first (cold) frame. */
+        private const val FILL_ITERS = 26
+        /**
+         * Iterations on the following frames: the state is warm-started from the previous
+         * frame, the boundary evolves slowly and the motion fill overwrites the result
+         * wherever the real background is known - a few sweeps are enough.
+         */
+        private const val FILL_ITERS_WARM = 18
+        /** Decoding table of the log-quantised confidences (computed once, no pow in the loops). */
+        private val WEIGHT_DECODE = FloatArray(256) { if (it == 0) 0f else 10f.pow(it / 32f) }
 
         /** For every pixel, the index of the nearest pixel outside [mask] (itself when outside). */
         fun nearestCleanIndices(mask: BooleanArray, w: Int, h: Int): IntArray {
