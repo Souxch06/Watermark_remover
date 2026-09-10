@@ -39,6 +39,20 @@ object WatermarkAnalyzer {
     const val MAX_INVERT_ALPHA = 0.8f
     /** A watermark layer is only trusted if this many frames were analysed. */
     const val MIN_FRAMES = 6
+        /** Samples per bootstrap chunk (a run of consecutive samples = one clip). */
+        private const val ALIGN_CHUNK = 8
+        /** Step between bootstrap chunks (overlapping, so a pure-clip chunk is likely). */
+        private const val ALIGN_CHUNK_STEP = 3
+        /** Search range (+- px) of the per-frame watermark alignment in the analysis. */
+        private const val ALIGN_SEARCH = 12
+        /** Minimum correlation for a frame offset to be used. */
+        private const val ALIGN_MIN_SCORE = 0.45f
+        /** Margin over the zero offset before a non-zero alignment is used. */
+        private const val ALIGN_MARGIN = 0.15f
+        /** Minimum opacity for a pixel to be used as an alignment tap. */
+        private const val ALIGN_TAP_ALPHA = 0.15f
+        /** Inverted pixels must cover at least this fraction of the mask for alignment. */
+        private const val ALIGN_INV_FRACTION = 0.40f
     /** Smallest subset of frames on which the logo may be analysed when it is not always there. */
     const val MIN_PRESENT_FRAMES = 4
     /** Largest region analysed (pixels); bigger zones fall back to the spatial reconstruction. */
@@ -139,15 +153,170 @@ object WatermarkAnalyzer {
         val w = input.width
         val h = input.height
         if (input.frames.size < MIN_FRAMES || w < 2 * RING + 4 || h < 2 * RING + 4 || w * h > MAX_REGION_PIXELS) return null
+        val direct = analyzePass(input.frames, w, h)
+        // The watermark does not necessarily sit at exactly the same pixels in every sampled
+        // frame: clip compilations re-render it per clip and auto-reframed exports shift it.
+        // The temporal median then smears it into nothing ("no watermark" -> the zone would
+        // fall back to spatial reconstruction, a blurry patch). When the direct pass fails,
+        // bootstrap a layer on a run of consecutive samples (inside one clip the watermark is
+        // still), re-align every frame onto it and re-analyse the whole set. When the direct
+        // pass succeeds, still try: a re-aligned pass can only be sharper.
+        if (direct != null && direct.hasWatermark) {
+            return alignAndReanalyse(input.frames, w, h, direct) ?: direct
+        }
+        var best: Layer? = null
+        var start = 0
+        while (start + MIN_FRAMES <= input.frames.size) {
+            val end = min(start + ALIGN_CHUNK, input.frames.size)
+            val l = analyzePass(input.frames.subList(start, end), w, h)
+            if (l != null && l.hasWatermark && (best == null || l.stats.maskPixels > best!!.stats.maskPixels)) best = l
+            if (end == input.frames.size) break
+            start += ALIGN_CHUNK_STEP
+        }
+        val base = best ?: return direct
+        return alignAndReanalyse(input.frames, w, h, base) ?: base
+    }
+
+    /**
+     * Re-aligns every sampled frame onto the watermark position of [base] and re-analyses the
+     * whole set. Returns null (and the caller keeps [base]) when the frames were already
+     * aligned or the re-analysis is not better.
+     */
+    private fun alignAndReanalyse(frames: List<ByteArray>, w: Int, h: Int, base: Layer): Layer? {
+        // Only an inversion-dominated layer can localise its watermark: a fill-dominated one
+        // has no reliable watermark taps (its few "inverted" pixels are usually background
+        // false positives) and the alignment would follow the moving background instead.
+        var inverted = 0
+        var masked = 0
+        for (i in base.alpha.indices) {
+            if (base.alpha[i] > 0f) inverted++
+            if (base.alpha[i] > 0f || base.fill[i]) masked++
+        }
+        if (masked == 0 || inverted < masked * ALIGN_INV_FRACTION) return null
+        val offsets = estimateFrameOffsets(frames, w, h, base)
+        if (offsets.all { it.first == 0 && it.second == 0 }) return null
+        // offsets[i] = where frame i's watermark sits relative to the base layer; sampling the
+        // frame at p + off moves the watermark back onto its analysed position.
+        val aligned = frames.mapIndexed { i, f -> shiftFrame(f, w, h, offsets[i].first, offsets[i].second) }
+        val out = analyzePass(aligned, w, h) ?: return null
+        // Adopt only when the re-aligned layer really explains the frames better: the residual
+        // consistent-gradient energy after inversion must drop clearly. A spurious alignment
+        // produces an over-detected mask that leaves the background unexplained (high energy).
+        // An empty layer has no residual at all: require the mask to be at least as complete.
+        if (out.stats.maskPixels < base.stats.maskPixels * 0.9f) return null
+        val baseResidual = residualEnergy(frames, w, h, base)
+        val outResidual = residualEnergy(aligned, w, h, out)
+        return if (outResidual < 0.85f * baseResidual) out else null
+    }
+
+    /** Total consistent-gradient energy left over the mask after inverting with [layer]. */
+    private fun residualEnergy(frames: List<ByteArray>, w: Int, h: Int, layer: Layer): Float {
+        val px = w * h
+        val e = consistentEnergy(frames, w, h, frames.size, Inversion(layer.colour, layer.alpha, layer.fill))
+        var total = 0f
+        for (i in 0 until px) if (layer.alpha[i] > 0f || layer.fill[i]) total += e[i]
+        return total
+    }
+
+    /**
+     * Where the watermark sits in each frame, relative to its position in [base]: the offset
+     * whose tap regression (edge pairs of the layer vs the frame) scores best. Frames where
+     * nothing scores are left at (0, 0).
+     */
+    private fun estimateFrameOffsets(frames: List<ByteArray>, w: Int, h: Int, base: Layer): List<Pair<Int, Int>> {
+        val px = w * h
+        val mask = BooleanArray(px) { base.alpha[it] > 0f || base.fill[it] }
+        if (mask.none { it }) return frames.map { 0 to 0 }
+        val nearest = RegionRestorer.nearestCleanIndices(mask, w, h)
+        // Edge taps: horizontal and vertical neighbours straddling the watermark border.
+        val tp = ArrayList<Int>(); val tq = ArrayList<Int>(); val tn = ArrayList<Int>()
+        val tda = ArrayList<Float>(); val tdc = ArrayList<FloatArray>()
+        fun consider(p: Int, q: Int) {
+            val aP = base.alpha[p]; val aQ = base.alpha[q]
+            if ((aP <= 0f && !base.fill[p]) == (aQ <= 0f && !base.fill[q])) return
+            // Only strong watermark pixels: an over-detected layer also covers background,
+            // and its weak taps would align on the moving background instead of the logo.
+            if (max(aP, aQ) < ALIGN_TAP_ALPHA || abs(aQ - aP) < ALIGN_TAP_ALPHA * 0.5f) return
+            var m = 0f
+            for (c in 0 until 3) m = max(m, abs(base.colour[q * 3 + c] - base.colour[p * 3 + c]))
+            if (m < 0.02f) return
+            val anchor = if (aP >= aQ) p else q
+            tp.add(p); tq.add(q); tn.add(nearest[anchor])
+            tda.add(aQ - aP)
+            tdc.add(FloatArray(3) { c -> base.colour[q * 3 + c] - base.colour[p * 3 + c] })
+        }
+        for (y in 0 until h) for (x in 0 until w) {
+            val p = y * w + x
+            if (x + 1 < w) consider(p, p + 1)
+            if (y + 1 < h) consider(p, p + w)
+        }
+        if (tp.isEmpty()) return frames.map { 0 to 0 }
+        return frames.map { f ->
+            var bestScore = -Float.MAX_VALUE
+            var bestX = 0
+            var bestY = 0
+            var zeroScore = -1f
+            for (dy in -ALIGN_SEARCH..ALIGN_SEARCH) for (dx in -ALIGN_SEARCH..ALIGN_SEARCH) {
+                val d = dy * w + dx
+                var num = 0.0
+                var den = 0.0
+                var obs2 = 0.0
+                for (k in tp.indices) {
+                    val p = tp[k] + d; val q = tq[k] + d; val n = tn[k] + d
+                    if (p < 0 || q < 0 || n < 0 || p >= px || q >= px || n >= px) continue
+                    val da = tda[k]
+                    if (da == 0f) continue
+                    for (c in 0 until 3) {
+                        val e = tdc[k][c] - v(f, n * 3 + c) * da
+                        val o = v(f, q * 3 + c) - v(f, p * 3 + c)
+                        num += o * e
+                        den += e * e
+                        obs2 += o * o
+                    }
+                }
+                // Normalised correlation (-1..1): cannot blow up on a coincidental pattern.
+                val scale = den * obs2
+                val s = if (scale > 1e-4) (num / kotlin.math.sqrt(scale)).toFloat() else -1f
+                if (dx == 0 && dy == 0) zeroScore = s
+                if (s > bestScore) { bestScore = s; bestX = dx; bestY = dy }
+            }
+            // An offset at the edge of the search window is a lost match, not a position.
+            if (abs(bestX) >= ALIGN_SEARCH || abs(bestY) >= ALIGN_SEARCH) return@map 0 to 0
+            // A non-zero offset must be clearly better than the zero one: a static watermark
+            // must not get shifted by estimation noise.
+            if (bestScore >= ALIGN_MIN_SCORE &&
+                ((bestX == 0 && bestY == 0) || bestScore > zeroScore + ALIGN_MARGIN)
+            ) bestX to bestY else 0 to 0
+        }
+    }
+
+    /** Shifts an RGB frame by (dx, dy), edge-clamped. */
+    private fun shiftFrame(f: ByteArray, w: Int, h: Int, dx: Int, dy: Int): ByteArray {
+        if (dx == 0 && dy == 0) return f
+        val out = ByteArray(f.size)
+        for (y in 0 until h) {
+            val sy = (y + dy).coerceIn(0, h - 1)
+            for (x in 0 until w) {
+                val sx = (x + dx).coerceIn(0, w - 1)
+                val dst = (y * w + x) * 3
+                val s = (sy * w + sx) * 3
+                out[dst] = f[s]; out[dst + 1] = f[s + 1]; out[dst + 2] = f[s + 2]
+            }
+        }
+        return out
+    }
+
+    /** One full analysis pass over the given frames (present-frame selection included). */
+    private fun analyzePass(inputFrames: List<ByteArray>, w: Int, h: Int): Layer? {
         val px = w * h
         val empty = { reason: String, motion: Float, present: Int ->
             Layer(w, h, FloatArray(px * 3), FloatArray(px), BooleanArray(px), ByteArray(px * 4),
-                Stats(input.frames.size, present, motion, 0, 0, 0, 0, reason))
+                Stats(inputFrames.size, present, motion, 0, 0, 0, 0, reason))
         }
 
         // --- 0. which frames contain the logo? ----------------------------------------------
-        val presentIdx = selectPresentFrames(input.frames, w, h)
-        val frames = presentIdx.map { input.frames[it] }
+        val presentIdx = selectPresentFrames(inputFrames, w, h)
+        val frames = presentIdx.map { inputFrames[it] }
         val n = frames.size
         if (n < MIN_PRESENT_FRAMES) return null
 
@@ -371,7 +540,7 @@ object WatermarkAnalyzer {
         val filled = fill.count { it }
         val invertedCount = alpha.count { it > 0f }
         return Layer(w, h, colour, alpha, fill, distances,
-            Stats(input.frames.size, n, motion, maskCount, invertedCount, filled, componentCount, "ok"))
+            Stats(inputFrames.size, n, motion, maskCount, invertedCount, filled, componentCount, "ok"))
     }
 
     // ------------------------------------------------------------------------------------------

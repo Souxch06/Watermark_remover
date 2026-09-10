@@ -63,6 +63,33 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     private val lumCur = FloatArray(px)
     private val lumPrev = FloatArray(px)
     private var lumBase = lumPrev // the frame the motion search matches against
+    // ---- per-frame watermark alignment: real exports (clip compilations, auto-reframe)
+    // re-render the watermark per clip, so it does NOT sit at exactly the same pixels all
+    // along the video. The restorer works in an "aligned" domain where the watermark is
+    // always at its analysed position: each frame is shifted by minus the estimated offset
+    // on the way in, and the result is shifted back on the way out. The motion / history
+    // machinery then stays self-consistent in that domain. ----
+    private var wmOffX = 0
+    private var wmOffY = 0
+    private val warpBuf = FloatArray(px * 3)
+    /**
+     * True when the layer can localise its watermark: enough strong inversion taps, and an
+     * inversion-dominated mask (a fill-dominated layer has no reliable watermark taps - its
+     * few "inverted" pixels are usually background false positives, and following them would
+     * align on the moving background instead of the logo).
+     */
+    private val wmTrackable: Boolean by lazy {
+        var inverted = 0
+        var masked = 0
+        for (i in 0 until px) {
+            if (layer.alpha[i] > 0f) inverted++
+            if (mask[i]) masked++
+        }
+        if (inverted < masked * WM_OFF_INV_FRACTION) return@lazy false
+        var strong = 0
+        for (k in tapDa.indices) if (abs(tapDa[k]) >= WM_OFF_TAP_ALPHA) strong++
+        strong >= WM_OFF_MIN_TAPS
+    }
     // Luminance of the frames t-2 and t-3: with a slow background, the sub-pixel estimate over
     // one frame is biased by the resampling; over three frames the same bias is divided by three.
     private val lumPrev2 = FloatArray(px)
@@ -175,6 +202,8 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     fun reset() {
         hasPrevious = false
         prevCount = 0
+        wmOffX = 0
+        wmOffY = 0
         wasPresent = true
         presence = 1f
         motionFound = false
@@ -197,6 +226,10 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
      */
     fun process(rgba: ByteArray, flipY: Boolean, output: ByteArray) {
         unpack(rgba, flipY)
+        estimateWatermarkOffset()
+        // The frame watermark sits at layer position + (wmOffX, wmOffY): sample the frame at
+        // p + off so the watermark lands exactly on its analysed position.
+        if (wmOffX != 0 || wmOffY != 0) shiftInPlace(wmOffX, wmOffY)
         computeCleanMean()
         presence = if (tapP.isEmpty()) 1f else measurePresence()
         // Hysteresis: a logo does not blink, so a present logo needs a clear drop to be declared
@@ -247,7 +280,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         System.arraycopy(weight, 0, prevWeight, 0, px)
         hasPrevious = true
         pushHistory()
-        pack(output, flipY)
+        pack(output, flipY, wmOffX, wmOffY)
     }
 
     // ------------------------------------------------------------------------------------------
@@ -267,17 +300,21 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         }
     }
 
-    private fun pack(rgba: ByteArray, @Suppress("UNUSED_PARAMETER") flipY: Boolean) {
+    private fun pack(rgba: ByteArray, @Suppress("UNUSED_PARAMETER") flipY: Boolean, offX: Int = 0, offY: Int = 0) {
+        // Un-warp: the restored content of the display pixel (x, y) is the aligned-domain
+        // pixel (x - offX, y - offY) (edge-clamped).
+        val d = -offY * width - offX
         for (y in 0 until height) {
             var dst = y * width * 4
-            var src = y * width * 3
             for (x in 0 until width) {
+                var src = (y * width + x + d) * 3
+                if (src < 0) src = 0
+                if (src > (px - 1) * 3) src = (px - 1) * 3
                 rgba[dst] = toByte(out[src])
                 rgba[dst + 1] = toByte(out[src + 1])
                 rgba[dst + 2] = toByte(out[src + 2])
                 rgba[dst + 3] = -1
                 dst += 4
-                src += 3
             }
         }
     }
@@ -302,6 +339,75 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
             }
         }
         return if (den > 1e-3) (num / den).toFloat().coerceIn(-1f, 2f) else 1f
+    }
+
+    /**
+     * Regression score of the layer's watermark pattern against the current frame when the
+     * frame is aligned by (dx, dy): ~1 when the watermark sits there, ~0 elsewhere. The
+     * presence taps (edge pixel pairs + a clean reference) shift rigidly, so the score stays
+     * valid whatever the background.
+     */
+    private fun presenceScoreAt(dx: Int, dy: Int): Float {
+        val d = dy * width + dx
+        var num = 0.0
+        var den = 0.0
+        for (k in tapP.indices) {
+            val p = tapP[k] + d
+            val q = tapQ[k] + d
+            val n = tapN[k] + d
+            if (p < 0 || q < 0 || n < 0 || p >= px || q >= px || n >= px) continue
+            val da = tapDa[k]
+            if (da == 0f) continue
+            val p3 = p * 3; val q3 = q * 3; val n3 = n * 3
+            for (c in 0 until 3) {
+                val e = tapDc[3 * k + c] - cur[n3 + c] * da
+                num += (cur[q3 + c] - cur[p3 + c]) * e
+                den += e * e
+            }
+        }
+        return if (den > 1e-3) (num / den).toFloat() else -1f
+    }
+
+    /**
+     * Finds where the watermark sits in the current frame (it may have been re-rendered a few
+     * pixels away, or jitter slightly): the offset whose alignment scores best wins, with a
+     * margin over the current offset so the estimate does not flicker.
+     */
+    private fun estimateWatermarkOffset() {
+        if (!wmTrackable) return
+        var bestScore = -Float.MAX_VALUE
+        var bestX = 0
+        var bestY = 0
+        for (dy in -WM_OFF_SEARCH..WM_OFF_SEARCH) for (dx in -WM_OFF_SEARCH..WM_OFF_SEARCH) {
+            val s = presenceScoreAt(dx, dy)
+            if (s > bestScore) { bestScore = s; bestX = dx; bestY = dy }
+        }
+        if (bestScore < WM_OFF_MIN_SCORE) return // nothing convincing: keep the last offset
+        if (wmOffX == bestX && wmOffY == bestY) return
+        val current = presenceScoreAt(wmOffX, wmOffY)
+        // Hysteresis: only move when the new alignment is clearly better - or when the current
+        // one has collapsed (the video cut to another clip and the watermark jumped).
+        if (bestScore > current + WM_OFF_MARGIN || current < WM_OFF_MIN_SCORE) {
+            wmOffX = bestX
+            wmOffY = bestY
+        }
+    }
+
+    /** Shifts [cur] by (dx, dy) in place (edge-clamped): cur'[p] = cur[p + (dx, dy)]. */
+    private fun shiftInPlace(dx: Int, dy: Int) {
+        if (dx == 0 && dy == 0) return
+        System.arraycopy(cur, 0, warpBuf, 0, px * 3)
+        for (y in 0 until height) {
+            val sy = (y + dy).coerceIn(0, height - 1)
+            for (x in 0 until width) {
+                val sx = (x + dx).coerceIn(0, width - 1)
+                val dst = (y * width + x) * 3
+                val s = (sy * width + sx) * 3
+                cur[dst] = warpBuf[s]
+                cur[dst + 1] = warpBuf[s + 1]
+                cur[dst + 2] = warpBuf[s + 2]
+            }
+        }
     }
 
     private fun estimateMotion() {
@@ -798,6 +904,18 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         private const val MAX_MATCH_ERROR = 0.06f
         /** Max gap between the one-frame estimate and the 3-frame refinement of it. */
         private const val MOTION_REFINE_MAX_DELTA = 1.5f
+        /** Search range (+- px) of the per-frame watermark alignment. */
+        private const val WM_OFF_SEARCH = 12
+        /** Opacity step for a tap to count towards watermark localisation. */
+        private const val WM_OFF_TAP_ALPHA = 0.08f
+        /** Minimum strong taps before the watermark position is tracked at all. */
+        private const val WM_OFF_MIN_TAPS = 6
+        /** Inverted pixels must cover at least this fraction of the mask for tracking. */
+        private const val WM_OFF_INV_FRACTION = 0.50f
+        /** Minimum correlation for a watermark offset to be adopted. */
+        private const val WM_OFF_MIN_SCORE = 0.45f
+        /** Margin required over the current offset before switching (anti-flicker). */
+        private const val WM_OFF_MARGIN = 0.08f
         /** Background travel (px) needed before a new frame enters the history. */
         private const val PUSH_TRAVEL = 2.5f
         /** Maximum frames between two stored frames (keeps recent frames on a still picture). */

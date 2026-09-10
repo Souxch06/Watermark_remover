@@ -464,6 +464,70 @@ class WatermarkAnalyzerTest {
     }
 
     @Test
+    fun `a watermark that is re-rendered between clips is still removed`() {
+        // Clip compilations (the Vizard-style exports) re-render the watermark per clip: it
+        // jumps a few pixels at every cut and the temporal median of the analysis smears it
+        // into nothing - the zone used to fall back to spatial reconstruction (a blurry
+        // patch). The analysis now bootstraps a layer on a run of consecutive samples and
+        // re-aligns every frame onto it, and the export re-aligns the layer on each frame.
+        fun bgClip(x: Int, y: Int, t: Int, scene: Int): FloatArray {
+            val xx = x + 6f * t
+            val yy = y + 4f * t
+            val p = scene * 2.3f
+            val r = 0.35f + 0.25f * sin(xx * 0.31f + p) + 0.15f * sin(yy * 0.17f + p)
+            val g = 0.40f + 0.20f * sin(xx * 0.23f + 1f + p) + 0.10f * sin((xx + yy) * 0.11f)
+            val b = 0.45f + 0.20f * sin(yy * 0.27f + 2f + p) + 0.10f * sin(xx * 0.13f)
+            return floatArrayOf(r.coerceIn(0f, 1f), g.coerceIn(0f, 1f), b.coerceIn(0f, 1f))
+        }
+        val cuts = listOf(20, 40)
+        val rnd = Random(17)
+        fun framesClips(n: Int): List<ByteArray> = (0 until n).map { t ->
+            val clip = cuts.count { t >= it }
+            val tc = t - (cuts.filter { t >= it }.maxOrNull() ?: 0)
+            val wx = 6 * clip
+            val wy = 3 * clip
+            val out = ByteArray(w * h * 3)
+            for (y in 0 until h) for (x in 0 until w) {
+                val bg = bgClip(x, y, tc, clip % 2)
+                val a = when (strokeDist(x - wx, y - wy)) { 0 -> 0.45f; 1 -> 0.30f; 2 -> 0.15f; 3 -> 0.05f; else -> 0f }
+                for (c in 0 until 3) {
+                    val v = (a + (1f - a) * bg[c] + (rnd.nextFloat() - 0.5f) * 2f * 0.008f).coerceIn(0f, 1f)
+                    out[(y * w + x) * 3 + c] = (v * 255f + 0.5f).toInt().toByte()
+                }
+            }
+            out
+        }
+        val all = framesClips(60)
+        val sample = all.indices.filter { it % 5 == 1 }.map { all[it] }
+        val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, sample))
+        // Without the alignment this returns a layer with hasWatermark = false.
+        assertTrue("layer=${layer?.stats?.reason}", layer != null && layer.hasWatermark)
+        val restorer = RegionRestorer(layer!!)
+        val errors = ArrayList<Float>()
+        var black = 0
+        for (t in 0 until 60) {
+            val out = rgba(all[t], false).also { restorer.process(it, false, it) }
+            var err = 0f
+            var n = 0
+            val clip = cuts.count { t >= it }
+            val tc = t - (cuts.filter { t >= it }.maxOrNull() ?: 0)
+            for (y in 0 until h) for (x in 0 until w) {
+                if (strokeDist(x, y) > 3) continue
+                val bg = bgClip(x, y, tc, clip % 2)
+                for (c in 0 until 3) {
+                    val o = (out[(y * w + x) * 4 + c].toInt() and 0xFF) / 255f
+                    err += abs(o - bg[c]); n++
+                    if (t >= 10 && o < 0.02f && bg[c] > 0.15f) black++
+                }
+            }
+            errors.add(err / n)
+        }
+        assertTrue("black pixels after warm-up: $black", black < 20)
+        val late = errors.takeLast(10).average()
+        assertTrue("late error $late (the per-clip watermark must be followed)", late < 0.09f)
+    }
+
+    @Test
     fun `layer packing keeps regions texel aligned and method switches to layer mode`() {
         val zone = WatermarkZone(1, NormalizedRect(0.5f, 0.5f, 0.6f, 0.6f))
         val region = WatermarkLayer.regionOf(zone, 1920, 1080)

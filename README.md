@@ -64,6 +64,15 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   opaque large sur un panoramique lent. La greffe de texture n'emprunte enfin son détail qu'à
   des donneurs situés hors des bords marqués, avec un écart plafonné : plus de taches sombres
   ou saturées là où le comblement touchait un contour fort.
+- **Filigrane qui bouge entre les clips** : les exports « compilation de clips » (Vizard, OpusClip,
+  etc.) re-rendent le filigrane à chaque clip — il ne reste pas au pixel près sur toute la vidéo,
+  et la médiane temporelle de l'analyse le smait en poussière (d'où une tache floue sur toute la
+  zone). L'analyse amorce désormais un calque sur une série d'images consécutives (dans un clip le
+  filigrane est immobile), ré-aligne toutes les images dessus et ré-analyse ; l'adoption du
+  résultat se fait par énergie résiduelle mesurée, pas par taille de masque. À l'export, le
+  restaurateur suit en outre la position du filigrane image par image (régression des taps de
+  présence, hystérésis, suivi coupé quand le calque n'est pas localisable) : le calque est
+  ré-aligné sur chaque image avant traitement, dans un domaine où le filigrane est fixe.
 - **Restauration image par image (`RegionRestorer`)** : pendant l'export, chaque image passe par
   un restaurateur CPU qui (1) mesure si le logo est réellement présent dans l'image (filigranes qui
   changent de place → les images sans logo ne sont pas touchées, plus d'apparitions fugaces),
