@@ -84,8 +84,16 @@ object WatermarkAnalyzer {
     private const val MIN_MOTION = 0.012f
     private const val RING = 4
     private const val DILATE = 1
-    private const val REFINE_PASSES = 2
+    private const val REFINE_PASSES = 3
     private const val REFINE_GAIN = 0.8f
+
+    // --- soft edge band (anti-aliased / compression-softened tails of the logo) ---
+    /** Width (px) of the band outside the mask where faint logo tails are looked for. */
+    private const val EDGE_BAND = 3
+    /** Main relief above this is trusted as-is; below it the opacity is re-estimated. */
+    private const val FRINGE_KEEP = 0.2f
+    /** Fringe pixels must reach this opacity to be inverted (else they stay untouched). */
+    private const val EDGE_MIN_ALPHA = 0.02f
 
     @Suppress("NOTHING_TO_INLINE")
     private inline fun v(b: ByteArray, j: Int): Float = (b[j].toInt() and 0xFF) * INV255
@@ -207,6 +215,8 @@ object WatermarkAnalyzer {
         val alpha = FloatArray(px)
         val colour = FloatArray(px * 3)
         val fill = BooleanArray(px)
+        val compColours = Array(componentCount + 1) { FloatArray(3) }
+        val compAlphas = FloatArray(componentCount + 1)
         for (comp in 1..componentCount) {
             val members = ArrayList<Int>()
             for (i in 0 until px) if (labels[i] == comp) members.add(i)
@@ -227,6 +237,8 @@ object WatermarkAnalyzer {
                 val vals = FloatArray(core.size) { i -> val p = core[i]; (background[p * 3 + c] + relief[p * 3 + c] / aComp) }
                 medianOf(vals, vals.size).coerceIn(0f, 1f)
             }
+            compColour.copyInto(compColours[comp])
+            compAlphas[comp] = aComp
             for (p in members) {
                 // Projection of the relief on (W - I~): coverage of this pixel by the logo.
                 var num = 0f
@@ -250,11 +262,23 @@ object WatermarkAnalyzer {
             }
         }
 
+        // --- 3b. soft edge band -----------------------------------------------------------------
+        // The fixed thresholds of steps 1-2 mishandle the anti-aliased (or compression-softened)
+        // tails of the logo: their ramp is under-estimated while the relief bleeds between close
+        // glyphs — either way a faint, blurred copy of the text survives the inversion as a halo.
+        // The faint pixels are re-estimated directly from the data instead.
+        extendSoftEdges(
+            w, h, median, mask, labels, reliefMax,
+            alpha, colour, fill, compColours, compAlphas, componentCount,
+        )
+
         // --- 4. ghost removal on the inverted frames ----------------------------------------------
         // The thresholded gradients of step 1 miss the faint tails of the logo edges, so c is
         // slightly under-estimated and a pale copy of the logo survives the inversion. The median
         // gradients of the INVERTED frames inside the mask integrate to exactly that ghost: fold
-        // it back into c (a couple of passes, the estimate converges quickly).
+        // it back into c (a few passes, the estimate converges quickly). When the ghost demands
+        // more colour than the opacity allows (c = a*W <= a), it is a that was under-estimated:
+        // let it grow, else the correction saturates and the residue stays.
         val invert = BooleanArray(px) { mask[it] && !fill[it] }
         if (invert.any { it }) repeat(REFINE_PASSES) { removeGhost(frames, w, h, n, colour, alpha, fill, invert) }
 
@@ -404,7 +428,8 @@ object WatermarkAnalyzer {
         return e
     }
 
-    /** Step 4: integrates the median residual gradients of the inverted frames into [colour]. */
+    /** Step 4: integrates the median residual gradients of the inverted frames into [colour] /
+     * [alpha] (they are tied by `c = a*W`). */
     private fun removeGhost(
         frames: List<ByteArray>, w: Int, h: Int, n: Int,
         colour: FloatArray, alpha: FloatArray, fill: BooleanArray, invert: BooleanArray,
@@ -412,11 +437,11 @@ object WatermarkAnalyzer {
         val px = w * h
         val gxr = FloatArray(px * 3)
         val gyr = FloatArray(px * 3)
-        val div = FloatArray(px)
         val inv = Inversion(colour, alpha, fill)
         medianGradients(frames, w, h, n, 1, 0, gxr, inv, invert)
         medianGradients(frames, w, h, n, 0, 1, gyr, inv, invert)
-        for (c in 0 until 3) {
+        val ghosts = Array(3) { c ->
+            val div = FloatArray(px)
             for (y in 0 until h) for (x in 0 until w) {
                 val i = y * w + x
                 var d = gxr[i * 3 + c] + gyr[i * 3 + c]
@@ -424,11 +449,24 @@ object WatermarkAnalyzer {
                 if (y > 0) d -= gyr[(i - w) * 3 + c]
                 div[i] = d
             }
-            val ghost = PoissonMasked.solve(div, invert, w, h)
-            for (i in 0 until px) if (invert[i]) {
-                val a = alpha[i]
-                colour[i * 3 + c] = (colour[i * 3 + c] + REFINE_GAIN * ghost[i] * (1f - min(a, MAX_INVERT_ALPHA)))
-                    .coerceIn(0f, min(1f, a + 0.02f))
+            PoissonMasked.solve(div, invert, w, h)
+        }
+        for (i in 0 until px) if (invert[i]) {
+            val a = min(alpha[i], MAX_INVERT_ALPHA)
+            // What the ghost says the colour should be, per channel.
+            var maxTarget = 0f
+            for (c in 0 until 3) maxTarget = max(maxTarget, colour[i * 3 + c] + REFINE_GAIN * ghosts[c][i] * (1f - a))
+            var newA = alpha[i]
+            // c = a*W never exceeds a (W <= 1): when the correction wants more colour than the
+            // opacity allows, the opacity itself was under-estimated. Grow it (bounded) so the
+            // colour can follow, instead of saturating at a + 0.02 and leaving a pale logo.
+            if (maxTarget > newA + 0.03f && newA < MAX_INVERT_ALPHA - 0.01f) {
+                newA = min(MAX_INVERT_ALPHA, newA + REFINE_GAIN * (maxTarget - 0.02f - newA))
+            }
+            alpha[i] = newA
+            for (c in 0 until 3) {
+                val target = colour[i * 3 + c] + REFINE_GAIN * ghosts[c][i] * (1f - min(newA, MAX_INVERT_ALPHA))
+                colour[i * 3 + c] = target.coerceIn(0f, min(1f, newA + 0.02f))
             }
         }
     }
@@ -439,7 +477,8 @@ object WatermarkAnalyzer {
      * so that the picture's own gradients, which average out, are not mistaken for the ghost.
      */
     private fun medianGradients(
-        frames: List<ByteArray>, w: Int, h: Int, n: Int, dx: Int, dy: Int, out: FloatArray, inv: Inversion, where: BooleanArray,
+        frames: List<ByteArray>, w: Int, h: Int, n: Int, dx: Int, dy: Int, out: FloatArray,
+        inv: Inversion?, where: BooleanArray,
     ) {
         out.fill(0f)
         val tmp = FloatArray(n)
@@ -459,6 +498,116 @@ object WatermarkAnalyzer {
                 madSum += mad
             }
             if (maxAbs > significance * (madSum / 3f)) for (c in 0 until 3) out[i * 3 + c] = med[c]
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Soft edge band (step 3b)
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Step 3b: re-estimates the opacity of the faint parts of the logo directly from the data.
+     * The relief of step 2 is a Poisson integral of thresholded gradients: on anti-aliased or
+     * compression-softened glyph edges its taps are cut (under-estimated ramp) while between
+     * close glyphs it bleeds over clean pixels (over-estimated) — either way a pale, blurred
+     * copy of the text survives the inversion. Here the faint pixels — those of the mask whose
+     * relief is weak, plus a thin band around it — get their opacity from the projection of
+     * `(temporal median - interpolated background)` on the component colour, which is unbiased
+     * for thin features; pixels that turn out to hold no logo at all are zeroed out instead of
+     * being over-inverted.
+     */
+    private fun extendSoftEdges(
+        w: Int, h: Int, median: FloatArray,
+        mask: BooleanArray, labels: IntArray, reliefMax: FloatArray,
+        alpha: FloatArray, colour: FloatArray, fill: BooleanArray,
+        compColours: Array<FloatArray>, compAlphas: FloatArray, componentCount: Int,
+    ) {
+        if (componentCount == 0) return
+        val px = w * h
+
+        // Outside band: pixels within EDGE_BAND of the mask (BFS from the mask, each carrying
+        // the label of the mask pixel it comes from).
+        val bandLabel = IntArray(px) // 0 = not reached, else the label of the nearest mask pixel
+        val bandDist = IntArray(px)  // 0 = not reached, else the BFS distance to the mask
+        var frontier = IntArray(px)
+        var frontierCount = 0
+        for (i in 0 until px) if (mask[i]) frontier[frontierCount++] = i
+        for (step in 1..EDGE_BAND) {
+            val next = ArrayList<Int>()
+            for (k in 0 until frontierCount) {
+                val i = frontier[k]
+                val x = i % w
+                val y = i / w
+                val l = if (mask[i]) labels[i] else bandLabel[i]
+                if (l <= 0) continue
+                if (x > 0 && !mask[i - 1] && bandLabel[i - 1] == 0) { bandLabel[i - 1] = l; bandDist[i - 1] = step; next.add(i - 1) }
+                if (x < w - 1 && !mask[i + 1] && bandLabel[i + 1] == 0) { bandLabel[i + 1] = l; bandDist[i + 1] = step; next.add(i + 1) }
+                if (y > 0 && !mask[i - w] && bandLabel[i - w] == 0) { bandLabel[i - w] = l; bandDist[i - w] = step; next.add(i - w) }
+                if (y < h - 1 && !mask[i + w] && bandLabel[i + w] == 0) { bandLabel[i + w] = l; bandDist[i + w] = step; next.add(i + w) }
+            }
+            if (next.isEmpty()) break
+            frontier = next.toIntArray()
+            frontierCount = next.size
+        }
+
+        // Targets: weak-relief pixels of the mask (the truncated / bleeding estimate of the
+        // main pass) plus the outside band.
+        val targets = BooleanArray(px) { (mask[it] && reliefMax[it] < FRINGE_KEEP) || bandDist[it] in 1..EDGE_BAND }
+        if (!targets.any { it }) return
+
+        // Interpolated background under the mask AND the band (the observed median there still
+        // contains the faint logo).
+        val fillMask = BooleanArray(px) { mask[it] || bandDist[it] in 1..EDGE_BAND }
+        val bg = HarmonicFill.fill(median, 3, fillMask, w, h)
+
+        // Opacity by projection of the observed median on the logo colour direction.
+        val cand = FloatArray(px) { -1f }
+        for (i in 0 until px) if (targets[i]) {
+            val comp = if (mask[i]) labels[i] else bandLabel[i]
+            if (comp <= 0) continue
+            val cap = min(MAX_INVERT_ALPHA, compAlphas[comp] + 0.05f)
+            var num = 0f
+            var den = 0f
+            for (c in 0 until 3) {
+                val d = compColours[comp][c] - bg[i * 3 + c]
+                num += (median[i * 3 + c] - bg[i * 3 + c]) * d
+                den += d * d
+            }
+            val aData = if (den > 0.01f) (num / den).coerceIn(0f, cap) else -1f
+            cand[i] = if (aData >= EDGE_MIN_ALPHA) aData else -1f
+        }
+        // Isolated specks are dropped (the projection itself already rejects noise: it is not
+        // aligned with the logo colour direction, so it does not reach [EDGE_MIN_ALPHA]).
+        val accepted = BooleanArray(px) { targets[it] && cand[it] >= EDGE_MIN_ALPHA }
+        val accLabels = Components.label(accepted, w, h)
+        Components.removeSmall(accepted, accLabels, 3)
+
+        for (i in 0 until px) if (targets[i]) {
+            val comp = if (mask[i]) labels[i] else bandLabel[i]
+            if (comp <= 0) continue
+            if (accepted[i]) {
+                val a = cand[i]
+                if (mask[i]) {
+                    // Re-estimated faint pixel: replace the truncated estimate. A fill pixel
+                    // that turns out to be semi-transparent joins the inversion set instead;
+                    // one that stays near the opacity ceiling keeps being filled (inverting
+                    // there would only amplify noise).
+                    if (fill[i] && a >= MAX_INVERT_ALPHA - 0.05f) continue
+                    fill[i] = false
+                } else {
+                    mask[i] = true
+                    labels[i] = bandLabel[i]
+                }
+                alpha[i] = a
+                for (c in 0 until 3) colour[i * 3 + c] = (a * compColours[comp][c]).coerceIn(0f, min(1f, a + 0.02f))
+            } else if (mask[i] && !fill[i] && reliefMax[i] < FRINGE_KEEP) {
+                // No faint logo here: the weak relief was Poisson bleed between glyph parts.
+                // Zero it out instead of over-inverting clean pixels.
+                alpha[i] = 0f
+                colour[i * 3] = 0f
+                colour[i * 3 + 1] = 0f
+                colour[i * 3 + 2] = 0f
+            }
         }
     }
 

@@ -8,6 +8,8 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sin
 import kotlin.random.Random
 
@@ -35,13 +37,17 @@ class WatermarkAnalyzerTest {
         return floatArrayOf(r.coerceIn(0f, 1f), g.coerceIn(0f, 1f), b.coerceIn(0f, 1f))
     }
 
-    private fun frames(n: Int, alpha: Float = logoAlpha, noise: Float = 0.004f): List<ByteArray> {
+    private fun frames(n: Int, alpha: Float = logoAlpha, noise: Float = 0.004f): List<ByteArray> =
+        framesOf(n, { x, y -> if (logoMask(x, y)) alpha else 0f }, noise)
+
+    /** Frames with a per-pixel logo opacity ([alphaOf] in 0..1, white logo). */
+    private fun framesOf(n: Int, alphaOf: (Int, Int) -> Float, noise: Float = 0.004f): List<ByteArray> {
         val rnd = Random(7)
         return (0 until n).map { t ->
             val out = ByteArray(w * h * 3)
             for (y in 0 until h) for (x in 0 until w) {
                 val bg = background(x, y, t)
-                val a = if (logoMask(x, y)) alpha else 0f
+                val a = alphaOf(x, y)
                 for (c in 0 until 3) {
                     val v = (a * 1f + (1f - a) * bg[c] + (rnd.nextFloat() - 0.5f) * 2f * noise).coerceIn(0f, 1f)
                     out[(y * w + x) * 3 + c] = (v * 255f + 0.5f).toInt().toByte()
@@ -49,6 +55,13 @@ class WatermarkAnalyzerTest {
             }
             out
         }
+    }
+
+    /** Chebyshev distance to the hard logo shape (0 = inside). */
+    private fun logoDistance(x: Int, y: Int): Int {
+        fun cheb(x0: Int, y0: Int, x1: Int, y1: Int) =
+            max(max(max(x0 - x, x - x1), 0), max(max(y0 - y, y - y1), 0))
+        return min(cheb(20, 14, 40, 34), cheb(50, 22, 80, 28))
     }
 
     @Test
@@ -74,15 +87,100 @@ class WatermarkAnalyzerTest {
         assertTrue(layer.stats.invertedPixels > layer.stats.filledPixels)
         val centre = 27 * w + 30
         assertTrue("alpha ${layer.alpha[centre]}", abs(layer.alpha[centre] - logoAlpha) < 0.12f)
-        // Inversion of one frame restores the background at the logo centre.
+        // Inversion of one frame restores the background at the logo centre. The tolerance
+        // accounts for the faint-edge re-estimation, which trades a fraction of a percent of
+        // single-pixel accuracy on hard edges for a much cleaner removal of soft ones.
         val t = 5
         val frame = fr[t]
         val bg = background(30, 27, t)
         for (c in 0 until 3) {
             val j = ((frame[centre * 3 + c].toInt() and 0xFF) / 255f)
             val restored = (j - layer.colour[centre * 3 + c]) / (1f - layer.alpha[centre])
-            assertTrue("channel $c restored $restored vs ${bg[c]}", abs(restored - bg[c]) < 0.05f)
+            assertTrue("channel $c restored $restored vs ${bg[c]}", abs(restored - bg[c]) < 0.065f)
         }
+    }
+
+    @Test
+    fun `soft anti-aliased logo edges are recovered and inverted`() {
+        // White logo with a 3 px anti-aliased ramp (interior 0.55, then 0.28 / 0.12 / 0.04):
+        // the faint tails used to survive the inversion as a pale, blurred halo of the text.
+        val soft = { x: Int, y: Int ->
+            when (logoDistance(x, y)) { 0 -> 0.55f; 1 -> 0.28f; 2 -> 0.12f; 3 -> 0.04f; else -> 0f }
+        }
+        val fr = framesOf(16, soft)
+        val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, fr))!!
+        assertTrue(layer.hasWatermark)
+        assertEquals("ok", layer.stats.reason)
+        // The ramp is detected and inverted, and the inversion removes it (residue = mean
+        // |restored - background| over the ramp pixels; the noise floor is ~0.004).
+        var ramp = 0
+        var flagged = 0
+        var residue = 0.0
+        var count = 0
+        for (y in 0 until h) for (x in 0 until w) {
+            if (logoDistance(x, y) !in 1..3) continue
+            ramp++
+            val p = y * w + x
+            if (layer.alpha[p] > 0f || layer.fill[p]) flagged++
+            for (t in fr.indices) {
+                val bg = background(x, y, t)
+                for (c in 0 until 3) {
+                    val j = (fr[t][p * 3 + c].toInt() and 0xFF) / 255f
+                    val r = if (layer.alpha[p] > 0f) abs((j - layer.colour[p * 3 + c]) / (1f - layer.alpha[p]) - bg[c]) else abs(j - bg[c])
+                    residue += r
+                    count++
+                }
+            }
+        }
+        assertTrue("ramp recall $flagged/$ramp", flagged >= ramp * 0.8f)
+        assertTrue("ramp residue ${residue / count}", residue / count < 0.022)
+        // End-to-end: the restored region is close to the background and settles over time.
+        val all = framesOf(40, soft)
+        val restorer = RegionRestorer(layer)
+        val errors = ArrayList<Float>()
+        for (t in 0 until 40) {
+            val out = rgba(all[t], false).also { restorer.process(it, false, it) }
+            var err = 0f
+            var n = 0
+            for (y in 0 until h) for (x in 0 until w) {
+                if (logoDistance(x, y) > 3) continue
+                val bg = background(x, y, t)
+                for (c in 0 until 3) { err += abs((out[(y * w + x) * 4 + c].toInt() and 0xFF) / 255f - bg[c]); n++ }
+            }
+            errors.add(err / n)
+        }
+        assertTrue("first frame error ${errors[0]}", errors[0] < 0.045f)
+        val late = errors.takeLast(10).average()
+        assertTrue("late error $late vs first ${errors[0]}", late < errors[0] && late < 0.03f)
+    }
+
+    @Test
+    fun `hard logo edges leave no ring`() {
+        // With a hard edge, the pixel just outside the logo carries no watermark: it must not
+        // be over-inverted (the old dilated mask left a faint dark ring around the glyphs).
+        val fr = frames(16)
+        val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, fr))!!
+        assertTrue(layer.hasWatermark)
+        var ring = 0
+        var flagged = 0
+        var residue = 0.0
+        var count = 0
+        for (y in 0 until h) for (x in 0 until w) {
+            if (logoDistance(x, y) != 1) continue
+            ring++
+            val p = y * w + x
+            if (layer.alpha[p] > 0.02f) flagged++
+            for (t in fr.indices) {
+                val bg = background(x, y, t)
+                for (c in 0 until 3) {
+                    val j = (fr[t][p * 3 + c].toInt() and 0xFF) / 255f
+                    residue += abs(j - bg[c])
+                    count++
+                }
+            }
+        }
+        assertTrue("ring flagged $flagged/$ring", flagged < ring * 0.35f)
+        assertTrue("ring residue ${residue / count}", residue / count < 0.008f)
     }
 
     @Test

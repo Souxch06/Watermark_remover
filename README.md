@@ -34,6 +34,11 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   puis en l'intégrant (équation de Poisson), on obtient le relief exact du logo (couleur × opacité)
   et un masque au pixel près. Chaque pixel semi-transparent est alors **inversé**
   (`I = (J − a·W) / (1 − a)`) : ce qui apparaît est l'image d'origine, pas une copie.
+- **Aucun texte fantôme flou** : les bords anti-aliasés du filigrane (ou adoucis par la compression
+  de la vidéo) forment une rampe d'opacité trop faible pour l'analyse par gradients ; cette rampe
+  est ré-estimée directement depuis les données (médiane temporelle projetée sur la couleur du
+  logo, dedans comme dehors du masque), ce qui supprime le halo pâle qui subsistait autour des
+  glyphes — et l'anneau d'un logo aux bords nets n'est plus sur-inversé.
 - **Restauration image par image (`RegionRestorer`)** : pendant l'export, chaque image passe par
   un restaurateur CPU qui (1) mesure si le logo est réellement présent dans l'image (filigranes qui
   changent de place → les images sans logo ne sont pas touchées, plus d'apparitions fugaces),

@@ -431,8 +431,8 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         private const val W_MAX = 2_500f
         /** Candidates at most ~2 hops away from a clean pixel teach the ghost estimate. */
         private const val GHOST_MIN_WEIGHT = 2_000f
-        /** Evidence needed before the learned ghost is subtracted (about 4 trusted frames). */
-        private const val GHOST_MIN_TOTAL = 8_000f
+        /** Evidence needed before the learned ghost is subtracted (about 2 trusted frames). */
+        private const val GHOST_MIN_TOTAL = 4_000f
         /** Forgetting horizon of the ghost estimate (keeps adapting to slow drifts). */
         private const val GHOST_MAX_TOTAL = 200_000f
 
