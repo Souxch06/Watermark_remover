@@ -310,15 +310,32 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
             lumCur[p] = (cur[p * 3] + cur[p * 3 + 1] + cur[p * 3 + 2]) * (1f / 3f)
             lumPrev[p] = (prevIn[p * 3] + prevIn[p * 3 + 1] + prevIn[p * 3 + 2]) * (1f / 3f)
         }
-        // Slow-motion baseline: match against t-3 as well and keep the estimate whose motion is
-        // small enough to be trustworthy at sub-pixel scale (bias divided by the frame distance).
-        if (prevCount >= 2) {
-            if (searchMotion(lumPrev3, factor = 3f)) {
-                shiftLumHistory()
-                return
+        // One-frame estimate first: the +-SEARCH window covers the whole plausible per-frame
+        // range, so this one is the reliable anchor whatever the pan speed.
+        val oneFrameOk = searchMotion(lumPrev, factor = 1f)
+        if (oneFrameOk) {
+            val m1x = motionX
+            val m1y = motionY
+            // Slow-motion refinement: matching against t-3 divides the sub-pixel bias by
+            // three. But the true shift is also three times larger and must stay inside the
+            // search window - on a fast pan the 3-frame match would be out of range and lock
+            // onto a wrong alignment, poisoning everything downstream. Only attempted when
+            // the one-frame estimate proves the motion is slow enough, and its result must
+            // stay consistent with that estimate.
+            if (prevCount >= 2 && abs(m1x) * 3f <= SEARCH && abs(m1y) * 3f <= SEARCH) {
+                if (searchMotion(lumPrev3, factor = 3f)) {
+                    if (abs(motionX - m1x) <= MOTION_REFINE_MAX_DELTA && abs(motionY - m1y) <= MOTION_REFINE_MAX_DELTA) {
+                        shiftLumHistory()
+                        return
+                    }
+                    motionX = m1x
+                    motionY = m1y
+                } else {
+                    motionX = m1x
+                    motionY = m1y
+                }
             }
         }
-        searchMotion(lumPrev, factor = 1f)
         shiftLumHistory()
     }
 
@@ -361,13 +378,8 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         val ex1 = matchError(bestX + 1, bestY)
         val ey0 = matchError(bestX, bestY - 1)
         val ey1 = matchError(bestX, bestY + 1)
-        val mx = (bestX + parabolicOffset(ex0, best, ex1)) / factor
-        val my = (bestY + parabolicOffset(ey0, best, ey1)) / factor
-        // With a far baseline a slow drift (accelerating camera) would be exaggerated: refuse
-        // speeds the one-frame search could not have missed.
-        if (abs(mx) > MAX_PER_FRAME_MOTION || abs(my) > MAX_PER_FRAME_MOTION) return false
-        motionX = mx
-        motionY = my
+        motionX = (bestX + parabolicOffset(ex0, best, ex1)) / factor
+        motionY = (bestY + parabolicOffset(ey0, best, ey1)) / factor
         motionFound = true
         estimateTone()
         return true
@@ -784,8 +796,8 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         private const val SEARCH = 16
         /** Largest deviation accepted for a motion match. */
         private const val MAX_MATCH_ERROR = 0.06f
-        /** Motion per frame beyond which the far (multi-frame) baseline is not trusted. */
-        private const val MAX_PER_FRAME_MOTION = 4f
+        /** Max gap between the one-frame estimate and the 3-frame refinement of it. */
+        private const val MOTION_REFINE_MAX_DELTA = 1.5f
         /** Background travel (px) needed before a new frame enters the history. */
         private const val PUSH_TRAVEL = 2.5f
         /** Maximum frames between two stored frames (keeps recent frames on a still picture). */

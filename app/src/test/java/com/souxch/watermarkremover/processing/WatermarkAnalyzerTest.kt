@@ -410,6 +410,60 @@ class WatermarkAnalyzerTest {
     }
 
     @Test
+    fun `a fast panning video is still followed`() {
+        // Real videos often pan fast (6+ px per frame). The one-frame motion search covers the
+        // whole plausible range, so the temporal restoration must keep working there too - a
+        // regression once silently disabled every temporal pass on fast pans (no motion, so no
+        // propagation and no motion fill: a dark smudge over the watermark).
+        fun bgFast(x: Int, y: Int, t: Int): FloatArray {
+            val xx = x + 6f * t
+            val yy = y + 4f * t
+            val r = 0.35f + 0.25f * sin(xx * 0.31f) + 0.15f * sin(yy * 0.17f)
+            val g = 0.40f + 0.20f * sin(xx * 0.23f + 1f) + 0.10f * sin((xx + yy) * 0.11f)
+            val b = 0.45f + 0.20f * sin(yy * 0.27f + 2f) + 0.10f * sin(xx * 0.13f)
+            return floatArrayOf(r.coerceIn(0f, 1f), g.coerceIn(0f, 1f), b.coerceIn(0f, 1f))
+        }
+        val rnd = Random(13)
+        fun framesFast(n: Int): List<ByteArray> = (0 until n).map { t ->
+            val out = ByteArray(w * h * 3)
+            for (y in 0 until h) for (x in 0 until w) {
+                val bg = bgFast(x, y, t)
+                val a = when (strokeDist(x, y)) { 0 -> 0.45f; 1 -> 0.30f; 2 -> 0.15f; 3 -> 0.05f; else -> 0f }
+                for (c in 0 until 3) {
+                    val v = (a + (1f - a) * bg[c] + (rnd.nextFloat() - 0.5f) * 2f * 0.008f).coerceIn(0f, 1f)
+                    out[(y * w + x) * 3 + c] = (v * 255f + 0.5f).toInt().toByte()
+                }
+            }
+            out
+        }
+        val all = framesFast(60)
+        val sample = all.indices.filter { it % 5 == 1 }.map { all[it] }
+        val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, sample))!!
+        assertTrue(layer.hasWatermark)
+        val restorer = RegionRestorer(layer)
+        val errors = ArrayList<Float>()
+        var black = 0
+        for (t in 0 until 60) {
+            val out = rgba(all[t], false).also { restorer.process(it, false, it) }
+            var err = 0f
+            var n = 0
+            for (y in 0 until h) for (x in 0 until w) {
+                if (strokeDist(x, y) > 3) continue
+                val bg = bgFast(x, y, t)
+                for (c in 0 until 3) {
+                    val o = (out[(y * w + x) * 4 + c].toInt() and 0xFF) / 255f
+                    err += abs(o - bg[c]); n++
+                    if (t >= 10 && o < 0.02f && bg[c] > 0.15f) black++
+                }
+            }
+            errors.add(err / n)
+        }
+        assertTrue("black pixels after warm-up: $black (over-inversion smudge)", black == 0)
+        val late = errors.takeLast(10).average()
+        assertTrue("late error $late (the fast pan must be followed)", late < 0.02f)
+    }
+
+    @Test
     fun `layer packing keeps regions texel aligned and method switches to layer mode`() {
         val zone = WatermarkZone(1, NormalizedRect(0.5f, 0.5f, 0.6f, 0.6f))
         val region = WatermarkLayer.regionOf(zone, 1920, 1080)
