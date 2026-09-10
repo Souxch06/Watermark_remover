@@ -93,6 +93,11 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     private val histMean = Array(historyDepth) { FloatArray(3) } // clean mean, per channel
     private var histStart = 0
     private var histCount = 0
+    private val histFrame = IntArray(historyDepth) // frame number of each stored frame
+    private var frameNo = 0
+    private var lastPushFrame = -1
+    private var lastPushCumX = 0f
+    private var lastPushCumY = 0f
     private var cumX = 0f
     private var cumY = 0f
     private val cleanMean = FloatArray(3) { 0.5f }
@@ -175,6 +180,10 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         motionFound = false
         histStart = 0
         histCount = 0
+        frameNo = 0
+        lastPushFrame = -1
+        lastPushCumX = 0f
+        lastPushCumY = 0f
         cumX = 0f
         cumY = 0f
         fillWarm = false
@@ -320,11 +329,6 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         prevCount++
     }
 
-    /**
-     * Searches the global motion between the current frame and [base] (a previous frame),
-     * [factor] frame distances away, and records it per frame. Returns false when the match is
-     * not trusted (then the caller falls back to a shorter baseline).
-     */
     private fun searchMotion(base: FloatArray, factor: Float): Boolean {
         lumBase = base
         // Stage 1: coarse search (step 2) over the whole range.
@@ -375,6 +379,10 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         return (0.5f * (e0 - e2) / den).coerceIn(-0.5f, 0.5f)
     }
 
+    /**
+     * Standard deviation of the luminance difference between the template and the previous frame
+     * shifted by (dx, dy): insensitive to a global brightness change (exposure, fades).
+     */
     /**
      * Standard deviation of the luminance difference between the template and the previous frame
      * shifted by (dx, dy): insensitive to a global brightness change (exposure, fades).
@@ -579,8 +587,8 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
             var bestR = 0f; var bestG = 0f; var bestB = 0f
             var bestAge = 1
             for (h in 0 until histCount) {
-                val age = h + 1
                 val idx = (histStart + histCount - 1 - h) % historyDepth
+                val age = max(1, frameNo - histFrame[idx])
                 // Where the content now at (x, y) was, `age` frames ago.
                 val sx = x - (cumX - histCumX[idx])
                 val sy = y - (cumY - histCumY[idx])
@@ -627,7 +635,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
             if (bestW <= 0f) continue
             val wB = weight[p]
             // Outlier test: the candidate must agree with the running estimate.
-            val tol = 3f * sqrt(1f / bestW + 1f / max(wB, 1f)) + 0.02f + 0.01f * bestAge
+            val tol = 3f * sqrt(1f / bestW + 1f / max(wB, 1f)) + 0.02f + 0.01f * min(bestAge, 20)
             if (max(abs(bestR - out[p * 3]), max(abs(bestG - out[p * 3 + 1]), abs(bestB - out[p * 3 + 2]))) > tol) continue
             val total = wB + bestW
             out[p * 3] = (out[p * 3] * wB + bestR * bestW) / total
@@ -650,12 +658,18 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         if (fillIdx.isEmpty()) return
         for (p in fillIdx) {
             if (weight[p] > W_FILL * 1.01f) continue
-            // Nearest clean pixel (the four stored distances), most likely to look alike.
+            // Nearest clean pixels (the four stored distances), nearest first. A donor sitting
+            // on a strong edge is skipped: its deviation from the local mean is not "texture"
+            // but the edge itself, and grafting it would push the pixel far outside the
+            // harmonic colour (black / saturated patches on real videos).
             var bestQ = -1
-            var bestD = Int.MAX_VALUE
+            var mr = 0f; var mg = 0f; var mb = 0f
+            val cand = IntArray(4)
+            val candD = IntArray(4)
+            var nc = 0
             for (k in 0 until 4) {
                 val d = layer.distances[p * 4 + k].toInt() and 0xFF
-                if (d == 0 || d == 255 || d >= bestD) continue
+                if (d == 0 || d == 255) continue
                 val q = when (k) {
                     0 -> p - d
                     1 -> p + d
@@ -663,34 +677,66 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
                     else -> p + d * width
                 }
                 if (q < 0 || q >= px) continue
-                bestD = d
+                cand[nc] = q; candD[nc] = d; nc++
+            }
+            // nearest first
+            for (a in 1 until nc) {
+                val q = cand[a]; val d = candD[a]; var b = a - 1
+                while (b >= 0 && candD[b] > d) { cand[b + 1] = cand[b]; candD[b + 1] = candD[b]; b-- }
+                cand[b + 1] = q; candD[b + 1] = d
+            }
+            for (a in 0 until nc) {
+                val q = cand[a]
+                val qx = q % width
+                val qy = q / width
+                var r = 0f; var g = 0f; var b = 0f
+                var mnR = 1f; var mxR = 0f
+                var cnt = 0
+                for (yy in max(0, qy - 1)..min(height - 1, qy + 1)) {
+                    for (xx in max(0, qx - 1)..min(width - 1, qx + 1)) {
+                        val s = yy * width + xx
+                        if (fillMask[s]) continue
+                        r += out[s * 3]; g += out[s * 3 + 1]; b += out[s * 3 + 2]; cnt++
+                        if (out[s * 3] < mnR) mnR = out[s * 3]
+                        if (out[s * 3] > mxR) mxR = out[s * 3]
+                    }
+                }
+                if (cnt < 4) continue
+                if (mxR - mnR > TEX_DONOR_RANGE) continue // edge donor, try the next one
                 bestQ = q
+                mr = r / cnt; mg = g / cnt; mb = b / cnt
+                break
             }
             if (bestQ < 0) continue
-            // Local mean of the real picture around the donor (skip fill pixels).
-            val qx = bestQ % width
-            val qy = bestQ / width
-            var mr = 0f; var mg = 0f; var mb = 0f
-            var cnt = 0
-            for (yy in max(0, qy - 1)..min(height - 1, qy + 1)) {
-                for (xx in max(0, qx - 1)..min(width - 1, qx + 1)) {
-                    val s = yy * width + xx
-                    if (fillMask[s]) continue
-                    mr += out[s * 3]; mg += out[s * 3 + 1]; mb += out[s * 3 + 2]; cnt++
-                }
-            }
-            if (cnt < 4) continue
-            mr /= cnt; mg /= cnt; mb /= cnt
-            // Graft: donor detail + harmonic colour, matched to the donor's local mean.
-            out[p * 3] = (out[bestQ * 3] + fillState[p * 3] - mr).coerceIn(0f, 1f)
-            out[p * 3 + 1] = (out[bestQ * 3 + 1] + fillState[p * 3 + 1] - mg).coerceIn(0f, 1f)
-            out[p * 3 + 2] = (out[bestQ * 3 + 2] + fillState[p * 3 + 2] - mb).coerceIn(0f, 1f)
+            // Graft: capped donor detail + harmonic colour (the tone comes from the fill, the
+            // grain from the real picture).
+            val dr = (out[bestQ * 3] - mr).coerceIn(-TEX_DEV, TEX_DEV)
+            val dg = (out[bestQ * 3 + 1] - mg).coerceIn(-TEX_DEV, TEX_DEV)
+            val db = (out[bestQ * 3 + 2] - mb).coerceIn(-TEX_DEV, TEX_DEV)
+            out[p * 3] = (fillState[p * 3] + dr).coerceIn(0f, 1f)
+            out[p * 3 + 1] = (fillState[p * 3 + 1] + dg).coerceIn(0f, 1f)
+            out[p * 3 + 2] = (fillState[p * 3 + 2] + db).coerceIn(0f, 1f)
             weight[p] = W_TEXTURE
         }
     }
 
-    /** Stores the restored frame (and its confidences) for the motion fill lookups. */
+    /**
+     * Stores the restored frame (and its confidences) for the motion fill lookups. With a slow
+     * background, consecutive frames barely differ in what they reveal: storing every frame
+     * would waste the ring on a few pixels of travel and the centre of a wide opaque area
+     * would never see its real background. So a frame is stored only when the background has
+     * travelled far enough since the last one (or after a maximum gap, so a nearly still
+     * picture keeps recent frames too): the same memory then covers a much longer span.
+     */
     private fun pushHistory() {
+        if (histCount > 0 && frameNo - lastPushFrame < MAX_PUSH_GAP) {
+            val travelX = abs(cumX - lastPushCumX)
+            val travelY = abs(cumY - lastPushCumY)
+            if (travelX < PUSH_TRAVEL && travelY < PUSH_TRAVEL) {
+                frameNo++
+                return
+            }
+        }
         val idx: Int
         if (histCount < historyDepth) {
             idx = (histStart + histCount) % historyDepth
@@ -699,6 +745,11 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
             idx = histStart
             histStart = (histStart + 1) % historyDepth
         }
+        lastPushFrame = frameNo
+        lastPushCumX = cumX
+        lastPushCumY = cumY
+        histFrame[idx] = frameNo
+        frameNo++
         val ob = histOut[idx]
         val wb = histWeight[idx]
         for (i in 0 until px) {
@@ -735,6 +786,10 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         private const val MAX_MATCH_ERROR = 0.06f
         /** Motion per frame beyond which the far (multi-frame) baseline is not trusted. */
         private const val MAX_PER_FRAME_MOTION = 4f
+        /** Background travel (px) needed before a new frame enters the history. */
+        private const val PUSH_TRAVEL = 2.5f
+        /** Maximum frames between two stored frames (keeps recent frames on a still picture). */
+        private const val MAX_PUSH_GAP = 24
         /** Noise of the source pixels (8-bit + compression), before amplification by the inversion. */
         private const val SIGMA_NOISE = 0.02f
         /** Error added by one frame of propagation (motion / interpolation). */
@@ -760,6 +815,10 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         private const val MOTION_FILL_DONE = 3_000f
         /** Confidence of a texture-grafted pixel: real detail, but not the real background. */
         private const val W_TEXTURE = 250f
+        /** Max local range (red channel) of a texture donor (stronger = it sits on an edge). */
+        private const val TEX_DONOR_RANGE = 0.30f
+        /** Cap on the grafted detail: keeps the graft inside the harmonic colour. */
+        private const val TEX_DEV = 0.12f
         /** Gauss-Seidel iterations of the harmonic fill, on the first (cold) frame. */
         private const val FILL_ITERS = 26
         /**

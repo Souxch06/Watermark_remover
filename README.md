@@ -58,7 +58,12 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   (l'erreur sous-pixel est divisée d'autant), et l'analyse ne se laisse plus abuser par un décor
   qui bouge à peine — ses gradients restent « cohérents » et faisaient croire que tout le cadre
   était du filigrane, d'où une énorme tache floue. Seules les structures réellement fortes sont
-  retenues, et l'intérieur des glyphes est reconstruit.
+  retenues, et l'intérieur des glyphes est reconstruit. L'historique du « motion fill » mémorise
+  en outre une image seulement quand le décor a réellement avancé : à couverture mémoire égale,
+  il couvre un déplacement bien plus long, donc le vrai fond finit par traverser même une zone
+  opaque large sur un panoramique lent. La greffe de texture n'emprunte enfin son détail qu'à
+  des donneurs situés hors des bords marqués, avec un écart plafonné : plus de taches sombres
+  ou saturées là où le comblement touchait un contour fort.
 - **Restauration image par image (`RegionRestorer`)** : pendant l'export, chaque image passe par
   un restaurateur CPU qui (1) mesure si le logo est réellement présent dans l'image (filigranes qui
   changent de place → les images sans logo ne sont pas touchées, plus d'apparitions fugaces),
