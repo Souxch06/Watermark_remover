@@ -5,6 +5,8 @@ import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
+import kotlin.math.sqrt
+import kotlin.random.Random
 
 /**
  * Recovers the watermark layer that a video app composited on top of the picture, so that the
@@ -94,6 +96,32 @@ object WatermarkAnalyzer {
     private const val FRINGE_KEEP = 0.2f
     /** Fringe pixels must reach this opacity to be inverted (else they stay untouched). */
     private const val EDGE_MIN_ALPHA = 0.02f
+
+    // --- component re-calibration by temporal regression (step 3c) ---
+    /** Frames needed before the temporal regression is trusted. */
+    private const val REGRESS_MIN_FRAMES = 8
+    /** Largest distance (px) to the nearest clean pixel for which the regression applies. */
+    private const val REGRESS_MAX_DIST = 12
+    /** Clean-pair correlation below this is not usable (backgrounds that do not co-vary). */
+    private const val REGRESS_MIN_GAMMA = 0.55f
+    /** References beyond this distance (px) must be much better correlated to be used per pixel. */
+    private const val REGRESS_NEAR_DIST = 4
+    /** Correlation required from a reference that is not near. */
+    private const val REGRESS_MIN_GAMMA_NEAR = 0.85f
+    /** Background variance below this carries no regression signal. */
+    private const val REGRESS_MIN_VAR = 4e-4f
+    /** Correlation samples per offset when estimating gamma. */
+    private const val REGRESS_GAMMA_SAMPLES = 24
+    /** Regressed pixels needed before a component may be re-scaled. */
+    private const val REGRESS_MIN_PIXELS = 12
+    /** Evidence (in pixels) at which the re-scaling reaches half of its full amplitude. */
+    private const val REGRESS_SHRINK_EVIDENCE = 24f
+    /** Bound of the component re-scaling factor. */
+    private const val REGRESS_MAX_SCALE = 0.25f
+    /** Weight of the per-pixel regression on the faint fringe. */
+    private const val REGRESS_FRINGE_GAIN = 0.6f
+    /** How far the per-pixel correction may move an opacity, in one go. */
+    private const val REGRESS_MAX_DRIFT = 0.15f
 
     @Suppress("NOTHING_TO_INLINE")
     private inline fun v(b: ByteArray, j: Int): Float = (b[j].toInt() and 0xFF) * INV255
@@ -271,6 +299,15 @@ object WatermarkAnalyzer {
             w, h, median, mask, labels, reliefMax,
             alpha, colour, fill, compColours, compAlphas, componentCount,
         )
+
+        // --- 3c. component re-calibration by temporal regression -------------------------------
+        // Both the variance cue of step 3 and the projection of step 3b lean on an interpolated
+        // background, which is biased wherever the logo is dense (thin glyphs close together) —
+        // exactly where a faint text residue is most visible. The opacity also follows from how
+        // much a pixel is DAMPED against a neighbouring clean pixel: J_p = a*W + (1-a)*I_p and
+        // I_p ~ gamma * I_r locally, so the slope of J_p against J_r is (1-a)*gamma. Gamma is
+        // measured on clean pairs at the same distance, and the slope needs no background at all.
+        refineAlphaByRegression(frames, w, h, n, labels, componentCount, mask, alpha, colour, fill)
 
         // --- 4. ghost removal on the inverted frames ----------------------------------------------
         // The thresholded gradients of step 1 miss the faint tails of the logo edges, so c is
@@ -608,6 +645,171 @@ object WatermarkAnalyzer {
                 colour[i * 3 + 1] = 0f
                 colour[i * 3 + 2] = 0f
             }
+        }
+    }
+
+    /**
+     * Step 3c: re-estimates the opacity from how much each pixel is DAMPED against neighbouring
+     * clean pixels. Both the variance cue of step 3 and the projection of step 3b lean on an
+     * interpolated background, biased wherever the logo is dense (thin glyphs close together) —
+     * exactly where a faint text residue is most visible. The damping needs no background at
+     * all: `J_p = a*W + (1-a)*I_p` and `I_p ~ gamma * I_r` locally, so the slope of J_p against
+     * J_r over time is `(1-a)*gamma`, and gamma is measured on clean pairs sharing the same
+     * offset vector (a moving texture does not correlate isotropically). With ~20 analysed
+     * frames a single pixel estimate is noisy, so it is averaged over up to five references and
+     * used in two bounded ways: one scaling factor per component (measured on its core) and a
+     * clamped per-pixel correction on the faint fringe, whose step 3b estimate is the most
+     * biased and whose residue is the visible one.
+     */
+    private fun refineAlphaByRegression(
+        frames: List<ByteArray>, w: Int, h: Int, n: Int,
+        labels: IntArray, componentCount: Int,
+        mask: BooleanArray, alpha: FloatArray, colour: FloatArray, fill: BooleanArray,
+    ) {
+        if (componentCount == 0 || n < REGRESS_MIN_FRAMES) return
+        val px = w * h
+        val clean = ArrayList<Int>()
+        for (i in 0 until px) if (!mask[i]) clean.add(i)
+        if (clean.size < 4 * REGRESS_MAX_DIST) return
+
+        // Correlation of clean pixel pairs per offset vector, computed on demand.
+        val gammaCache = HashMap<Long, FloatArray>()
+        fun gammaAt(dx: Int, dy: Int): FloatArray? {
+            val key = dx.toLong() * 65536L + dy
+            gammaCache[key]?.let { return it }
+            val rnd = Random(dx * 31 + dy * 7 + 5)
+            val samples = Array(3) { ArrayList<Float>() }
+            var tries = 0
+            var used = 0
+            while (used < REGRESS_GAMMA_SAMPLES * 2 && tries < REGRESS_GAMMA_SAMPLES * 20) {
+                tries++
+                val q = clean[rnd.nextInt(clean.size)]
+                val x2 = q % w + dx
+                val y2 = q / w + dy
+                if (x2 < 0 || y2 < 0 || x2 >= w || y2 >= h) continue
+                val q2 = y2 * w + x2
+                if (mask[q2]) continue
+                used++
+                for (c in 0 until 3) {
+                    var mx = 0.0; var my = 0.0; var sxx = 0.0; var syy = 0.0; var sxy = 0.0
+                    for (t in 0 until n) {
+                        val a = v(frames[t], q * 3 + c).toDouble()
+                        val b = v(frames[t], q2 * 3 + c).toDouble()
+                        mx += a; my += b; sxx += a * a; syy += b * b; sxy += a * b
+                    }
+                    mx /= n; my /= n
+                    val varA = sxx / n - mx * mx
+                    val varB = syy / n - my * my
+                    if (varA < REGRESS_MIN_VAR || varB < REGRESS_MIN_VAR) continue
+                    samples[c].add(((sxy / n - mx * my) / sqrt(varA * varB)).toFloat())
+                }
+            }
+            val out = FloatArray(3)
+            for (c in 0 until 3) {
+                val s = samples[c]
+                out[c] = if (s.size >= 4) medianOf(s.toFloatArray(), s.size).coerceIn(0f, 1f) else 0f
+            }
+            gammaCache[key] = out
+            return out
+        }
+
+        // Nearest clean pixels: BFS nearest plus the first clean one left / right / up / down.
+        val nearest = RegionRestorer.nearestCleanIndices(mask, w, h)
+        val nLeft = IntArray(px) { -1 }
+        val nRight = IntArray(px) { -1 }
+        val nUp = IntArray(px) { -1 }
+        val nDown = IntArray(px) { -1 }
+        for (y in 0 until h) {
+            var last = -1
+            for (x in 0 until w) { val i = y * w + x; if (!mask[i]) last = i else nLeft[i] = last }
+            last = -1
+            for (x in w - 1 downTo 0) { val i = y * w + x; if (!mask[i]) last = i else nRight[i] = last }
+        }
+        for (x in 0 until w) {
+            var last = -1
+            for (y in 0 until h) { val i = y * w + x; if (!mask[i]) last = i else nUp[i] = last }
+            last = -1
+            for (y in h - 1 downTo 0) { val i = y * w + x; if (!mask[i]) last = i else nDown[i] = last }
+        }
+
+        // Pass 1: per-pixel regression estimate, averaged over up to five clean references.
+        val aRegPx = FloatArray(px) { -1f }
+        for (p in 0 until px) {
+            if (!mask[p] || fill[p] || alpha[p] <= 0f) continue
+            var num = 0f
+            var den = 0f
+            for (r in intArrayOf(nLeft[p], nRight[p], nUp[p], nDown[p], nearest[p])) {
+                if (r < 0 || r == p) continue
+                val dx = (p % w) - (r % w)
+                val dy = (p / w) - (r / w)
+                if (dx * dx + dy * dy > REGRESS_MAX_DIST * REGRESS_MAX_DIST) continue
+                val gamma = gammaAt(dx, dy) ?: continue
+                for (c in 0 until 3) {
+                    val g = gamma[c]
+                    if (g < REGRESS_MIN_GAMMA) continue
+                    var sx = 0.0; var sy = 0.0; var sxx = 0.0; var sxy = 0.0
+                    for (t in 0 until n) {
+                        val x = v(frames[t], r * 3 + c).toDouble()
+                        val y = v(frames[t], p * 3 + c).toDouble()
+                        sx += x; sy += y; sxx += x * x; sxy += x * y
+                    }
+                    val varX = sxx / n - (sx / n) * (sx / n)
+                    if (varX < REGRESS_MIN_VAR) continue
+                    val slope = ((sxy / n - (sx / n) * (sy / n)) / varX).toFloat()
+                    val aC = (1f - slope / g).coerceIn(0f, 1f)
+                    val weight = (g * g * varX).toFloat()
+                    num += aC * weight
+                    den += weight
+                }
+            }
+            if (den > 0f) aRegPx[p] = num / den
+        }
+
+        // Pass 2: one scaling factor per component, measured on its CORE (its strongest pixels
+        // — the faint fringe may hold false positives whose regression would drag the factor
+        // towards zero). Bounded and shrunk by the evidence.
+        val compFringe = FloatArray(componentCount + 1) { Float.MAX_VALUE }
+        for (comp in 1..componentCount) {
+            val alphas = ArrayList<Float>()
+            for (p in 0 until px) if (labels[p] == comp && !fill[p] && alpha[p] > 0f) alphas.add(alpha[p])
+            if (alphas.size < REGRESS_MIN_PIXELS) continue
+            val sorted = alphas.toFloatArray().also { it.sort() }
+            val p90 = sorted[(sorted.size * 0.9f).toInt().coerceIn(0, sorted.size - 1)]
+            val fringe = max(0.5f * p90, 0.12f)
+            compFringe[comp] = fringe
+            val ratios = ArrayList<Float>()
+            for (p in 0 until px) {
+                if (labels[p] != comp || fill[p] || alpha[p] <= 0f || aRegPx[p] < 0f) continue
+                if (alpha[p] < fringe) continue
+                ratios.add(aRegPx[p] / alpha[p])
+            }
+            if (ratios.size < REGRESS_MIN_PIXELS / 2) continue
+            val ratio = medianOf(ratios.toFloatArray(), ratios.size)
+            val shrink = ratios.size.toFloat() / (ratios.size + REGRESS_SHRINK_EVIDENCE)
+            val k = 1f + shrink * (ratio - 1f).coerceIn(-REGRESS_MAX_SCALE, REGRESS_MAX_SCALE)
+            if (abs(k - 1f) < 0.02f) continue
+            for (p in 0 until px) {
+                if (labels[p] != comp || fill[p] || alpha[p] <= 0f) continue
+                val a2 = (alpha[p] * k).coerceIn(0.02f, MAX_INVERT_ALPHA)
+                val ratioP = a2 / alpha[p]
+                for (c in 0 until 3) colour[p * 3 + c] = (colour[p * 3 + c] * ratioP).coerceIn(0f, a2 + 0.02f)
+                alpha[p] = a2
+            }
+        }
+
+        // Pass 3: clamped per-pixel correction on the faint fringe, whose step 3b estimate is
+        // the most polluted (the interpolated background crosses other glyphs around it).
+        for (p in 0 until px) {
+            if (!mask[p] || fill[p] || alpha[p] <= 0f || aRegPx[p] < 0f) continue
+            val comp = labels[p]
+            if (comp <= 0 || alpha[p] >= compFringe[comp]) continue
+            val aOld = alpha[p]
+            val aNew = (aOld + REGRESS_FRINGE_GAIN * (aRegPx[p] - aOld).coerceIn(-REGRESS_MAX_DRIFT, REGRESS_MAX_DRIFT))
+                .coerceIn(0.02f, MAX_INVERT_ALPHA)
+            if (abs(aNew - aOld) < 0.005f) continue
+            val ratio = aNew / aOld
+            for (c in 0 until 3) colour[p * 3 + c] = (colour[p * 3 + c] * ratio).coerceIn(0f, aNew + 0.02f)
+            alpha[p] = aNew
         }
     }
 

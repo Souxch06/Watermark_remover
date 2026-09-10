@@ -396,7 +396,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
             if (wT >= GHOST_MIN_WEIGHT && layer.alpha[p] > 0f && !layer.fill[p]) {
                 // Trusted picture from clean pixels: learn what the inversion gets wrong here.
                 val newTotal = ghostWeight[p] + wT
-                for (c in 0 until 3) ghostAcc[p * 3 + c] += (base[p * 3 + c] - t[c]).coerceIn(-0.15f, 0.15f) * wT
+                for (c in 0 until 3) ghostAcc[p * 3 + c] += (base[p * 3 + c] - t[c]).coerceIn(-0.3f, 0.3f) * wT
                 if (newTotal > GHOST_MAX_TOTAL) {
                     val k = GHOST_MAX_TOTAL / newTotal
                     for (c in 0 until 3) ghostAcc[p * 3 + c] *= k
@@ -428,11 +428,11 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         private const val SIGMA_HOP = 0.012f
         private const val W_CLEAN = 10_000f
         private const val W_FILL = 1f / (0.12f * 0.12f)
-        private const val W_MAX = 2_500f
+        private const val W_MAX = 8_000f
         /** Candidates at most ~2 hops away from a clean pixel teach the ghost estimate. */
         private const val GHOST_MIN_WEIGHT = 2_000f
-        /** Evidence needed before the learned ghost is subtracted (about 2 trusted frames). */
-        private const val GHOST_MIN_TOTAL = 4_000f
+        /** Evidence needed before the learned ghost is subtracted (about 1 trusted frame). */
+        private const val GHOST_MIN_TOTAL = 2_500f
         /** Forgetting horizon of the ghost estimate (keeps adapting to slow drifts). */
         private const val GHOST_MAX_TOTAL = 200_000f
 

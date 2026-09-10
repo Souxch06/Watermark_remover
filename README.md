@@ -38,7 +38,11 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   de la vidéo) forment une rampe d'opacité trop faible pour l'analyse par gradients ; cette rampe
   est ré-estimée directement depuis les données (médiane temporelle projetée sur la couleur du
   logo, dedans comme dehors du masque), ce qui supprime le halo pâle qui subsistait autour des
-  glyphes — et l'anneau d'un logo aux bords nets n'est plus sur-inversé.
+  glyphes — et l'anneau d'un logo aux bords nets n'est plus sur-inversé. L'opacité de chaque
+  composant est en outre re-calibrée par régression temporelle sur les pixels propres voisins
+  (l'amortissement du fond mesure l'opacité, sans passer par un fond interpolé), et l'export
+  apprend le résidu systématique restant image par image : le décor net arrive derrière la zone
+  avec le mouvement et le corrige, de plus en plus propre au fil de la vidéo.
 - **Restauration image par image (`RegionRestorer`)** : pendant l'export, chaque image passe par
   un restaurateur CPU qui (1) mesure si le logo est réellement présent dans l'image (filigranes qui
   changent de place → les images sans logo ne sont pas touchées, plus d'apparitions fugaces),

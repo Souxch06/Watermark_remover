@@ -273,6 +273,59 @@ class WatermarkAnalyzerTest {
     }
 
     @Test
+    fun `thin soft text is cleaned up as the video plays`() {
+        // Text with 3 px strokes and a 4 px anti-aliased ramp (real text watermarks): around
+        // thin glyphs no clean pixel is near enough for a perfect per-pixel analysis of the
+        // ramp, so the export must learn the remaining systematic error while the video plays
+        // (temporal propagation + on-line ghost) — the late frames are markedly cleaner.
+        fun strokeDist(x: Int, y: Int): Int {
+            fun cheb(x0: Int, y0: Int, x1: Int, y1: Int) =
+                max(max(max(x0 - x, x - x1), 0), max(max(y0 - y, y - y1), 0))
+            val strokes = arrayOf(
+                intArrayOf(20, 14, 22, 30), intArrayOf(28, 14, 30, 30), intArrayOf(20, 21, 30, 23),
+                intArrayOf(38, 14, 40, 30), intArrayOf(48, 14, 50, 30), intArrayOf(48, 27, 58, 29),
+            )
+            var best = 100
+            for (r in strokes) best = min(best, cheb(r[0], r[1], r[2], r[3]))
+            return best
+        }
+        val text = { x: Int, y: Int ->
+            when (strokeDist(x, y)) { 0 -> 0.55f; 1 -> 0.30f; 2 -> 0.14f; 3 -> 0.05f; 4 -> 0.018f; else -> 0f }
+        }
+        val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, framesOf(16, text, noise = 0.008f)))!!
+        assertTrue(layer.hasWatermark)
+        assertEquals("ok", layer.stats.reason)
+        var ramp = 0
+        var flagged = 0
+        for (y in 0 until h) for (x in 0 until w) {
+            if (strokeDist(x, y) !in 1..3) continue
+            ramp++
+            val p = y * w + x
+            if (layer.alpha[p] > 0f || layer.fill[p]) flagged++
+        }
+        assertTrue("ramp recall $flagged/$ramp", flagged >= ramp * 0.85f)
+        // End-to-end: the error over the text area must drop well below its first-frame value.
+        val all = framesOf(40, text, noise = 0.008f)
+        val restorer = RegionRestorer(layer)
+        val errors = ArrayList<Float>()
+        for (t in 0 until 40) {
+            val out = rgba(all[t], false).also { restorer.process(it, false, it) }
+            var err = 0f
+            var n = 0
+            for (y in 0 until h) for (x in 0 until w) {
+                if (strokeDist(x, y) > 4) continue
+                val bg = background(x, y, t)
+                for (c in 0 until 3) { err += abs((out[(y * w + x) * 4 + c].toInt() and 0xFF) / 255f - bg[c]); n++ }
+            }
+            errors.add(err / n)
+        }
+        assertTrue("first frame error ${errors[0]}", errors[0] < 0.045f)
+        val late = errors.takeLast(10).average()
+        assertTrue("late error $late", late < 0.015f)
+        assertTrue("late $late vs first ${errors[0]}", late < 0.65f * errors[0])
+    }
+
+    @Test
     fun `layer packing keeps regions texel aligned and method switches to layer mode`() {
         val zone = WatermarkZone(1, NormalizedRect(0.5f, 0.5f, 0.6f, 0.6f))
         val region = WatermarkLayer.regionOf(zone, 1920, 1080)
