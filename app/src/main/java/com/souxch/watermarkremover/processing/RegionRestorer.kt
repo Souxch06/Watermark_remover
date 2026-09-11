@@ -176,6 +176,15 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     private var fillColdDone = false
     private val fillState = FloatArray(px * 3)
 
+    // ---- content-aware (exemplar) fill: patch-based synthesis for pixels the video never
+    // reveals (still background, opaque logo). A PatchMatch nearest-neighbour field maps every
+    // fill pixel to the clean patch it resembles best; the estimate is voted from the field and
+    // stays constant for the whole scene (no flicker), the temporal passes overriding it
+    // wherever the real background is seen. ----
+    private var patchValid = false
+    private val patchEstimate = FloatArray(px * 3)
+    private val patchMean = FloatArray(3) { 0.5f }
+
     // On-line estimate of the systematic error of the inversion (per pixel): whatever is left of
     // the logo after inversion shows up as a constant difference with the picture carried from
     // clean pixels. Learned during the export, it also absorbs colour-conversion differences
@@ -200,6 +209,8 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     /** Offset of the watermark in the last processed frame, relative to its analysed position. */
     val watermarkOffsetX: Int get() = wmOffX
     val watermarkOffsetY: Int get() = wmOffY
+    /** Diagnostics (bench): whether pixel [p] of the region belongs to the removal mask. */
+    fun maskAt(p: Int): Boolean = mask[p]
 
     init {
         val nearest = nearestCleanIndices(mask, width, height)
@@ -241,6 +252,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         lastPushFrame = -1
         lastPushCumX = 0f
         lastPushCumY = 0f
+        patchValid = false // the synthesis belongs to the previous clip's background
     }
 
     /** Forgets the previous frames (seek, new export); the learned ghost is kept. */
@@ -262,6 +274,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         cumY = 0f
         fillWarm = false
         fillColdDone = false
+        patchValid = false
     }
 
     /**
@@ -331,6 +344,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
             harmonicFill()
             if (motionFound) propagate()
             motionFill()
+            patchFill()
             textureFill()
         }
 
@@ -845,6 +859,163 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     }
 
     /**
+     * Content-aware fill of what the video never reveals. The still-background case (tripod,
+     * opaque logo) leaves the harmonic interpolation as the only estimate: correct in colour
+     * but visibly blurry - "the patch". Here the real texture of the region is synthesised
+     * from the region itself, Photoshop-style: every still-unknown fill pixel looks up the
+     * clean patch (PATCH x PATCH) it resembles best (PatchMatch: propagation + random search),
+     * and its value is voted from all the patches that cover it. The estimate is computed once
+     * per scene and then only exposure-corrected, so it is perfectly stable in time; wherever
+     * the motion ever reveals the true picture, the temporal passes have already taken over.
+     */
+    private fun patchFill() {
+        // Only for still-background layers: on a moving picture the temporal passes reveal
+        // the real background and v2.6 behaviour is already the best per-pixel result; the
+        // synthesis is for the holes nothing will ever reveal (static logo, static camera).
+        if (layer.stats.reason != "static-fill") return
+        if (fillIdx.isEmpty()) return
+        // If the picture does move after all, the temporal machine knows better than any
+        // synthesis: get out of its way.
+        if (abs(cumX) > PATCH_MAX_TRAVEL || abs(cumY) > PATCH_MAX_TRAVEL) return
+        if (!patchValid) computePatchEstimate()
+        if (!patchValid) return
+        // Exposure correction towards the current frame (fades, light drift).
+        val gr = (cleanMean[0] / max(patchMean[0], 0.02f)).coerceIn(0.6f, 1.6f)
+        val gg = (cleanMean[1] / max(patchMean[1], 0.02f)).coerceIn(0.6f, 1.6f)
+        val gb = (cleanMean[2] / max(patchMean[2], 0.02f)).coerceIn(0.6f, 1.6f)
+        for (p in fillIdx) {
+            out[p * 3] = (patchEstimate[p * 3] * gr).coerceIn(0f, 1f)
+            out[p * 3 + 1] = (patchEstimate[p * 3 + 1] * gg).coerceIn(0f, 1f)
+            out[p * 3 + 2] = (patchEstimate[p * 3 + 2] * gb).coerceIn(0f, 1f)
+            weight[p] = W_PATCH
+        }
+    }
+
+    /**
+     * Builds [patchEstimate] by onion-style patch synthesis (the principle of Photoshop's
+     * content-aware fill): fill pixels are processed edge-first, and each one adopts the
+     * value of the donor pixel whose patch best matches the ALREADY-KNOWN part of its own
+     * patch - the real pixels around the mask plus everything synthesised so far. Structure
+     * (edges, bands, grain) therefore continues into the hole instead of averaging away,
+     * which is exactly what a whole-area matcher initialised from the smooth harmonic
+     * estimate cannot do (a flat target matches everything equally and stays flat).
+     */
+    private fun computePatchEstimate() {
+        // Donor centres: a full PATCH x PATCH neighbourhood free of the mask.
+        val donor = BooleanArray(px)
+        val donors = IntArray(px)
+        var nDonors = 0
+        for (y in PATCH_R until height - PATCH_R) {
+            for (x in PATCH_R until width - PATCH_R) {
+                val p = y * width + x
+                if (mask[p]) continue
+                var ok = true
+                var q = p - PATCH_R * width - PATCH_R
+                outer@ for (dy in 0 until 2 * PATCH_R + 1) {
+                    var r = q
+                    for (dx in 0 until 2 * PATCH_R + 1) {
+                        if (mask[r]) { ok = false; break@outer }
+                        r++
+                    }
+                    q += width
+                }
+                if (ok) { donor[p] = true; donors[nDonors++] = p }
+            }
+        }
+        if (nDonors == 0 || fillIdx.isEmpty()) return
+
+        // Edge-first order: the analysis stored, for every fill pixel, its distance to the
+        // nearest non-fill pixel in each of the four directions.
+        val order = fillIdx.sortedBy { p ->
+            val d = layer.distances
+            val l = d[p * 4].toInt() and 0xFF
+            val r = d[p * 4 + 1].toInt() and 0xFF
+            val u = d[p * 4 + 2].toInt() and 0xFF
+            val b = d[p * 4 + 3].toInt() and 0xFF
+            min(min(l, r), min(u, b))
+        }
+        // The picture being synthesised: real pixels around, harmonic estimate inside (kept
+        // wherever synthesis cannot reach, e.g. fill pixels flush with the region border).
+        val syn = out.copyOf()
+        val known = BooleanArray(px) { !mask[it] }
+        val adopted = IntArray(px) { -1 } // donor of each synthesised pixel (propagation)
+        val gridStep = max(1, nDonors / PATCH_GRID)
+        val rng = java.util.Random(0x5EED)
+        for (p in order) {
+            val x = p % width
+            val y = p / width
+            if (x < PATCH_R || x >= width - PATCH_R || y < PATCH_R || y >= height - PATCH_R) continue
+            var bestS = -1
+            var bestD = Float.MAX_VALUE
+            fun consider(cand: Int) {
+                if (cand < 0 || cand >= px || cand == bestS || !donor[cand]) return
+                val d = onionDistance(p, cand, known, syn)
+                if (d < bestD) { bestD = d; bestS = cand }
+            }
+            // Propagation: the neighbours already synthesised point at their donors; the
+            // same donor shifted by the neighbour's delta is the natural candidate here.
+            if (x > 0 && adopted[p - 1] >= 0) consider(adopted[p - 1] + 1)
+            if (x < width - 1 && adopted[p + 1] >= 0) consider(adopted[p + 1] - 1)
+            if (y > 0 && adopted[p - width] >= 0) consider(adopted[p - width] + width)
+            if (y < height - 1 && adopted[p + width] >= 0) consider(adopted[p + width] - width)
+            // Coarse grid over the whole donor set: every pixel gets a fresh global chance.
+            var g = 0
+            while (g < nDonors) { consider(donors[g]); g += gridStep }
+            // Random exploration.
+            repeat(PATCH_RANDOM) { consider(donors[rng.nextInt(nDonors)]) }
+            if (bestS >= 0) {
+                // Sanity guard: a donor matched on a thin known fringe can sit far from the
+                // harmonic colour (e.g. a dark patch adopted over a bright pixel). Keep the
+                // harmonic there - wrong texture is recoverable, a black splodge is not.
+                val dr = abs(out[bestS * 3] - fillState[p * 3])
+                val dg = abs(out[bestS * 3 + 1] - fillState[p * 3 + 1])
+                val db = abs(out[bestS * 3 + 2] - fillState[p * 3 + 2])
+                if (max(dr, max(dg, db)) <= PATCH_MAX_SHIFT) {
+                    syn[p * 3] = out[bestS * 3]
+                    syn[p * 3 + 1] = out[bestS * 3 + 1]
+                    syn[p * 3 + 2] = out[bestS * 3 + 2]
+                    adopted[p] = bestS
+                    known[p] = true
+                }
+            }
+        }
+        for (p in fillIdx) {
+            patchEstimate[p * 3] = syn[p * 3]
+            patchEstimate[p * 3 + 1] = syn[p * 3 + 1]
+            patchEstimate[p * 3 + 2] = syn[p * 3 + 2]
+        }
+        patchMean[0] = cleanMean[0]
+        patchMean[1] = cleanMean[1]
+        patchMean[2] = cleanMean[2]
+        patchValid = true
+    }
+
+    /**
+     * Mean SAD between the patch centred at [target] and the donor patch centred at [cand],
+     * restricted to the target pixels that are already known (real or synthesised). A
+     * candidate whose patch brings too little context is rejected outright.
+     */
+    private fun onionDistance(target: Int, cand: Int, known: BooleanArray, syn: FloatArray): Float {
+        var sum = 0f
+        var n = 0
+        for (dy in -PATCH_R..PATCH_R) {
+            var q = target + dy * width - PATCH_R
+            var s = cand + dy * width - PATCH_R
+            for (dx in 0 until 2 * PATCH_R + 1) {
+                if (known[q]) {
+                    sum += abs(syn[q * 3] - out[s * 3]) +
+                        abs(syn[q * 3 + 1] - out[s * 3 + 1]) +
+                        abs(syn[q * 3 + 2] - out[s * 3 + 2])
+                    n++
+                }
+                q++
+                s++
+            }
+        }
+        return if (n >= PATCH_MIN_KNOWN) sum / n else Float.MAX_VALUE
+    }
+
+    /**
      * The "content-aware" finish of the pro tools: a pixel that nothing has ever revealed (still
      * at the bare fill confidence) would otherwise stay a smooth, visibly blurry patch. Instead,
      * the REAL texture of the nearest clean pixel is grafted on it: the detail comes from the
@@ -1038,6 +1209,21 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         private const val MOTION_FILL_DONE = 3_000f
         /** Confidence of a texture-grafted pixel: real detail, but not the real background. */
         private const val W_TEXTURE = 250f
+        /** Confidence of a patch-synthesised pixel: plausible texture, not the real background. */
+        private const val W_PATCH = 100f
+        /** Half size of the synthesis patch (7x7 with 3). */
+        private const val PATCH_R = 3
+        /** Donor candidates sampled on a coarse grid over the whole donor set. */
+        private const val PATCH_GRID = 96
+        /** Extra random donor candidates per synthesised pixel. */
+        private const val PATCH_RANDOM = 20
+        /** Known patch pixels a donor must match against (rejects context-free candidates). */
+        private const val PATCH_MIN_KNOWN = 18
+        /** How far an adopted value may sit from the harmonic colour (sanity guard). */
+        private const val PATCH_MAX_SHIFT = 0.35f
+        /** Accumulated motion beyond this means the background does move: synthesis steps aside. */
+        private const val PATCH_MAX_TRAVEL = 8f
+
         /** Max local range (red channel) of a texture donor (stronger = it sits on an edge). */
         private const val TEX_DONOR_RANGE = 0.30f
         /** Cap on the grafted detail: keeps the graft inside the harmonic colour. */

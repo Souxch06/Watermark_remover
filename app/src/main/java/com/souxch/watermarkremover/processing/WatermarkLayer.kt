@@ -74,17 +74,35 @@ class WatermarkLayer(
         floatArrayOf(frameWidth.toFloat(), if (yUp) -frameHeight.toFloat() else frameHeight.toFloat())
 
     companion object {
-        /** Extra pixels analysed around each zone (the logo may slightly overflow the frame). */
-        const val MARGIN = 8
+        /**
+         * Extra pixels analysed around each zone. Beyond letting a slightly overflowing logo in,
+         * the margin is the donor area the content-aware fill synthesises from: on a still
+         * background the picture under the logo is rebuilt from these pixels, so it must be
+         * wide enough to carry real texture. It shrinks when the zone is so large that the
+         * region would exceed the analysis limit (huge zones keep the previous behaviour
+         * instead of losing the layer altogether).
+         */
+        const val MARGIN = 28
+
+        /** The margin never goes below this (the logo may slightly overflow the user's zone). */
+        const val MIN_MARGIN = 8
 
         /** Pixel rectangle (left, top, width, height) analysed for [zone] in a frame of the given size. */
         fun regionOf(zone: WatermarkZone, frameWidth: Int, frameHeight: Int): IntArray {
             val r: NormalizedRect = zone.rect.sanitized()
-            val left = ((r.left * frameWidth).roundToInt() - MARGIN).coerceAtLeast(0)
-            val top = ((r.top * frameHeight).roundToInt() - MARGIN).coerceAtLeast(0)
-            val right = ((r.right * frameWidth).roundToInt() + MARGIN).coerceAtMost(frameWidth)
-            val bottom = ((r.bottom * frameHeight).roundToInt() + MARGIN).coerceAtMost(frameHeight)
-            return intArrayOf(left, top, max(right - left, 1), max(bottom - top, 1))
+            var margin = MARGIN
+            while (true) {
+                val left = ((r.left * frameWidth).roundToInt() - margin).coerceAtLeast(0)
+                val top = ((r.top * frameHeight).roundToInt() - margin).coerceAtLeast(0)
+                val right = ((r.right * frameWidth).roundToInt() + margin).coerceAtMost(frameWidth)
+                val bottom = ((r.bottom * frameHeight).roundToInt() + margin).coerceAtMost(frameHeight)
+                val w = max(right - left, 1)
+                val h = max(bottom - top, 1)
+                if (w * h <= WatermarkAnalyzer.MAX_REGION_PIXELS || margin <= MIN_MARGIN) {
+                    return intArrayOf(left, top, w, h)
+                }
+                margin = max(MIN_MARGIN, margin / 2)
+            }
         }
 
         /** Packs the analysed layers. [layers] entries may be null (no result). */

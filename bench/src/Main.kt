@@ -34,6 +34,7 @@ class Synth(
     val my: Float, // motion of clip 0 (px / frame)
     val jitter: Float, // extra random motion of the later clips
     val noiseAmp: Float = 0.012f,
+    val shimmer: Float = 0f, // in-place band drift (static camera: light moves, camera does not)
 ) {
     private val g = 4
     private val grids = Array(6) { FloatArray(g * g) }
@@ -198,18 +199,8 @@ private const val SAMPLE_STEP = 3
 private val WHITE = floatArrayOf(1f, 1f, 1f)
 private val GRAY = floatArrayOf(0.80f, 0.80f, 0.83f)
 
-fun runCase(name: String, gen: CaseGen, probe: Boolean = false) {
-    val samples = (0 until N_FRAMES step SAMPLE_STEP).map { gen.watermarked(it) }
-    val t0 = System.currentTimeMillis()
-    val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(W, H, samples))
-    val dt = System.currentTimeMillis() - t0
-    if (layer == null || !layer.hasWatermark) {
-        val reason = layer?.stats?.reason ?: "null"
-        println("%-24s NO LAYER (%s) -> spatial fallback  [${dt} ms]".format(name, reason))
-        return
-    }
-    val st = layer.stats
-    val restorer = RegionRestorer(layer)
+fun runCase(name: String, gen: CaseGen, probe: Boolean = false, margin: Int? = null) {
+    // Union of the watermark placements over the whole video = what a user-drawn zone covers.
     var minX = W
     var maxX = 0
     var minY = H
@@ -222,32 +213,68 @@ fun runCase(name: String, gen: CaseGen, probe: Boolean = false) {
         maxX = max(maxX, ox + gen.wm.w)
         maxY = max(maxY, oy + gen.wm.h)
     }
+    // Analysed/restored region: the union bbox grown by [margin] (like WatermarkLayer.regionOf
+    // in the app), or the full frame when null (historical behaviour of the 12 base cases).
+    val rx = if (margin == null) 0 else max(0, minX - margin)
+    val ry = if (margin == null) 0 else max(0, minY - margin)
+    val rw = if (margin == null) W else min(W, maxX + margin) - rx
+    val rh = if (margin == null) H else min(H, maxY + margin) - ry
+    val bx0 = minX - rx
+    val by0 = minY - ry
+    val bx1 = maxX - rx
+    val by1 = maxY - ry
+    fun crop(bytes: ByteArray): ByteArray {
+        if (margin == null) return bytes
+        val out = ByteArray(rw * rh * 3)
+        for (y in 0 until rh) {
+            System.arraycopy(bytes, ((ry + y) * W + rx) * 3, out, y * rw * 3, rw * 3)
+        }
+        return out
+    }
+    val samples = (0 until N_FRAMES step SAMPLE_STEP).map { crop(gen.watermarked(it)) }
+    val t0 = System.currentTimeMillis()
+    val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(rw, rh, samples))
+    val dt = System.currentTimeMillis() - t0
+    if (layer == null || !layer.hasWatermark) {
+        val reason = layer?.stats?.reason ?: "null"
+        println("%-26s NO LAYER (%s) -> spatial fallback  [${dt} ms]".format(name, reason))
+        return
+    }
+    val st = layer.stats
+    val restorer = RegionRestorer(layer)
     var errSum = 0.0
     var errN = 0
     var lateSum = 0.0
     var lateN = 0
     var blacks = 0
+    var lumOut = 0.0
+    var lumClean = 0.0
+    var gradOut = 0.0
+    var gradClean = 0.0
+    var restoreMs = 0.0
     val trace = StringBuilder()
     var lastClip = -1
-    val rgba = ByteArray(W * H * 4)
+    val rgba = ByteArray(rw * rh * 4)
     for (t in 0 until N_FRAMES) {
-        val wmFrame = gen.watermarked(t)
-        for (i in 0 until W * H) {
+        val wmFrame = crop(gen.watermarked(t))
+        for (i in 0 until rw * rh) {
             rgba[i * 4] = wmFrame[i * 3]
             rgba[i * 4 + 1] = wmFrame[i * 3 + 1]
             rgba[i * 4 + 2] = wmFrame[i * 3 + 2]
             rgba[i * 4 + 3] = -1
         }
+        val t1 = System.currentTimeMillis()
         restorer.process(rgba, false, rgba)
-        val clean = gen.clean(t)
+        restoreMs += System.currentTimeMillis() - t1
+        val clean = crop(gen.clean(t))
         val late = t >= N_FRAMES * 3 / 5
-        for (y in minY..maxY) for (x in minX..maxX) {
-            val i = (y * W + x) * 3
+        for (y in by0..by1) for (x in bx0..bx1) {
+            val i = (y * rw + x) * 3
             var d = 0f
             var oc = 0f
             var cc = 0f
             for (c in 0 until 3) {
-                val o = (rgba[(y * W + x) * 4 + c].toInt() and 0xFF) * (1f / 255f)
+                val o = (rgba[(y * rw + x) * 4 + c].toInt() and 0xFF) * (1f / 255f)
                 val k = (clean[i + c].toInt() and 0xFF) * (1f / 255f)
                 d = max(d, abs(o - k))
                 oc += o
@@ -258,6 +285,20 @@ fun runCase(name: String, gen: CaseGen, probe: Boolean = false) {
             if (late) {
                 lateSum += d
                 lateN++
+                lumOut += oc / 3f
+                lumClean += cc / 3f
+                if (x + 1 <= bx1) {
+                    val oo = (rgba[(y * rw + x + 1) * 4].toInt() and 0xFF) + (rgba[(y * rw + x + 1) * 4 + 1].toInt() and 0xFF) + (rgba[(y * rw + x + 1) * 4 + 2].toInt() and 0xFF)
+                    val kk = (clean[i + 3].toInt() and 0xFF) + (clean[i + 3 + 1].toInt() and 0xFF) + (clean[i + 3 + 2].toInt() and 0xFF)
+                    gradOut += abs((rgba[(y * rw + x) * 4].toInt() and 0xFF) + (rgba[(y * rw + x) * 4 + 1].toInt() and 0xFF) + (rgba[(y * rw + x) * 4 + 2].toInt() and 0xFF) - oo)
+                    gradClean += abs((clean[i].toInt() and 0xFF) + (clean[i + 1].toInt() and 0xFF) + (clean[i + 2].toInt() and 0xFF) - kk)
+                }
+                if (y + 1 <= by1) {
+                    val oo = (rgba[((y + 1) * rw + x) * 4].toInt() and 0xFF) + (rgba[((y + 1) * rw + x) * 4 + 1].toInt() and 0xFF) + (rgba[((y + 1) * rw + x) * 4 + 2].toInt() and 0xFF)
+                    val kk = (clean[i + rw * 3].toInt() and 0xFF) + (clean[i + rw * 3 + 1].toInt() and 0xFF) + (clean[i + rw * 3 + 2].toInt() and 0xFF)
+                    gradOut += abs((rgba[(y * rw + x) * 4].toInt() and 0xFF) + (rgba[(y * rw + x) * 4 + 1].toInt() and 0xFF) + (rgba[(y * rw + x) * 4 + 2].toInt() and 0xFF) - oo)
+                    gradClean += abs((clean[i].toInt() and 0xFF) + (clean[i + 1].toInt() and 0xFF) + (clean[i + 2].toInt() and 0xFF) - kk)
+                }
             }
             if (oc / 3f < 0.12f && cc / 3f > 0.35f) blacks++
         }
@@ -268,19 +309,58 @@ fun runCase(name: String, gen: CaseGen, probe: Boolean = false) {
             lastClip = clip
         }
     }
+    if (probe) {
+        // Dump the last processed frame (and its references) for visual inspection.
+        val t = N_FRAMES - 1
+        val wmFrame = crop(gen.watermarked(t))
+        val cleanF = crop(gen.clean(t))
+        val rgba = ByteArray(rw * rh * 4)
+        for (i in 0 until rw * rh) {
+            rgba[i * 4] = wmFrame[i * 3]
+            rgba[i * 4 + 1] = wmFrame[i * 3 + 1]
+            rgba[i * 4 + 2] = wmFrame[i * 3 + 2]
+            rgba[i * 4 + 3] = -1
+        }
+        restorer.process(rgba, false, rgba) // warm state: one more pass = the same picture
+        fun writeBmp(fileName: String, get: (Int) -> IntArray) {
+            val rowSize = (rw * 3 + 3) and 3.inv()
+            val dataSize = rowSize * rh
+            val f = java.io.File("/tmp/bench_out", fileName)
+            f.parentFile.mkdirs()
+            val o = java.io.DataOutputStream(java.io.FileOutputStream(f))
+            fun i32(v: Int) { o.write(v and 0xFF); o.write((v shr 8) and 0xFF); o.write((v shr 16) and 0xFF); o.write((v shr 24) and 0xFF) }
+            fun i16(v: Int) { o.write(v and 0xFF); o.write((v shr 8) and 0xFF) }
+            o.write(0x42); o.write(0x4D); i32(54 + dataSize); i32(0); i32(54)
+            i32(40); i32(rw); i32(rh); i16(1); i16(24); i32(0); i32(dataSize); i32(2835); i32(2835); i32(0); i32(0)
+            for (y in rh - 1 downTo 0) {
+                for (x in 0 until rw) {
+                    val c = get(y * rw + x)
+                    o.write(c[2]); o.write(c[1]); o.write(c[0])
+                }
+                for (p in rw * 3 until rowSize) o.write(0)
+            }
+            o.close()
+        }
+        writeBmp("$name-clean.bmp") { i -> intArrayOf(cleanF[i * 3].toInt() and 0xFF, cleanF[i * 3 + 1].toInt() and 0xFF, cleanF[i * 3 + 2].toInt() and 0xFF) }
+        writeBmp("$name-restored.bmp") { i -> intArrayOf(rgba[i * 4].toInt() and 0xFF, rgba[i * 4 + 1].toInt() and 0xFF, rgba[i * 4 + 2].toInt() and 0xFF) }
+        writeBmp("$name-mask.bmp") { i -> if (restorer.maskAt(i)) intArrayOf(255, 60, 60) else intArrayOf(45, 45, 45) }
+        println("probe: /tmp/bench_out/$name-*.bmp")
+    }
+    val lumBias = (lumOut - lumClean) / max(lateN, 1)
+    val texRatio = if (gradClean > 1e-6) gradOut / gradClean else 1.0
     val extra = if (layer.template != null) " tmpl=on" else ""
     println(
-        "%-24s mask=%-5d inv=%-5d fill=%-5d %-8s err=%.4f late=%.4f blacks=%-4d [%d ms]%s"
-            .format(name, st.maskPixels, st.invertedPixels, st.filledPixels, st.reason, errSum / errN, lateSum / lateN, blacks, dt, extra)
+        "%-26s mask=%-5d inv=%-5d fill=%-5d %-8s err=%.4f late=%.4f blacks=%-4d lumΔ=%+.3f tex=%.2f [%d ms|%.1f ms/f]%s"
+            .format(name, st.maskPixels, st.invertedPixels, st.filledPixels, st.reason, errSum / errN, lateSum / lateN, blacks, lumBias, texRatio, dt, restoreMs / N_FRAMES, extra)
     )
-    println("%-24s wmOff: %s".format("", trace))
+    println("%-26s wmOff: %s".format("", trace))
 }
 
 fun main(args: Array<String>) {
     val filter = args.getOrNull(0) ?: ""
     val probe = args.contains("probe")
-    fun case(name: String, build: () -> CaseGen) {
-        if (name.contains(filter)) runCase(name, build(), probe)
+    fun case(name: String, margin: Int? = null, build: () -> CaseGen) {
+        if (name.contains(filter)) runCase(name, build(), probe, margin)
     }
     val single = Int.MAX_VALUE
     val staticOff: (Int) -> Int = { 0 }
@@ -324,5 +404,27 @@ fun main(args: Array<String>) {
     }
     case("short_clips_shift_opaque") {
         CaseGen(Synth(W, H, 22, 8, 3.0f, 2.0f, 3f), Wm.logoOpaque(WHITE, 1.0f), 20, 42, patternOff, patternOffY, 112)
+    }
+
+    // ---- static camera (tripod / fixed framing: nothing ever reveals the background under the
+    // logo; only spatial reconstruction can fill it). shimmer = in-place light drift so the
+    // scene stays alive. margin mirrors WatermarkLayer.regionOf of the app. ----
+    case("staticcam_opaque_m8", margin = 8) {
+        CaseGen(Synth(W, H, 30, single, 0f, 0f, 0f, shimmer = 0.06f), Wm.logoOpaque(WHITE, 1.0f), 20, 42, staticOff, staticOff, 120)
+    }
+    case("staticcam_opaque", margin = 28) {
+        CaseGen(Synth(W, H, 31, single, 0f, 0f, 0f, shimmer = 0.06f), Wm.logoOpaque(WHITE, 1.0f), 20, 42, staticOff, staticOff, 121)
+    }
+    case("staticcam_opaque85", margin = 28) {
+        CaseGen(Synth(W, H, 32, single, 0f, 0f, 0f, shimmer = 0.06f), Wm.logoOpaque(WHITE, 0.85f), 20, 42, staticOff, staticOff, 122)
+    }
+    case("staticcam_semi", margin = 28) {
+        CaseGen(Synth(W, H, 33, single, 0f, 0f, 0f, shimmer = 0.06f), Wm.wordmark(2, WHITE, 0.5f), 28, 42, staticOff, staticOff, 123)
+    }
+    case("staticcam_semi78", margin = 28) {
+        CaseGen(Synth(W, H, 34, single, 0f, 0f, 0f, shimmer = 0.06f), Wm.wordmark(2, WHITE, 0.78f), 28, 42, staticOff, staticOff, 124)
+    }
+    case("staticcam_gray", margin = 28) {
+        CaseGen(Synth(W, H, 35, single, 0f, 0f, 0f, shimmer = 0.06f), Wm.wordmark(2, GRAY, 0.40f), 28, 42, staticOff, staticOff, 125)
     }
 }

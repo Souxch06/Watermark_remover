@@ -49,6 +49,19 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   recopie : le mouvement du fond est mesuré, la source la plus fiable de l'historique des images
   est recalée dessus (interpolation bilinéaire, correction d'exposition, rejet des échantillons
   contradictoires), ce qui rétablit la vraie texture là où seule la couleur était connue.
+- **Vidéos à caméra statique (podcast, plateau fixe, capture d'écran)** : quand le décor ne
+  bouge pas du tout, aucun fond ne peut jamais être « révélé » par le mouvement — l'analyse
+  temporelle ne voyait aucun indice et rendait toute la zone au flou spatial (la fameuse tache).
+  Le logo est alors cherché **spatialement**, sur la médiane temporelle : un seuil de contraste
+  local ancré sur la médiane + k·MAD du décor isole ses bords, les composantes voisines se
+  rallient au masque (une marque pleine ne déclenche le contraste que sur son périmètre), et
+  tout ce que le masque couvre est reconstruit par **synthèse par patchs « en pelure d'oignon »**
+  (le principe du content-aware fill de Photoshop) : chaque pixel manquant adopte la valeur du
+  donneur dont le patch correspond le mieux à la partie déjà connue de son voisinage — bords
+  réels puis pixels déjà synthétisés. Les structures du décor (bandes, contours, grain)
+  se prolongent dans le trou au lieu d'une moyenne lissée, avec garde-fous : valeur adoptée
+  plafonnée à l'écart de la couleur harmonique (jamais de tache noire), et priorité au vrai
+  décor si la caméra se met à bouger.
 - **Remplissage harmonique + greffe de texture** : les zones jamais révélées par le mouvement
   (cœur opaque, toutes premières images) sont comblées par une résolution de l'équation de
   Laplace sur les bords restaurés — puis la vraie texture du pixel propre le plus proche est

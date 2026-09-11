@@ -273,11 +273,31 @@ class WatermarkAnalyzerTest {
     }
 
     @Test
-    fun `static video gives no layer`() {
+    fun `a still video gets a static fill layer`() {
+        // A still background (tripod, one set for the whole video) never reveals the picture
+        // behind the logo and defeats every temporal cue: the analysis used to give up (no
+        // layer, spatial fallback = the blurry patch). The logo must now be found SPATIALLY,
+        // on the temporal median, as an all-fill layer, and the restorer must rebuild the
+        // area from the surroundings - colour-true, no dark blob.
         val fr = List(12) { frames(1)[0] }
         val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, fr))!!
-        assertTrue(!layer.hasWatermark)
-        assertEquals("static", layer.stats.reason)
+        assertTrue(layer.hasWatermark)
+        assertEquals("static-fill", layer.stats.reason)
+        assertTrue("a static logo must carry a tracking template", layer.template != null)
+        val restorer = RegionRestorer(layer)
+        val out = rgba(fr[0], false).also { restorer.process(it, false, it) }
+        var outLum = 0f
+        var cleanLum = 0f
+        var n = 0
+        for (y in 0 until h) for (x in 0 until w) {
+            if (!layer.fill[y * w + x]) continue
+            outLum += (out[(y * w + x) * 4].toInt() and 0xFF) / 255f
+            cleanLum += background(x, y, 0)[0]
+            n++
+        }
+        assertTrue("static fill must cover the logo", n >= 300)
+        val bias = abs(outLum / n - cleanLum / n)
+        assertTrue("static fill colour bias $bias (no dark or bright blob)", bias < 0.10f)
     }
 
     @Test
@@ -630,25 +650,40 @@ class WatermarkAnalyzerTest {
         val region = WatermarkLayer.regionOf(zone, 1920, 1080)
         assertEquals(960 - WatermarkLayer.MARGIN, region[0])
         assertEquals(540 - WatermarkLayer.MARGIN, region[1])
-        val analysed = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, frames(8)))!!
-        // Region size must match the analysed size for the layer to be used.
-        val m = WatermarkLayer.MARGIN
-        val small = WatermarkZone(2, NormalizedRect(m / 200f, m / 100f, (w - m) / 200f, (h - m) / 100f))
-        val r2 = WatermarkLayer.regionOf(small, 200, 100)
-        assertEquals(0, r2[0])
-        assertEquals(0, r2[1])
-        assertEquals(w, r2[2])
-        assertEquals(h, r2[3])
-        val packed = WatermarkLayer.pack(200, 100, listOf(small), listOf(analysed))
+        // Region size must match the analysed size for the layer to be used: a zone at
+        // pixels [60,140]x[60,90] of a 200x100 frame maps to the region (32,32,136,86).
+        val zone2 = WatermarkZone(2, NormalizedRect(0.30f, 0.50f, 0.70f, 0.75f))
+        val r2 = WatermarkLayer.regionOf(zone2, 200, 120)
+        assertEquals(32, r2[0])
+        assertEquals(32, r2[1])
+        assertEquals(136, r2[2])
+        assertEquals(86, r2[3])
+        // A small moving-background video of exactly that region size.
+        val rnd = Random(7)
+        val mini = (0 until 10).map { t ->
+            val f = ByteArray(136 * 86 * 3)
+            for (y in 0 until 86) for (x in 0 until 136) {
+                val bg = background(x, y, t)
+                val a = if (x in 50..70 && y in 35..55) 0.6f else 0f
+                for (c in 0 until 3) {
+                    val v = (a + (1f - a) * bg[c] + (rnd.nextFloat() - 0.5f) * 2f * 0.004f).coerceIn(0f, 1f)
+                    f[(y * 136 + x) * 3 + c] = (v * 255f + 0.5f).toInt().toByte()
+                }
+            }
+            f
+        }
+        val analysed = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(136, 86, mini))!!
+        assertTrue(analysed.hasWatermark)
+        val packed = WatermarkLayer.pack(200, 120, listOf(zone2), listOf(analysed))
         assertEquals(1, packed.regions.size)
-        assertEquals(w, packed.atlasWidth)
-        assertEquals(h, packed.atlasHeight)
+        assertEquals(136, packed.atlasWidth)
+        assertEquals(86, packed.atlasHeight)
         assertTrue(packed.hasWatermark)
         assertEquals(WatermarkShader.METHOD_LAYER, WatermarkShader.methodId(RemovalSettings(), packed))
-        val rects = packed.rectUniforms(listOf(small), yUp = false)
-        assertEquals(0f, rects[0], 1e-6f)
-        assertEquals(w.toFloat(), rects[2], 1e-6f)
-        assertEquals(0f, packed.offsetUniforms(listOf(small))[0], 1e-6f)
+        val rects = packed.rectUniforms(listOf(zone2), yUp = false)
+        assertEquals(32f / 200f, rects[0], 1e-6f)
+        assertEquals(136f, rects[2], 1e-6f)
+        assertEquals(0f, packed.offsetUniforms(listOf(zone2))[0], 1e-6f)
         assertEquals(1, packed.newRestorers().size)
     }
 }

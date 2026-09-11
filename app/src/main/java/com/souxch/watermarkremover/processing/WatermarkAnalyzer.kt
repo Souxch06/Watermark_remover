@@ -72,6 +72,26 @@ object WatermarkAnalyzer {
     /** Largest region analysed (pixels); bigger zones fall back to the spatial reconstruction. */
     const val MAX_REGION_PIXELS = 300_000
 
+    // ---- static-scene (spatial) detection ----
+    /** Minimum local contrast (luminance range over 3x3) for the spatial logo detection. */
+    private const val STATIC_MIN_CONTRAST = 0.10f
+    /** The spatial contrast threshold sits this many (mean) MADs above the background median. */
+    private const val STATIC_CONTRAST_MAD = 4f
+    /** Components below this size (px) are noise. */
+    private const val STATIC_MIN_COMPONENT = 8
+    /** A component must carry this fraction of the best component's contrast mass to be kept. */
+    private const val STATIC_MASS_KEEP = 0.05f
+    /** Recruitment mass floor (a solid mark has little perimeter to score with). */
+    private const val STATIC_RECRUIT_MASS = 0.03f
+    /** At most this many components become part of the mask. */
+    private const val STATIC_MAX_COMPONENTS = 3
+    /** Boxes are grown by this many pixels (antialiasing, soft shadows). */
+    private const val STATIC_GROW = 6
+    /** Logo parts sit at most this far (px) from the strongest component. */
+    private const val STATIC_CLUSTER = 32
+    /** A detection covering more than this fraction of the inner zone falls back to all of it. */
+    private const val STATIC_MAX_COVER = 0.70f
+
     /** Frames of the analysed region: each `width*height*3` RGB bytes (row-major). */
     class Frames(val width: Int, val height: Int, val frames: List<ByteArray>)
 
@@ -285,7 +305,20 @@ object WatermarkAnalyzer {
             }
             return candidate
         }
-        if (best == null) return direct
+        if (best == null) {
+            // A still background (tripod, same set for the whole video - a podcast, a studio
+            // panel) never reveals the picture behind the logo and kills every temporal cue
+            // the detection relies on ("consistent over time" becomes true of the whole
+            // picture). Last resort only: candidates and chunks must have found nothing
+            // (a re-rendered compilation over a still set can still be saved by them). The
+            // logo is then found SPATIALLY, on the temporal median, and everything the mask
+            // covers is filled: the restorer reconstructs it from the surroundings
+            // (content-aware fill).
+            if (direct != null && !direct.hasWatermark && direct.stats.reason == "static") {
+                return staticLayer(input.frames, w, h, direct.stats.motion) ?: direct
+            }
+            return direct
+        }
         return alignAndReanalyse(input.frames, w, h, best) ?: best
     }
 
@@ -503,6 +536,164 @@ object WatermarkAnalyzer {
             }
         }
         return out
+    }
+
+    /**
+     * Layer for a still background. The temporal machinery is blind there (nothing ever moves,
+     * so "consistent over time" is true of the whole picture, and the semi-transparent pixels
+     * never vary enough to be regressed): the logo is found as the zone's high-contrast
+     * OUTLIER on the temporal median, and the mask is the union of the bounding boxes of the
+     * strongest contrast components - antialiased strokes and faint shadow parts of the logo
+     * live inside those boxes. Everything the mask covers is filled: under a still logo the
+     * true picture is never revealed, so the restorer rebuilds it from the surroundings.
+     * A detection that fails its guards falls back to the whole inner zone (what the user
+     * circled): a reconstructed zone always beats a shader blur of it.
+     */
+    private fun staticLayer(frames: List<ByteArray>, w: Int, h: Int, motion: Float): Layer? {
+        val px = w * h
+        // Temporal median = the clean still picture plus the logo, free of sensor noise.
+        val median = FloatArray(px * 3)
+        val tmp = FloatArray(frames.size)
+        for (i in 0 until px) {
+            for (c in 0 until 3) {
+                for (t in frames.indices) tmp[t] = v(frames[t], i * 3 + c)
+                median[i * 3 + c] = medianOf(tmp, frames.size)
+            }
+        }
+        val lum = FloatArray(px) { i -> (median[i * 3] + median[i * 3 + 1] + median[i * 3 + 2]) * (1f / 3f) }
+        val contrast = localRange(lum, w, h, 1)
+
+        // Inner area = the region minus the border ring (the logo never lives in the ring).
+        val x0 = RING
+        val x1 = w - RING
+        val y0 = RING
+        val y1 = h - RING
+        if (x1 - x0 < 4 || y1 - y0 < 4) return null
+        val innerCount = (x1 - x0) * (y1 - y0)
+
+        // Adaptive threshold, anchored on the BACKGROUND (the vast majority of the zone):
+        // median + k*MAD of the local contrast. A percentile of the zone would drift into
+        // the logo's own contrast whenever the user's zone is snug around it.
+        val values = ArrayList<Float>(innerCount)
+        for (y in y0 until y1) for (x in x0 until x1) values.add(contrast[y * w + x])
+        values.sort()
+        val bgMedian = percentileOfSorted(values, 0.5f)
+        var madSum = 0f
+        for (v in values) madSum += abs(v - bgMedian)
+        val mad = madSum / max(values.size, 1)
+        val thr = max(STATIC_MIN_CONTRAST, bgMedian + STATIC_CONTRAST_MAD * mad)
+        if (DEBUG) println("staticLayer: bgMedian=" + "%.3f".format(bgMedian) + " mad=" + "%.3f".format(mad) + " thr=" + "%.3f".format(thr))
+
+        // Contrast components, scored by their total excess contrast ("mass"): background
+        // texture fires everywhere but weakly, a logo concentrates strong edges.
+        val detected = BooleanArray(px) { i ->
+            val x = i % w
+            val y = i / w
+            x >= x0 && x < x1 && y >= y0 && y < y1 && contrast[i] > thr
+        }
+        val labels = Components.label(detected, w, h)
+        val nComp = labels.max()
+        if (nComp > 0) {
+            val mass = FloatArray(nComp + 1)
+            val size = IntArray(nComp + 1)
+            val minX = IntArray(nComp + 1) { w }
+            val maxX = IntArray(nComp + 1)
+            val minY = IntArray(nComp + 1) { h }
+            val maxY = IntArray(nComp + 1)
+            for (y in y0 until y1) for (x in x0 until x1) {
+                val comp = labels[y * w + x]
+                if (comp == 0) continue
+                mass[comp] += contrast[y * w + x] - thr
+                size[comp]++
+                if (x < minX[comp]) minX[comp] = x
+                if (x > maxX[comp]) maxX[comp] = x
+                if (y < minY[comp]) minY[comp] = y
+                if (y > maxY[comp]) maxY[comp] = y
+            }
+            val order = (1..nComp).filter { size[it] >= STATIC_MIN_COMPONENT && mass[it] > 0f }
+                .sortedByDescending { mass[it] }
+            if (DEBUG) println(
+                "staticLayer: thr=" + "%.3f".format(thr) + " nComp=" + nComp + " " +
+                    (1..nComp).joinToString(",") {
+                        "[$it] x${minX[it]}-${maxX[it]} y${minY[it]}-${maxY[it]} n${size[it]} m" + "%.1f".format(mass[it])
+                    }
+            )
+            if (order.isNotEmpty()) {
+                val bestMass = mass[order.first()]
+                val bestComp = order.first()
+                // The logo's parts are adjacent by construction (one mark, one wordmark); a
+                // strong blob far from the strongest one is background, not logo.
+                val kept = order.take(STATIC_MAX_COMPONENTS).filter { comp ->
+                    mass[comp] >= STATIC_MASS_KEEP * bestMass &&
+                        abs(minX[comp] - minX[bestComp]) + abs(maxX[comp] - maxX[bestComp]) +
+                        abs(minY[comp] - minY[bestComp]) + abs(maxY[comp] - maxY[bestComp]) <= STATIC_CLUSTER * 4
+                }
+                if (kept.isNotEmpty()) {
+                    // One single bounding box over everything kept: faint strokes, soft
+                    // shadows and the gaps between glyphs live inside it. Growing and a
+                    // small dilation then cover the antialiased fringe of the logo.
+                    var bx0 = w; var bx1 = 0; var by0 = h; var by1 = 0
+                    for (comp in kept) {
+                        bx0 = min(bx0, minX[comp]); bx1 = max(bx1, maxX[comp])
+                        by0 = min(by0, minY[comp]); by1 = max(by1, maxY[comp])
+                    }
+                    // Recruitment: a solid mark only fires on its thin perimeter and loses
+                    // the mass ranking to an all-edges wordmark, yet it is part of the logo.
+                    // Any small-but-real component sitting next to the detected box joins it.
+                    for (comp in 1..nComp) {
+                        if (size[comp] < STATIC_MIN_COMPONENT) continue
+                        if (mass[comp] < STATIC_RECRUIT_MASS * bestMass) continue
+                        val gapX = max(bx0 - maxX[comp], minX[comp] - bx1)
+                        val gapY = max(by0 - maxY[comp], minY[comp] - by1)
+                        if (max(gapX, gapY) > STATIC_CLUSTER) continue
+                        bx0 = min(bx0, minX[comp]); bx1 = max(bx1, maxX[comp])
+                        by0 = min(by0, minY[comp]); by1 = max(by1, maxY[comp])
+                    }
+                    bx0 = (bx0 - STATIC_GROW).coerceAtLeast(x0)
+                    bx1 = (bx1 + STATIC_GROW).coerceAtMost(x1 - 1)
+                    by0 = (by0 - STATIC_GROW).coerceAtLeast(y0)
+                    by1 = (by1 + STATIC_GROW).coerceAtMost(y1 - 1)
+                    val mask = BooleanArray(px)
+                    var covered = 0
+                    for (y in by0..by1) for (x in bx0..bx1) {
+                        mask[y * w + x] = true; covered++
+                    }
+                    repeat(2) { dilate(mask, w, h) }
+                    // Guard: a detection that swallows the zone (busy background, logo over
+                    // detailed content) is not a localisation - erase the circled zone instead.
+                    if (covered in 1..(STATIC_MAX_COVER * innerCount).toInt()) {
+                        return buildStaticLayer(mask, frames, w, h, motion, px)
+                    }
+                }
+            }
+        }
+        // Fallback: the whole inner zone.
+        val mask = BooleanArray(px) { i ->
+            val x = i % w
+            val y = i / w
+            x >= x0 && x < x1 && y >= y0 && y < y1
+        }
+        return buildStaticLayer(mask, frames, w, h, motion, px)
+    }
+
+    private fun buildStaticLayer(mask: BooleanArray, frames: List<ByteArray>, w: Int, h: Int, motion: Float, px: Int): Layer? {
+        if (mask.none { it }) return null
+        if (DEBUG) {
+            var x0 = w; var x1 = 0; var y0 = h; var y1 = 0
+            for (i in 0 until px) if (mask[i]) {
+                val x = i % w; val y = i / w
+                if (x < x0) x0 = x; if (x > x1) x1 = x
+                if (y < y0) y0 = y; if (y > y1) y1 = y
+            }
+            println("buildStaticLayer: mask bbox x$x0-$x1 y$y0-$y1 count=${mask.count { it }}")
+        }
+        // The logo is static (the picture is), so its median appearance is a valid tracking
+        // template should it still be re-rendered a few pixels away between clips.
+        val template = OpaqueTemplate.build(frames, w, h, mask, mask, TEMPLATE_MAX_MAD, TEMPLATE_MIN_PIXELS)
+        var count = 0
+        for (i in 0 until px) if (mask[i]) count++
+        val stats = Stats(frames.size, frames.size, motion, count, 0, count, 1, "static-fill")
+        return Layer(w, h, FloatArray(px * 3), FloatArray(px), mask, fillDistances(mask, w, h), stats, template)
     }
 
     /** One full analysis pass over the given frames (present-frame selection included). */
