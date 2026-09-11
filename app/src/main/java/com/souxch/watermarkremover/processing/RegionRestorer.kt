@@ -90,6 +90,35 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         for (k in tapDa.indices) if (abs(tapDa[k]) >= WM_OFF_TAP_ALPHA) strong++
         strong >= WM_OFF_MIN_TAPS
     }
+    /**
+     * Opaque (fill-dominated) layers are localised differently: by matching the analysis-time
+     * appearance template against the frame (see [OpaqueTemplate]). The template must be
+     * distinctive: enough support pixels, and a support that spans the logo's shape. The
+     * eroded core of a logo that drifts continuously is a small blob (say the solid mark of
+     * the logo, its thin text strokes eroded away) that other parts of the logo - or bright
+     * patches of background - match just as well: tracking with it locks onto them and jumps
+     * around. Such a layer keeps a mask that already covers the drift range instead.
+     */
+    private val wmTemplate: OpaqueTemplate.Template? by lazy {
+        val t = layer.template ?: return@lazy null
+        if (t.idx.size < WM_TM_MIN_TRACK_PIXELS) return@lazy null
+        var sMinX = width; var sMaxX = 0; var sMinY = height; var sMaxY = 0
+        for (k in t.idx) {
+            val x = k % width; val y = k / width
+            if (x < sMinX) sMinX = x; if (x > sMaxX) sMaxX = x
+            if (y < sMinY) sMinY = y; if (y > sMaxY) sMaxY = y
+        }
+        var mMinX = width; var mMaxX = 0; var mMinY = height; var mMaxY = 0
+        for (i in 0 until px) if (mask[i]) {
+            val x = i % width; val y = i / width
+            if (x < mMinX) mMinX = x; if (x > mMaxX) mMaxX = x
+            if (y < mMinY) mMinY = y; if (y > mMaxY) mMaxY = y
+        }
+        val spanX = (sMaxX - sMinX + 1).toFloat() / (mMaxX - mMinX + 1).coerceAtLeast(1)
+        val spanY = (sMaxY - sMinY + 1).toFloat() / (mMaxY - mMinY + 1).coerceAtLeast(1)
+        if (spanX < WM_TM_MIN_SPAN || spanY < WM_TM_MIN_SPAN) return@lazy null
+        t
+    }
     // Luminance of the frames t-2 and t-3: with a slow background, the sub-pixel estimate over
     // one frame is biased by the resampling; over three frames the same bias is divided by three.
     private val lumPrev2 = FloatArray(px)
@@ -117,6 +146,10 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     private val histWeight = Array(historyDepth) { ByteArray(px) } // log-quantized confidence
     private val histCumX = FloatArray(historyDepth)
     private val histCumY = FloatArray(historyDepth)
+    // Warp offset each stored frame was restored under (the aligned domain changes when the
+    // tracked watermark jumps between clips).
+    private val histWmOffX = IntArray(historyDepth)
+    private val histWmOffY = IntArray(historyDepth)
     private val histMean = Array(historyDepth) { FloatArray(3) } // clean mean, per channel
     private var histStart = 0
     private var histCount = 0
@@ -164,6 +197,9 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     /** Mean absolute difference of the best match (diagnostics). */
     var motionError: Float = 1f
         private set
+    /** Offset of the watermark in the last processed frame, relative to its analysed position. */
+    val watermarkOffsetX: Int get() = wmOffX
+    val watermarkOffsetY: Int get() = wmOffY
 
     init {
         val nearest = nearestCleanIndices(mask, width, height)
@@ -198,6 +234,15 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         template = IntArray((clean.size + stride - 1) / stride) { clean[it * stride] }
     }
 
+    /** Drops the motion-fill history (the stored frames belong to another clip / picture). */
+    private fun clearHistory() {
+        histStart = 0
+        histCount = 0
+        lastPushFrame = -1
+        lastPushCumX = 0f
+        lastPushCumY = 0f
+    }
+
     /** Forgets the previous frames (seek, new export); the learned ghost is kept. */
     fun reset() {
         hasPrevious = false
@@ -226,7 +271,12 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
      */
     fun process(rgba: ByteArray, flipY: Boolean, output: ByteArray) {
         unpack(rgba, flipY)
+        val prevWmOffX = wmOffX
+        val prevWmOffY = wmOffY
         estimateWatermarkOffset()
+        // A jump of the tracked watermark = the video cut to another clip: the stored frames
+        // belong to another picture, they must not feed the temporal fill anymore.
+        if (abs(wmOffX - prevWmOffX) >= 2 || abs(wmOffY - prevWmOffY) >= 2) clearHistory()
         // The frame watermark sits at layer position + (wmOffX, wmOffY): sample the frame at
         // p + off so the watermark lands exactly on its analysed position.
         if (wmOffX != 0 || wmOffY != 0) shiftInPlace(wmOffX, wmOffY)
@@ -246,7 +296,17 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         // ---- motion of the background since the previous frame ----
         motionFound = false
         if (hasPrevious) estimateMotion()
-        if (motionFound) { cumX += motionX; cumY += motionY }
+        if (motionFound) {
+            // The motion is measured between the two frames' aligned domains, so it absorbs
+            // the warp jump when the tracked watermark moved; the accumulated motion must be
+            // the background's own motion, or the history lookups drift with the warp.
+            cumX += motionX + (wmOffX - prevWmOffX)
+            cumY += motionY + (wmOffY - prevWmOffY)
+        } else if (hasPrevious) {
+            // No motion match = the picture itself changed (a cut the watermark tracking did
+            // not see, a flash): the stored frames are from another world.
+            clearHistory()
+        }
 
         // ---- base estimate: raw / inverted / fill, with confidences ----
         for (p in 0 until px) {
@@ -371,23 +431,43 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     /**
      * Finds where the watermark sits in the current frame (it may have been re-rendered a few
      * pixels away, or jitter slightly): the offset whose alignment scores best wins, with a
-     * margin over the current offset so the estimate does not flicker.
+     * margin over the current offset so the estimate does not flicker. Semi-transparent layers
+     * are localised by their gradient taps; opaque ones by matching their appearance template.
      */
     private fun estimateWatermarkOffset() {
-        if (!wmTrackable) return
+        if (wmTrackable) {
+            var bestScore = -Float.MAX_VALUE
+            var bestX = 0
+            var bestY = 0
+            for (dy in -WM_OFF_SEARCH..WM_OFF_SEARCH) for (dx in -WM_OFF_SEARCH..WM_OFF_SEARCH) {
+                val s = presenceScoreAt(dx, dy)
+                if (s > bestScore) { bestScore = s; bestX = dx; bestY = dy }
+            }
+            if (bestScore < WM_OFF_MIN_SCORE) return // nothing convincing: keep the last offset
+            if (wmOffX == bestX && wmOffY == bestY) return
+            val current = presenceScoreAt(wmOffX, wmOffY)
+            // Hysteresis: only move when the new alignment is clearly better - or when the current
+            // one has collapsed (the video cut to another clip and the watermark jumped).
+            if (bestScore > current + WM_OFF_MARGIN || current < WM_OFF_MIN_SCORE) {
+                wmOffX = bestX
+                wmOffY = bestY
+            }
+            return
+        }
+        val t = wmTemplate ?: return
         var bestScore = -Float.MAX_VALUE
         var bestX = 0
         var bestY = 0
-        for (dy in -WM_OFF_SEARCH..WM_OFF_SEARCH) for (dx in -WM_OFF_SEARCH..WM_OFF_SEARCH) {
-            val s = presenceScoreAt(dx, dy)
+        for (dy in -WM_TM_SEARCH..WM_TM_SEARCH) for (dx in -WM_TM_SEARCH..WM_TM_SEARCH) {
+            val s = OpaqueTemplate.match(t, cur, dx, dy)
             if (s > bestScore) { bestScore = s; bestX = dx; bestY = dy }
         }
-        if (bestScore < WM_OFF_MIN_SCORE) return // nothing convincing: keep the last offset
+        // An argmax at the edge of the window is a lost match, not a position.
+        if (abs(bestX) >= WM_TM_SEARCH || abs(bestY) >= WM_TM_SEARCH) return
+        if (bestScore < WM_TM_MIN_SCORE) return
         if (wmOffX == bestX && wmOffY == bestY) return
-        val current = presenceScoreAt(wmOffX, wmOffY)
-        // Hysteresis: only move when the new alignment is clearly better - or when the current
-        // one has collapsed (the video cut to another clip and the watermark jumped).
-        if (bestScore > current + WM_OFF_MARGIN || current < WM_OFF_MIN_SCORE) {
+        val current = OpaqueTemplate.match(t, cur, wmOffX, wmOffY)
+        if (bestScore > current + WM_TM_MARGIN || current < WM_TM_MIN_SCORE) {
             wmOffX = bestX
             wmOffY = bestY
         }
@@ -707,9 +787,10 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
             for (h in 0 until histCount) {
                 val idx = (histStart + histCount - 1 - h) % historyDepth
                 val age = max(1, frameNo - histFrame[idx])
-                // Where the content now at (x, y) was, `age` frames ago.
-                val sx = x - (cumX - histCumX[idx])
-                val sy = y - (cumY - histCumY[idx])
+                // Where the content now at (x, y) was, `age` frames ago - in the aligned
+                // domain of THAT frame, which is displaced by the warp change since then.
+                val sx = x - (cumX - histCumX[idx]) + (wmOffX - histWmOffX[idx])
+                val sy = y - (cumY - histCumY[idx]) + (wmOffY - histWmOffY[idx])
                 if (sx < 0f || sy < 0f || sx > width - 1f || sy > height - 1f) continue
                 val x0 = floor(sx).toInt()
                 val y0 = floor(sy).toInt()
@@ -878,6 +959,8 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         }
         histCumX[idx] = cumX
         histCumY[idx] = cumY
+        histWmOffX[idx] = wmOffX
+        histWmOffY[idx] = wmOffY
         histMean[idx][0] = cleanMean[0]
         histMean[idx][1] = cleanMean[1]
         histMean[idx][2] = cleanMean[2]
@@ -916,6 +999,16 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         private const val WM_OFF_MIN_SCORE = 0.45f
         /** Margin required over the current offset before switching (anti-flicker). */
         private const val WM_OFF_MARGIN = 0.08f
+        /** Search range (+- px) of the opaque-template watermark alignment. */
+        private const val WM_TM_SEARCH = 16
+        /** Minimum template match score for an offset to be adopted. */
+        private const val WM_TM_MIN_SCORE = 0.55f
+        /** Minimum template support pixels before the watermark position is tracked at all. */
+        private const val WM_TM_MIN_TRACK_PIXELS = 150
+        /** The support must span this fraction of the mask's bounding box, on both axes. */
+        private const val WM_TM_MIN_SPAN = 0.5f
+        /** Margin required over the current offset before switching (anti-flicker). */
+        private const val WM_TM_MARGIN = 0.08f
         /** Background travel (px) needed before a new frame enters the history. */
         private const val PUSH_TRAVEL = 2.5f
         /** Maximum frames between two stored frames (keeps recent frames on a still picture). */

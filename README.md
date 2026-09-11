@@ -73,6 +73,17 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   restaurateur suit en outre la position du filigrane image par image (régression des taps de
   présence, hystérésis, suivi coupé quand le calque n'est pas localisable) : le calque est
   ré-aligné sur chaque image avant traitement, dans un domaine où le filigrane est fixe.
+- **Filigrane opaque re-rendu par clip (Vizard & co.)** : quand le filigrane est opaque ou quasi
+  (logo plein, texte épais), le mécanisme précédent restait aveugle — ses quelques pixels
+  « inversables » ne suffisent ni à aligner l'analyse ni à suivre le logo à l'export, et le calque
+  restaient celui d'un seul clip : les autres gardaient le filigrane, plus une tache floue là où
+  il n'était plus. L'analyse capture désormais l'apparence même du logo (médiane temporelle de ses
+  pixels réellement stables, anneau de contraste autour) : cette « empreinte » sert à vérifier
+  qu'on retrouve bien le logo ailleurs dans la vidéo, puis à le suivre image par image à l'export
+  (accord du cœur + contraste du pourtour, insensible aux zones plates de la couleur du logo).
+  Le calque adopté est comblé en entier (plus d'inversion aux alphas smeads) et l'historique de
+  comblement est remis à zéro à chaque changement de clip — plus de pixels sombres importés d'une
+  autre scène.
 - **Restauration image par image (`RegionRestorer`)** : pendant l'export, chaque image passe par
   un restaurateur CPU qui (1) mesure si le logo est réellement présent dans l'image (filigranes qui
   changent de place → les images sans logo ne sont pas touchées, plus d'apparitions fugaces),

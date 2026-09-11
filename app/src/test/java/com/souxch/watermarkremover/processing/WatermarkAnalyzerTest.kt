@@ -528,6 +528,103 @@ class WatermarkAnalyzerTest {
     }
 
     @Test
+    fun `an opaque watermark that is re-rendered between clips is still removed`() {
+        // The Vizard-style exports burn an (almost) opaque logo into the picture, and clip
+        // compilations re-render it per clip: it jumps a few pixels at every cut. The temporal
+        // median smears it into garbage and the analysis used to either find nothing (spatial
+        // fallback = the blurry patch) or commit to a garbage partial mask. A chunk of one
+        // clip now provides the precise layer, the logo's appearance is captured as a
+        // template, and the export follows the logo frame by frame.
+        fun bgClip(x: Int, y: Int, t: Int, scene: Int): FloatArray {
+            val xx = x + 6f * t
+            val yy = y + 4f * t
+            val p = scene * 2.3f
+            val r = 0.35f + 0.25f * sin(xx * 0.31f + p) + 0.15f * sin(yy * 0.17f + p)
+            val g = 0.40f + 0.20f * sin(xx * 0.23f + 1f + p) + 0.10f * sin((xx + yy) * 0.11f)
+            val b = 0.45f + 0.20f * sin(yy * 0.27f + 2f + p) + 0.10f * sin(xx * 0.13f)
+            return floatArrayOf(r.coerceIn(0f, 1f), g.coerceIn(0f, 1f), b.coerceIn(0f, 1f))
+        }
+        val cuts = listOf(20, 40)
+        val rnd = Random(23)
+        fun framesClips(n: Int): List<ByteArray> = (0 until n).map { t ->
+            val clip = cuts.count { t >= it }
+            val tc = t - (cuts.filter { t >= it }.maxOrNull() ?: 0)
+            val wx = 6 * clip
+            val wy = 3 * clip
+            val out = ByteArray(w * h * 3)
+            for (y in 0 until h) for (x in 0 until w) {
+                val bg = bgClip(x, y, tc, clip % 2)
+                val a = when (logoDistance(x - wx, y - wy)) { 0 -> 1f; 1 -> 0.5f; else -> 0f }
+                for (c in 0 until 3) {
+                    val v = (a + (1f - a) * bg[c] + (rnd.nextFloat() - 0.5f) * 2f * 0.008f).coerceIn(0f, 1f)
+                    out[(y * w + x) * 3 + c] = (v * 255f + 0.5f).toInt().toByte()
+                }
+            }
+            out
+        }
+        val all = framesClips(60)
+        val sample = all.indices.filter { it % 5 == 1 }.map { all[it] }
+        val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, sample))
+        assertTrue("layer=${layer?.stats?.reason}", layer != null && layer.hasWatermark)
+        assertTrue("an opaque logo must be tracked by its appearance template", layer!!.template != null)
+        val restorer = RegionRestorer(layer)
+        val errors = ArrayList<Float>()
+        var black = 0
+        var followed = 0
+        var checked = 0
+        var baseX = 0
+        var baseY = 0
+        for (t in 0 until 60) {
+            val out = rgba(all[t], false).also { restorer.process(it, false, it) }
+            if (t == 2) { baseX = restorer.watermarkOffsetX; baseY = restorer.watermarkOffsetY }
+            if (t >= 10) {
+                val clip = cuts.count { t >= it }
+                checked++
+                if (restorer.watermarkOffsetX == baseX + 6 * clip && restorer.watermarkOffsetY == baseY + 3 * clip) followed++
+            }
+            var err = 0f
+            var n = 0
+            val clip = cuts.count { t >= it }
+            val tc = t - (cuts.filter { t >= it }.maxOrNull() ?: 0)
+            for (y in 0 until h) for (x in 0 until w) {
+                if (logoDistance(x, y) > 2) continue
+                val bg = bgClip(x, y, tc, clip % 2)
+                for (c in 0 until 3) {
+                    val o = (out[(y * w + x) * 4 + c].toInt() and 0xFF) / 255f
+                    err += abs(o - bg[c]); n++
+                    if (t >= 10 && o < 0.02f && bg[c] > 0.15f) black++
+                }
+            }
+            errors.add(err / n)
+        }
+        assertTrue("template tracking followed the per-clip jumps in only $followed/$checked frames", followed >= checked - 5)
+        assertTrue("black pixels after warm-up: $black", black < 20)
+        val late = errors.takeLast(10).average()
+        assertTrue("late error $late (the per-clip opaque watermark must be followed)", late < 0.09f)
+    }
+
+    @Test
+    fun `a static opaque watermark carries a template and does not wander`() {
+        // A static opaque logo also gets its appearance template (so the export could follow
+        // it if it moved after all), but the template must never make a still logo wander:
+        // a wrong offset would warp the restoration and damage clean pixels.
+        val opaque = { x: Int, y: Int ->
+            when (logoDistance(x, y)) { 0 -> 1f; 1 -> 0.5f; else -> 0f }
+        }
+        val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, framesOf(16, opaque)))!!
+        assertTrue(layer.hasWatermark)
+        assertEquals("ok", layer.stats.reason)
+        assertTrue("a fill-dominated logo must carry a tracking template", layer.template != null)
+        val restorer = RegionRestorer(layer)
+        var wandered = 0
+        for (t in 0 until 40) {
+            rgba(framesOf(40, opaque)[t], false).also { restorer.process(it, false, it) }
+            if (restorer.watermarkOffsetX != 0 || restorer.watermarkOffsetY != 0) wandered++
+        }
+        assertTrue("a still logo must not wander (wandered $wandered/40 frames)", wandered == 0)
+    }
+
+    @Test
     fun `layer packing keeps regions texel aligned and method switches to layer mode`() {
         val zone = WatermarkZone(1, NormalizedRect(0.5f, 0.5f, 0.6f, 0.6f))
         val region = WatermarkLayer.regionOf(zone, 1920, 1080)

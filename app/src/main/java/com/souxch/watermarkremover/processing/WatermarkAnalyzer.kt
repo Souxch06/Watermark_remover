@@ -39,20 +39,34 @@ object WatermarkAnalyzer {
     const val MAX_INVERT_ALPHA = 0.8f
     /** A watermark layer is only trusted if this many frames were analysed. */
     const val MIN_FRAMES = 6
-        /** Samples per bootstrap chunk (a run of consecutive samples = one clip). */
-        private const val ALIGN_CHUNK = 8
-        /** Step between bootstrap chunks (overlapping, so a pure-clip chunk is likely). */
-        private const val ALIGN_CHUNK_STEP = 3
-        /** Search range (+- px) of the per-frame watermark alignment in the analysis. */
-        private const val ALIGN_SEARCH = 12
-        /** Minimum correlation for a frame offset to be used. */
-        private const val ALIGN_MIN_SCORE = 0.45f
-        /** Margin over the zero offset before a non-zero alignment is used. */
-        private const val ALIGN_MARGIN = 0.15f
-        /** Minimum opacity for a pixel to be used as an alignment tap. */
-        private const val ALIGN_TAP_ALPHA = 0.15f
-        /** Inverted pixels must cover at least this fraction of the mask for alignment. */
-        private const val ALIGN_INV_FRACTION = 0.40f
+    /** Samples per bootstrap chunk (a run of consecutive samples = one clip). */
+    private const val ALIGN_CHUNK = 8
+    /** Step between bootstrap chunks (overlapping, so a pure-clip chunk is likely). */
+    private const val ALIGN_CHUNK_STEP = 3
+    /** Search range (+- px) of the per-frame watermark alignment in the analysis. */
+    private const val ALIGN_SEARCH = 12
+    /** Minimum correlation for a frame offset to be used. */
+    private const val ALIGN_MIN_SCORE = 0.45f
+    /** Margin over the zero offset before a non-zero alignment is used. */
+    private const val ALIGN_MARGIN = 0.15f
+    /** Minimum opacity for a pixel to be used as an alignment tap. */
+    private const val ALIGN_TAP_ALPHA = 0.15f
+    /** Inverted pixels must cover at least this fraction of the mask for alignment. */
+    private const val ALIGN_INV_FRACTION = 0.40f
+    /** Fill pixels must cover at least this fraction of the mask for an opaque-logo template. */
+    private const val TEMPLATE_FILL_FRACTION = 0.50f
+    /** Weaker requirement for a bootstrap chunk (a drifting logo smears its chunk edges). */
+    private const val CHUNK_FILL_FRACTION = 0.30f
+    /** A bootstrap chunk layer must be this complete w.r.t. the direct layer to take over. */
+    private const val CHUNK_TAKEOVER = 0.60f
+    /** Temporal MAD above which a fill pixel is not stably opaque (background shows through). */
+    private const val TEMPLATE_MAX_MAD = 0.06f
+    /** Minimum stable fill pixels for a usable tracking template. */
+    private const val TEMPLATE_MIN_PIXELS = 40
+    /** Match score required from frames outside the chunk for a chunk takeover to be accepted. */
+    private const val TEMPLATE_VERIFY_SCORE = 0.45f
+    /** Frames outside the chunk that must show the logo for a chunk takeover to be accepted. */
+    private const val TEMPLATE_VERIFY_FRAMES = 2
     /** Smallest subset of frames on which the logo may be analysed when it is not always there. */
     const val MIN_PRESENT_FRAMES = 4
     /** Largest region analysed (pixels); bigger zones fall back to the spatial reconstruction. */
@@ -62,12 +76,16 @@ object WatermarkAnalyzer {
     class Frames(val width: Int, val height: Int, val frames: List<ByteArray>)
 
     /**
-     * Result of the analysis for one zone (region = zone + margin, same size as the input).
+     * Recovered watermark layer of one zone.
      *  - [colour]  : per pixel `a*W` (RGB), zero outside the logo
      *  - [alpha]   : per pixel opacity used for the inversion, zero outside the logo
      *  - [fill]    : true where the pixel must be re-synthesised from its neighbours instead
      *  - [distances]: for fill pixels, distance (in pixels) to the nearest non-fill pixel to the
      *                left / right / top / bottom (255 = none in that direction)
+     *  - [template]: when the logo is opaque (fill-dominated), the median appearance of its
+     *                stable pixels plus a ring just outside it; the restorer matches this
+     *                template against every frame to follow a watermark that is re-rendered
+     *                or drifting between clips. Null for inversion-dominated layers.
      */
     class Layer(
         val width: Int,
@@ -77,6 +95,7 @@ object WatermarkAnalyzer {
         val fill: BooleanArray,
         val distances: ByteArray,
         val stats: Stats,
+        val template: OpaqueTemplate.Template? = null,
     ) {
         val hasWatermark: Boolean get() = stats.maskPixels > 0
     }
@@ -146,6 +165,9 @@ object WatermarkAnalyzer {
     @Suppress("NOTHING_TO_INLINE")
     private inline fun v(b: ByteArray, j: Int): Float = (b[j].toInt() and 0xFF) * INV255
 
+    /** Set to true locally to follow the layer selection on the bench (never in release). */
+    private const val DEBUG = false
+
     /** Per-pixel inversion parameters, used to validate the layer on the sample frames. */
     private class Inversion(val colour: FloatArray, val alpha: FloatArray, val fill: BooleanArray)
 
@@ -156,25 +178,202 @@ object WatermarkAnalyzer {
         val direct = analyzePass(input.frames, w, h)
         // The watermark does not necessarily sit at exactly the same pixels in every sampled
         // frame: clip compilations re-render it per clip and auto-reframed exports shift it.
-        // The temporal median then smears it into nothing ("no watermark" -> the zone would
-        // fall back to spatial reconstruction, a blurry patch). When the direct pass fails,
-        // bootstrap a layer on a run of consecutive samples (inside one clip the watermark is
-        // still), re-align every frame onto it and re-analyse the whole set. When the direct
-        // pass succeeds, still try: a re-aligned pass can only be sharper.
-        if (direct != null && direct.hasWatermark) {
-            return alignAndReanalyse(input.frames, w, h, direct) ?: direct
-        }
-        var best: Layer? = null
+        // The temporal median then smears it into nothing or into a partial, garbage mask.
+        // When the direct pass produces something, still try: a re-aligned pass (every frame
+        // shifted onto the watermark position of the direct layer) can only be sharper.
+        val candidate: Layer? =
+            if (direct != null && direct.hasWatermark) alignAndReanalyse(input.frames, w, h, direct) ?: direct else null
+        // Bootstrap a layer on runs of consecutive samples: inside one clip the watermark is
+        // still, so a chunk sees it sharply where the direct pass over everything smears it.
+        // Among comparably large chunks, the most fill-dominated one wins: with a continuously
+        // drifting watermark every chunk is slightly smeared (its edges look semi-transparent),
+        // and the least smeared chunk is the one that looks the most opaque.
+        class Chunk(val layer: Layer, val start: Int, val end: Int)
+        val chunkLayers = ArrayList<Chunk>()
         var start = 0
         while (start + MIN_FRAMES <= input.frames.size) {
             val end = min(start + ALIGN_CHUNK, input.frames.size)
             val l = analyzePass(input.frames.subList(start, end), w, h)
-            if (l != null && l.hasWatermark && (best == null || l.stats.maskPixels > best!!.stats.maskPixels)) best = l
+            if (l != null && l.hasWatermark) chunkLayers.add(Chunk(l, start, end))
             if (end == input.frames.size) break
             start += ALIGN_CHUNK_STEP
         }
-        val base = best ?: return direct
-        return alignAndReanalyse(input.frames, w, h, base) ?: base
+        var best: Layer? = null
+        var bestStart = -1
+        var bestEnd = -1
+        if (chunkLayers.isNotEmpty()) {
+            val maxMask = chunkLayers.maxOf { it.layer.stats.maskPixels }
+            val selected = chunkLayers
+                .filter { it.layer.stats.maskPixels >= 0.6f * maxMask }
+                .maxWithOrNull(compareBy({ fillFraction(it.layer) }, { it.layer.stats.maskPixels }))
+            if (selected != null) {
+                best = selected.layer
+                bestStart = selected.start
+                bestEnd = selected.end
+            }
+            if (DEBUG) println(
+                "analyze: chunks=" + chunkLayers.joinToString(",") {
+                    it.layer.stats.maskPixels.toString() + "/" + it.layer.stats.invertedPixels + "/" + it.layer.stats.filledPixels
+                } + " selected=" + (selected?.let { it.layer.stats.maskPixels.toString() + "/" + fillFraction(it.layer) } ?: "-")
+            )
+        }
+        // Opaque (fill-dominated) logo: re-rendered or drifting, the direct pass can only hold
+        // a smeared copy of it, and its few inverted pixels are not reliable alignment taps
+        // (the alignment above then commits to garbage). A chunk layer holds the precise
+        // position; the restorer follows the logo per frame with an analysis-time template of
+        // its appearance. The takeover needs the chunk layer to be nearly as complete as the
+        // direct one AND the template to be found again in frames outside the chunk (a chunk
+        // of locally still background would otherwise fake a watermark).
+        val chunk = best
+        // When the direct layer is itself fill-dominated and nearly as complete, the video is
+        // static: the direct layer (analysed on more frames) wins, with its own template.
+        val chunkTakesOver = chunk != null && fillDominated(chunk, CHUNK_FILL_FRACTION) &&
+            (candidate == null || chunk.stats.maskPixels >= candidate.stats.maskPixels * CHUNK_TAKEOVER) &&
+            !(candidate != null && fillDominated(candidate, TEMPLATE_FILL_FRACTION) &&
+                candidate.stats.maskPixels >= chunk.stats.maskPixels * 0.75f)
+        if (DEBUG) println(
+            "analyze: direct=" + (direct?.stats?.let { it.maskPixels.toString() + "/" + it.reason } ?: "-") +
+                " cand=" + (candidate?.let { it.stats.maskPixels.toString() + "/" + it.stats.invertedPixels + "/" + it.stats.filledPixels } ?: "-") +
+                " chunk=" + (chunk?.let { it.stats.maskPixels.toString() + "/" + it.stats.invertedPixels + "/" + it.stats.filledPixels } ?: "-") +
+                " take=" + chunkTakesOver
+        )
+        if (chunk != null && chunkTakesOver) {
+            val template = OpaqueTemplate.build(
+                input.frames.subList(bestStart, bestEnd), w, h, maskOf(chunk), chunk.fill,
+                TEMPLATE_MAX_MAD, TEMPLATE_MIN_PIXELS,
+            )
+            if (template != null) {
+                val offsets = estimateTemplateOffsets(template, input.frames, bestStart, bestEnd, w, h)
+                val outside = input.frames.size - (bestEnd - bestStart)
+                val verified = input.frames.indices.count { i ->
+                    (i < bestStart || i >= bestEnd) && offsets[i].third >= TEMPLATE_VERIFY_SCORE
+                }
+                if (verified >= min(TEMPLATE_VERIFY_FRAMES, outside)) {
+                    // Re-align every frame onto the chunk's watermark position and rebuild the
+                    // template over all of them: a logo that drifts continuously erodes the
+                    // stable core of any single chunk, but once the frames are aligned the
+                    // whole logo (glyph strokes included) is stable again - and a template
+                    // that spans the whole logo shape is what the per-frame tracking needs
+                    // to be distinctive.
+                    val aligned = input.frames.mapIndexed { i, f ->
+                        shiftFrame(f, w, h, offsets[i].first, offsets[i].second)
+                    }
+                    val strong = OpaqueTemplate.build(
+                        aligned, w, h, maskOf(chunk), maskOf(chunk), TEMPLATE_MAX_MAD, TEMPLATE_MIN_PIXELS,
+                    )
+                    if (DEBUG) println(
+                        "analyze: takeover chunk[$bestStart,$bestEnd) support=" + template.idx.size +
+                            " rebuilt=" + (strong?.idx?.size ?: -1) + " verified=$verified"
+                    )
+                    // Keep whichever template is the more distinctive (the rebuild can also
+                    // lose pixels, e.g. on a slightly translucent logo).
+                    val best = if ((strong?.idx?.size ?: 0) > template.idx.size) strong!! else template
+                    return purifyToFills(chunk).withTemplate(best)
+                }
+            }
+        }
+        if (candidate != null) {
+            if (fillDominated(candidate, TEMPLATE_FILL_FRACTION)) {
+                // Static opaque logo: the direct layer is the right one, attach the template
+                // (built over all frames: only truly stable pixels survive) so the restorer
+                // can still track it if it moves after all.
+                val template = OpaqueTemplate.build(
+                    input.frames, w, h, maskOf(candidate), candidate.fill,
+                    TEMPLATE_MAX_MAD, TEMPLATE_MIN_PIXELS,
+                )
+                if (template != null) return candidate.withTemplate(template)
+            }
+            return candidate
+        }
+        if (best == null) return direct
+        return alignAndReanalyse(input.frames, w, h, best) ?: best
+    }
+
+    /** Pixels touched by the layer (inverted or filled). */
+    private fun maskOf(layer: Layer): BooleanArray =
+        BooleanArray(layer.alpha.size) { layer.alpha[it] > 0f || layer.fill[it] }
+
+    /** Fraction of the masked pixels that are opaque (filled). */
+    private fun fillFraction(layer: Layer): Float {
+        var inverted = 0
+        var masked = 0
+        for (i in layer.alpha.indices) {
+            if (layer.alpha[i] > 0f) inverted++
+            if (layer.alpha[i] > 0f || layer.fill[i]) masked++
+        }
+        return if (masked == 0) 0f else (masked - inverted).toFloat() / masked
+    }
+
+    /** True when at least [fraction] of the masked pixels are opaque (filled). */
+    private fun fillDominated(layer: Layer, fraction: Float): Boolean {
+        var inverted = 0
+        var masked = 0
+        for (i in layer.alpha.indices) {
+            if (layer.alpha[i] > 0f) inverted++
+            if (layer.alpha[i] > 0f || layer.fill[i]) masked++
+        }
+        return masked > 0 && (masked - inverted) >= masked * fraction
+    }
+
+    private fun Layer.withTemplate(template: OpaqueTemplate.Template): Layer =
+        Layer(width, height, colour, alpha, fill, distances, stats, template)
+
+    /**
+     * A tracked, fill-dominated layer must not try to invert its few "semi-transparent"
+     * pixels: on a re-rendered or drifting logo those alphas are the smear of the analysis,
+     * and the per-frame warp only realigns whole pixels anyway. Everything the mask covers is
+     * filled instead; the temporal fill then rebuilds the true picture behind the logo.
+     */
+    private fun purifyToFills(layer: Layer): Layer {
+        if (layer.stats.invertedPixels == 0) return layer
+        val fill = BooleanArray(layer.fill.size) { layer.alpha[it] > 0f || layer.fill[it] }
+        val stats = Stats(
+            layer.stats.frames, layer.stats.presentFrames, layer.stats.motion,
+            layer.stats.maskPixels, 0, layer.stats.maskPixels, layer.stats.components, layer.stats.reason,
+        )
+        return Layer(
+            layer.width, layer.height,
+            FloatArray(layer.colour.size), FloatArray(layer.alpha.size),
+            fill, fillDistances(fill, layer.width, layer.height), stats,
+        )
+    }
+
+
+
+    /**
+     * Where the watermark sits in each frame, relative to the chunk the template was built
+     * from, and with which match score (0 = not found; frames of the chunk itself are the
+     * reference). Also the takeover's safety net: a chunk of locally still background would
+     * produce a template that is found nowhere outside the chunk.
+     */
+    private fun estimateTemplateOffsets(
+        template: OpaqueTemplate.Template,
+        frames: List<ByteArray>,
+        chunkStart: Int,
+        chunkEnd: Int,
+        w: Int,
+        h: Int,
+    ): List<Triple<Int, Int, Float>> {
+        val img = FloatArray(w * h * 3)
+        return frames.mapIndexed { i, f ->
+            if (i >= chunkStart && i < chunkEnd) return@mapIndexed Triple(0, 0, 1f)
+            OpaqueTemplate.unpack(f, img)
+            var bestScore = -1f
+            var bestX = 0
+            var bestY = 0
+            var zeroScore = -1f
+            for (dy in -ALIGN_SEARCH..ALIGN_SEARCH) for (dx in -ALIGN_SEARCH..ALIGN_SEARCH) {
+                val sc = OpaqueTemplate.match(template, img, dx, dy)
+                if (dx == 0 && dy == 0) zeroScore = sc
+                if (sc > bestScore) { bestScore = sc; bestX = dx; bestY = dy }
+            }
+            // An argmax at the edge of the window is a lost match, not a position; a non-zero
+            // offset must clearly beat the zero one (a still logo must not be moved by noise).
+            if (abs(bestX) >= ALIGN_SEARCH || abs(bestY) >= ALIGN_SEARCH) return@mapIndexed Triple(0, 0, 0f)
+            if (bestScore >= TEMPLATE_VERIFY_SCORE &&
+                ((bestX == 0 && bestY == 0) || bestScore > zeroScore + 0.08f)
+            ) Triple(bestX, bestY, bestScore) else Triple(0, 0, 0f)
+        }
     }
 
     /**
@@ -1345,5 +1544,161 @@ object Components {
         val sizes = IntArray(n + 1)
         for (l in labels) sizes[l]++
         for (i in labels.indices) if (labels[i] != 0 && sizes[labels[i]] < minSize) { mask[i] = false }
+    }
+}
+
+/**
+ * Appearance template of an opaque (fill-dominated) watermark, and the matcher that follows
+ * such a watermark from frame to frame.
+ *
+ * An opaque logo hides the picture completely: its pixels hold the logo's own colour, which is
+ * constant over time while the background moves. The template is the temporal median of the
+ * layer's *stable* fill pixels (median absolute deviation below a threshold, so anti-aliased
+ * or semi-transparent fringes and any background bleed-through are excluded), plus a one-pixel
+ * ring just outside the mask.
+ *
+ * The match score combines two cues:
+ *  - the *core agreement*: the frame, shifted by (dx, dy), must reproduce the template values
+ *    on the support pixels;
+ *  - the *ring contrast*: the pixels just outside the shifted mask must differ from the logo's
+ *    mean colour. Without it, a flat patch of background the colour of the logo (white logo
+ *    over a white sky) would match everywhere and the tracker would wander off.
+ * The score is ~1 at the true position (both cues strong), around 0 on plain background, and
+ * negative when the core actively disagrees. Brightness changes of the whole video are not
+ * corrected for: an opaque watermark is composited after any camera fade, so its colour does
+ * not follow the picture.
+ */
+object OpaqueTemplate {
+
+    private const val INV255 = 1f / 255f
+    /** Per-pixel, per-channel difference cap: outliers (edges, compression) must not dominate. */
+    private const val CAP = 0.25f
+    /** Mean capped difference that maps to a core agreement of 0. */
+    private const val TAU = 0.10f
+    /** Weight of the core agreement in the score (the rest is the ring contrast). */
+    private const val CORE_WEIGHT = 0.6f
+
+    class Template(
+        val width: Int,
+        val height: Int,
+        /** Median RGB (0..1) over the analysis frames; only [idx] entries are meaningful. */
+        val values: FloatArray,
+        /** Indices of the stable (truly opaque) fill pixels. */
+        val idx: IntArray,
+        /** Indices of the one-pixel ring just outside the whole watermark mask. */
+        val ring: IntArray,
+    ) {
+        val coreMean = FloatArray(3)
+
+        init {
+            for (k in idx.indices) for (c in 0 until 3) coreMean[c] += values[idx[k] * 3 + c]
+            if (idx.isNotEmpty()) for (c in 0 until 3) coreMean[c] /= idx.size
+        }
+    }
+
+    /**
+     * Builds the template of [fill] pixels that are stable across [frames] (temporal MAD at or
+     * below [maxMad]); [mask] (fill + inverted) only serves to place the contrast ring.
+     * Returns null when fewer than [minPixels] stable pixels remain.
+     */
+    fun build(
+        frames: List<ByteArray>,
+        w: Int,
+        h: Int,
+        mask: BooleanArray,
+        fill: BooleanArray,
+        maxMad: Float,
+        minPixels: Int,
+    ): Template? {
+        val px = w * h
+        val tmp = FloatArray(frames.size)
+        val values = FloatArray(px * 3)
+        val idx = ArrayList<Int>()
+        for (i in 0 until px) {
+            if (!fill[i]) continue
+            var mad = 0f
+            for (c in 0 until 3) {
+                for (t in frames.indices) tmp[t] = (frames[t][i * 3 + c].toInt() and 0xFF) * INV255
+                val (m, md) = medianMadOf(tmp, frames.size)
+                values[i * 3 + c] = m
+                if (md > mad) mad = md
+            }
+            if (mad <= maxMad) idx.add(i)
+        }
+        if (idx.size < minPixels) return null
+        // One-pixel ring just outside the mask.
+        val ringMask = BooleanArray(px)
+        for (y in 0 until h) for (x in 0 until w) {
+            val i = y * w + x
+            if (mask[i]) continue
+            var near = false
+            for (dy in -1..1) {
+                for (dx in -1..1) {
+                    val xx = x + dx
+                    val yy = y + dy
+                    if (xx in 0 until w && yy in 0 until h && mask[yy * w + xx]) near = true
+                }
+            }
+            ringMask[i] = near
+        }
+        val ring = IntArray(px)
+        var n = 0
+        for (i in 0 until px) if (ringMask[i]) ring[n++] = i
+        return Template(w, h, values, idx.toIntArray(), ring.copyOf(n))
+    }
+
+    /** Match score of [t] against the image [img] (RGB floats, same size) shifted by (dx, dy). */
+    fun match(t: Template, img: FloatArray, dx: Int, dy: Int): Float {
+        val w = t.width
+        val h = t.height
+        val px = w * h
+        var sad = 0f
+        var n = 0
+        for (k in t.idx.indices) {
+            val src = t.idx[k]
+            val x = src % w + dx
+            val y = src / w + dy
+            if (x < 0 || y < 0 || x >= w || y >= h) continue
+            val p = y * w + x
+            var diff = 0f
+            for (c in 0 until 3) diff += abs(img[p * 3 + c] - t.values[src * 3 + c])
+            sad += if (diff > 3f * CAP) CAP else diff * (1f / 3f)
+            n++
+        }
+        if (n < t.idx.size / 2) return -1f
+        val core = 1f - (sad / n) / TAU
+        if (t.ring.isEmpty()) return core.coerceIn(-1f, 1f)
+        var ring = 0f
+        var rn = 0
+        for (q in t.ring) {
+            val x = q % w + dx
+            val y = q / w + dy
+            if (x < 0 || y < 0 || x >= w || y >= h) continue
+            val p = y * w + x
+            var diff = 0f
+            for (c in 0 until 3) diff += abs(img[p * 3 + c] - t.coreMean[c])
+            ring += if (diff > 3f * CAP) CAP else diff * (1f / 3f)
+            rn++
+        }
+        if (rn < 8) return core.coerceIn(-1f, 1f)
+        val contrast = ((ring / rn) / TAU).coerceIn(0f, 1f)
+        return CORE_WEIGHT * core.coerceIn(-1f, 1f) + (1f - CORE_WEIGHT) * contrast
+    }
+
+    /** Unpacks an RGB byte frame into [out] as 0..1 floats. */
+    fun unpack(frame: ByteArray, out: FloatArray) {
+        for (i in 0 until out.size) out[i] = (frame[i].toInt() and 0xFF) * INV255
+    }
+
+    /** (median, MAD * 1.4826) of the first [n] entries; destroys their order. */
+    private fun medianMadOf(values: FloatArray, n: Int): Pair<Float, Float> {
+        val a = values.copyOf(n)
+        a.sort()
+        val m = if (n % 2 == 1) a[n / 2] else 0.5f * (a[n / 2 - 1] + a[n / 2])
+        for (t in 0 until n) values[t] = abs(values[t] - m)
+        val b = values.copyOf(n)
+        b.sort()
+        val md = if (n % 2 == 1) b[n / 2] else 0.5f * (b[n / 2 - 1] + b[n / 2])
+        return m to md * 1.4826f
     }
 }
