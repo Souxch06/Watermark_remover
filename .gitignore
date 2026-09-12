@@ -1,0 +1,30 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+.kotlin/
+
+# Local configuration (SDK path, private signing secrets, ...)
+local.properties
+*.jks
+*.keystore
+keystore.properties
+# ...except the public release key used by GitHub Releases (see signing/keystore.properties)
+!signing/release.jks
+!signing/keystore.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Android
+captures/
+.externalNativeBuild/
+.cxx/
+/app/release/
+/app/debug/
+*.apk
+*.aab
+image-search/

@@ -1,0 +1,1895 @@
+package com.souxch.watermarkremover.processing
+
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
+import kotlin.random.Random
+
+/**
+ * Recovers the watermark layer that a video app composited on top of the picture, so that the
+ * picture BEHIND the watermark can be restored (instead of being painted over).
+ *
+ * Model: every frame is `J = a * W + (1 - a) * I` where `I` is the true picture, `W` the
+ * watermark colour and `a` its opacity (both constant over time because the logo does not move).
+ * Because the picture changes from frame to frame while the logo does not, the gradients of the
+ * logo are the only ones that are identical in every frame. We therefore:
+ *  0. find which sampled frames actually contain the logo (some apps alternate the position of
+ *     their watermark, so a zone may only hold it part of the time);
+ *  1. take, at every pixel, the median over those frames of the horizontal / vertical gradients
+ *     and keep only the ones that are consistent (much larger than their spread);
+ *  2. integrate them (Poisson equation, solved exactly with a sine transform) -> `V = a*(W - I~)`,
+ *     the watermark relief, which is zero wherever no logo is present -> a pixel-accurate mask;
+ *  3. estimate the opacity `a` per pixel: from how much the pixel values vary over time compared
+ *     with their neighbourhood (a semi-transparent logo damps the variations by `1 - a`) and from
+ *     the projection of the relief on the logo colour;
+ *  4. build per-pixel `c = a*W` and `a`, and check on the sample frames that the inversion
+ *     `I = (J - c) / (1 - a)` really removes the logo; parts that are opaque or that fail the
+ *     check are flagged for spatial filling instead.
+ * The per-frame work (presence test, inversion, temporal propagation) is done by [RegionRestorer].
+ *
+ * Everything is pure Kotlin (no Android types) so it runs on the JVM tests. All arrays are
+ * row-major, `[y * width + x]`; frames are packed RGB bytes, maps are floats in 0..1.
+ */
+object WatermarkAnalyzer {
+
+    /** Max opacity we still invert; above that the picture is (almost) gone -> fill. */
+    const val MAX_INVERT_ALPHA = 0.8f
+    /** A watermark layer is only trusted if this many frames were analysed. */
+    const val MIN_FRAMES = 6
+    /** Samples per bootstrap chunk (a run of consecutive samples = one clip). */
+    private const val ALIGN_CHUNK = 8
+    /** Step between bootstrap chunks (overlapping, so a pure-clip chunk is likely). */
+    private const val ALIGN_CHUNK_STEP = 3
+    /** Search range (+- px) of the per-frame watermark alignment in the analysis. */
+    private const val ALIGN_SEARCH = 12
+    /** Minimum correlation for a frame offset to be used. */
+    private const val ALIGN_MIN_SCORE = 0.45f
+    /** Margin over the zero offset before a non-zero alignment is used. */
+    private const val ALIGN_MARGIN = 0.15f
+    /** Minimum opacity for a pixel to be used as an alignment tap. */
+    private const val ALIGN_TAP_ALPHA = 0.15f
+    /** Inverted pixels must cover at least this fraction of the mask for alignment. */
+    private const val ALIGN_INV_FRACTION = 0.40f
+    /** Fill pixels must cover at least this fraction of the mask for an opaque-logo template. */
+    private const val TEMPLATE_FILL_FRACTION = 0.50f
+    /** Weaker requirement for a bootstrap chunk (a drifting logo smears its chunk edges). */
+    private const val CHUNK_FILL_FRACTION = 0.30f
+    /** A bootstrap chunk layer must be this complete w.r.t. the direct layer to take over. */
+    private const val CHUNK_TAKEOVER = 0.60f
+    /** Temporal MAD above which a fill pixel is not stably opaque (background shows through). */
+    private const val TEMPLATE_MAX_MAD = 0.06f
+    /** Minimum stable fill pixels for a usable tracking template. */
+    private const val TEMPLATE_MIN_PIXELS = 40
+    /** Match score required from frames outside the chunk for a chunk takeover to be accepted. */
+    private const val TEMPLATE_VERIFY_SCORE = 0.45f
+    /** Frames outside the chunk that must show the logo for a chunk takeover to be accepted. */
+    private const val TEMPLATE_VERIFY_FRAMES = 2
+    /** Smallest subset of frames on which the logo may be analysed when it is not always there. */
+    const val MIN_PRESENT_FRAMES = 4
+    /** Largest region analysed (pixels); bigger zones fall back to the spatial reconstruction. */
+    const val MAX_REGION_PIXELS = 300_000
+
+    // ---- static-scene (spatial) detection ----
+    /** Minimum local contrast (luminance range over 3x3) for the spatial logo detection. */
+    private const val STATIC_MIN_CONTRAST = 0.10f
+    /** The spatial contrast threshold sits this many (mean) MADs above the background median. */
+    private const val STATIC_CONTRAST_MAD = 4f
+    /** Components below this size (px) are noise. */
+    private const val STATIC_MIN_COMPONENT = 8
+    /** A component must carry this fraction of the best component's contrast mass to be kept. */
+    private const val STATIC_MASS_KEEP = 0.05f
+    /** Recruitment mass floor (a solid mark has little perimeter to score with). */
+    private const val STATIC_RECRUIT_MASS = 0.03f
+    /** At most this many components become part of the mask. */
+    private const val STATIC_MAX_COMPONENTS = 3
+    /** Boxes are grown by this many pixels (antialiasing, soft shadows). */
+    private const val STATIC_GROW = 6
+    /** Logo parts sit at most this far (px) from the strongest component. */
+    private const val STATIC_CLUSTER = 32
+    /** A detection covering more than this fraction of the inner zone falls back to all of it. */
+    private const val STATIC_MAX_COVER = 0.70f
+
+    /** Frames of the analysed region: each `width*height*3` RGB bytes (row-major). */
+    class Frames(val width: Int, val height: Int, val frames: List<ByteArray>)
+
+    /**
+     * Recovered watermark layer of one zone.
+     *  - [colour]  : per pixel `a*W` (RGB), zero outside the logo
+     *  - [alpha]   : per pixel opacity used for the inversion, zero outside the logo
+     *  - [fill]    : true where the pixel must be re-synthesised from its neighbours instead
+     *  - [distances]: for fill pixels, distance (in pixels) to the nearest non-fill pixel to the
+     *                left / right / top / bottom (255 = none in that direction)
+     *  - [template]: when the logo is opaque (fill-dominated), the median appearance of its
+     *                stable pixels plus a ring just outside it; the restorer matches this
+     *                template against every frame to follow a watermark that is re-rendered
+     *                or drifting between clips. Null for inversion-dominated layers.
+     */
+    class Layer(
+        val width: Int,
+        val height: Int,
+        val colour: FloatArray,
+        val alpha: FloatArray,
+        val fill: BooleanArray,
+        val distances: ByteArray,
+        val stats: Stats,
+        val template: OpaqueTemplate.Template? = null,
+    ) {
+        val hasWatermark: Boolean get() = stats.maskPixels > 0
+    }
+
+    data class Stats(
+        val frames: Int,
+        val presentFrames: Int,
+        val motion: Float,
+        val maskPixels: Int,
+        val invertedPixels: Int,
+        val filledPixels: Int,
+        val components: Int,
+        val reason: String,
+    )
+
+    private const val INV255 = 1f / 255f
+    private const val TAU_GRADIENT = 0.02f
+    private const val K_CONSISTENT = 2.0f
+    private const val TAU_RELIEF = 0.05f
+    /** Local contrast (5x5 range) required in the relief: a slow background plateaus smoothly. */
+    private const val TAU_RELIEF_HF = 0.10f
+    /** Mask covering more than this fraction of the zone = the analysis failed, keep the strongest. */
+    private const val OVERMASK_FRACTION = 0.60f
+    /** Quantile of the relief kept when the zone is over-masked. */
+    private const val OVERMASK_KEEP = 0.70f
+    private const val MIN_COMPONENT = 6
+    private const val MIN_MOTION = 0.012f
+    private const val RING = 4
+    private const val DILATE = 1
+    private const val REFINE_PASSES = 3
+    private const val REFINE_GAIN = 0.8f
+
+    // --- soft edge band (anti-aliased / compression-softened tails of the logo) ---
+    /** Width (px) of the band outside the mask where faint logo tails are looked for. */
+    private const val EDGE_BAND = 3
+    /** Main relief above this is trusted as-is; below it the opacity is re-estimated. */
+    private const val FRINGE_KEEP = 0.2f
+    /** Fringe pixels must reach this opacity to be inverted (else they stay untouched). */
+    private const val EDGE_MIN_ALPHA = 0.02f
+
+    // --- component re-calibration by temporal regression (step 3c) ---
+    /** Frames needed before the temporal regression is trusted. */
+    private const val REGRESS_MIN_FRAMES = 8
+    /** Largest distance (px) to the nearest clean pixel for which the regression applies. */
+    private const val REGRESS_MAX_DIST = 12
+    /** Clean-pair correlation below this is not usable (backgrounds that do not co-vary). */
+    private const val REGRESS_MIN_GAMMA = 0.55f
+    /** References beyond this distance (px) must be much better correlated to be used per pixel. */
+    private const val REGRESS_NEAR_DIST = 4
+    /** Correlation required from a reference that is not near. */
+    private const val REGRESS_MIN_GAMMA_NEAR = 0.85f
+    /** Background variance below this carries no regression signal. */
+    private const val REGRESS_MIN_VAR = 4e-4f
+    /** Correlation samples per offset when estimating gamma. */
+    private const val REGRESS_GAMMA_SAMPLES = 24
+    /** Regressed pixels needed before a component may be re-scaled. */
+    private const val REGRESS_MIN_PIXELS = 12
+    /** Evidence (in pixels) at which the re-scaling reaches half of its full amplitude. */
+    private const val REGRESS_SHRINK_EVIDENCE = 24f
+    /** Bound of the component re-scaling factor. */
+    private const val REGRESS_MAX_SCALE = 0.25f
+    /** Weight of the per-pixel regression on the faint fringe. */
+    private const val REGRESS_FRINGE_GAIN = 0.6f
+    /** How far the per-pixel correction may move an opacity, in one go. */
+    private const val REGRESS_MAX_DRIFT = 0.15f
+
+    @Suppress("NOTHING_TO_INLINE")
+    private inline fun v(b: ByteArray, j: Int): Float = (b[j].toInt() and 0xFF) * INV255
+
+    /** Set to true locally to follow the layer selection on the bench (never in release). */
+    private const val DEBUG = false
+
+    /** Per-pixel inversion parameters, used to validate the layer on the sample frames. */
+    private class Inversion(val colour: FloatArray, val alpha: FloatArray, val fill: BooleanArray)
+
+    fun analyze(input: Frames): Layer? {
+        val w = input.width
+        val h = input.height
+        if (input.frames.size < MIN_FRAMES || w < 2 * RING + 4 || h < 2 * RING + 4 || w * h > MAX_REGION_PIXELS) return null
+        val direct = analyzePass(input.frames, w, h)
+        // The watermark does not necessarily sit at exactly the same pixels in every sampled
+        // frame: clip compilations re-render it per clip and auto-reframed exports shift it.
+        // The temporal median then smears it into nothing or into a partial, garbage mask.
+        // When the direct pass produces something, still try: a re-aligned pass (every frame
+        // shifted onto the watermark position of the direct layer) can only be sharper.
+        val candidate: Layer? =
+            if (direct != null && direct.hasWatermark) alignAndReanalyse(input.frames, w, h, direct) ?: direct else null
+        // Bootstrap a layer on runs of consecutive samples: inside one clip the watermark is
+        // still, so a chunk sees it sharply where the direct pass over everything smears it.
+        // Among comparably large chunks, the most fill-dominated one wins: with a continuously
+        // drifting watermark every chunk is slightly smeared (its edges look semi-transparent),
+        // and the least smeared chunk is the one that looks the most opaque.
+        class Chunk(val layer: Layer, val start: Int, val end: Int)
+        val chunkLayers = ArrayList<Chunk>()
+        var start = 0
+        while (start + MIN_FRAMES <= input.frames.size) {
+            val end = min(start + ALIGN_CHUNK, input.frames.size)
+            val l = analyzePass(input.frames.subList(start, end), w, h)
+            if (l != null && l.hasWatermark) chunkLayers.add(Chunk(l, start, end))
+            if (end == input.frames.size) break
+            start += ALIGN_CHUNK_STEP
+        }
+        var best: Layer? = null
+        var bestStart = -1
+        var bestEnd = -1
+        if (chunkLayers.isNotEmpty()) {
+            val maxMask = chunkLayers.maxOf { it.layer.stats.maskPixels }
+            val selected = chunkLayers
+                .filter { it.layer.stats.maskPixels >= 0.6f * maxMask }
+                .maxWithOrNull(compareBy({ fillFraction(it.layer) }, { it.layer.stats.maskPixels }))
+            if (selected != null) {
+                best = selected.layer
+                bestStart = selected.start
+                bestEnd = selected.end
+            }
+            if (DEBUG) println(
+                "analyze: chunks=" + chunkLayers.joinToString(",") {
+                    it.layer.stats.maskPixels.toString() + "/" + it.layer.stats.invertedPixels + "/" + it.layer.stats.filledPixels
+                } + " selected=" + (selected?.let { it.layer.stats.maskPixels.toString() + "/" + fillFraction(it.layer) } ?: "-")
+            )
+        }
+        // Opaque (fill-dominated) logo: re-rendered or drifting, the direct pass can only hold
+        // a smeared copy of it, and its few inverted pixels are not reliable alignment taps
+        // (the alignment above then commits to garbage). A chunk layer holds the precise
+        // position; the restorer follows the logo per frame with an analysis-time template of
+        // its appearance. The takeover needs the chunk layer to be nearly as complete as the
+        // direct one AND the template to be found again in frames outside the chunk (a chunk
+        // of locally still background would otherwise fake a watermark).
+        val chunk = best
+        // When the direct layer is itself fill-dominated and nearly as complete, the video is
+        // static: the direct layer (analysed on more frames) wins, with its own template.
+        val chunkTakesOver = chunk != null && fillDominated(chunk, CHUNK_FILL_FRACTION) &&
+            (candidate == null || chunk.stats.maskPixels >= candidate.stats.maskPixels * CHUNK_TAKEOVER) &&
+            !(candidate != null && fillDominated(candidate, TEMPLATE_FILL_FRACTION) &&
+                candidate.stats.maskPixels >= chunk.stats.maskPixels * 0.75f)
+        if (DEBUG) println(
+            "analyze: direct=" + (direct?.stats?.let { it.maskPixels.toString() + "/" + it.reason } ?: "-") +
+                " cand=" + (candidate?.let { it.stats.maskPixels.toString() + "/" + it.stats.invertedPixels + "/" + it.stats.filledPixels } ?: "-") +
+                " chunk=" + (chunk?.let { it.stats.maskPixels.toString() + "/" + it.stats.invertedPixels + "/" + it.stats.filledPixels } ?: "-") +
+                " take=" + chunkTakesOver
+        )
+        if (chunk != null && chunkTakesOver) {
+            val template = OpaqueTemplate.build(
+                input.frames.subList(bestStart, bestEnd), w, h, maskOf(chunk), chunk.fill,
+                TEMPLATE_MAX_MAD, TEMPLATE_MIN_PIXELS,
+            )
+            if (template != null) {
+                val offsets = estimateTemplateOffsets(template, input.frames, bestStart, bestEnd, w, h)
+                val outside = input.frames.size - (bestEnd - bestStart)
+                val verified = input.frames.indices.count { i ->
+                    (i < bestStart || i >= bestEnd) && offsets[i].third >= TEMPLATE_VERIFY_SCORE
+                }
+                if (verified >= min(TEMPLATE_VERIFY_FRAMES, outside)) {
+                    // Re-align every frame onto the chunk's watermark position and rebuild the
+                    // template over all of them: a logo that drifts continuously erodes the
+                    // stable core of any single chunk, but once the frames are aligned the
+                    // whole logo (glyph strokes included) is stable again - and a template
+                    // that spans the whole logo shape is what the per-frame tracking needs
+                    // to be distinctive.
+                    val aligned = input.frames.mapIndexed { i, f ->
+                        shiftFrame(f, w, h, offsets[i].first, offsets[i].second)
+                    }
+                    val strong = OpaqueTemplate.build(
+                        aligned, w, h, maskOf(chunk), maskOf(chunk), TEMPLATE_MAX_MAD, TEMPLATE_MIN_PIXELS,
+                    )
+                    if (DEBUG) println(
+                        "analyze: takeover chunk[$bestStart,$bestEnd) support=" + template.idx.size +
+                            " rebuilt=" + (strong?.idx?.size ?: -1) + " verified=$verified"
+                    )
+                    // Keep whichever template is the more distinctive (the rebuild can also
+                    // lose pixels, e.g. on a slightly translucent logo).
+                    val best = if ((strong?.idx?.size ?: 0) > template.idx.size) strong!! else template
+                    return purifyToFills(chunk).withTemplate(best)
+                }
+            }
+        }
+        if (candidate != null) {
+            if (fillDominated(candidate, TEMPLATE_FILL_FRACTION)) {
+                // Static opaque logo: the direct layer is the right one, attach the template
+                // (built over all frames: only truly stable pixels survive) so the restorer
+                // can still track it if it moves after all.
+                val template = OpaqueTemplate.build(
+                    input.frames, w, h, maskOf(candidate), candidate.fill,
+                    TEMPLATE_MAX_MAD, TEMPLATE_MIN_PIXELS,
+                )
+                if (template != null) return candidate.withTemplate(template)
+            }
+            return candidate
+        }
+        if (best == null) {
+            // A still background (tripod, same set for the whole video - a podcast, a studio
+            // panel) never reveals the picture behind the logo and kills every temporal cue
+            // the detection relies on ("consistent over time" becomes true of the whole
+            // picture). Last resort only: candidates and chunks must have found nothing
+            // (a re-rendered compilation over a still set can still be saved by them). The
+            // logo is then found SPATIALLY, on the temporal median, and everything the mask
+            // covers is filled: the restorer reconstructs it from the surroundings
+            // (content-aware fill).
+            if (direct != null && !direct.hasWatermark && direct.stats.reason == "static") {
+                return staticLayer(input.frames, w, h, direct.stats.motion) ?: direct
+            }
+            return direct
+        }
+        return alignAndReanalyse(input.frames, w, h, best) ?: best
+    }
+
+    /** Pixels touched by the layer (inverted or filled). */
+    private fun maskOf(layer: Layer): BooleanArray =
+        BooleanArray(layer.alpha.size) { layer.alpha[it] > 0f || layer.fill[it] }
+
+    /** Fraction of the masked pixels that are opaque (filled). */
+    private fun fillFraction(layer: Layer): Float {
+        var inverted = 0
+        var masked = 0
+        for (i in layer.alpha.indices) {
+            if (layer.alpha[i] > 0f) inverted++
+            if (layer.alpha[i] > 0f || layer.fill[i]) masked++
+        }
+        return if (masked == 0) 0f else (masked - inverted).toFloat() / masked
+    }
+
+    /** True when at least [fraction] of the masked pixels are opaque (filled). */
+    private fun fillDominated(layer: Layer, fraction: Float): Boolean {
+        var inverted = 0
+        var masked = 0
+        for (i in layer.alpha.indices) {
+            if (layer.alpha[i] > 0f) inverted++
+            if (layer.alpha[i] > 0f || layer.fill[i]) masked++
+        }
+        return masked > 0 && (masked - inverted) >= masked * fraction
+    }
+
+    private fun Layer.withTemplate(template: OpaqueTemplate.Template): Layer =
+        Layer(width, height, colour, alpha, fill, distances, stats, template)
+
+    /**
+     * A tracked, fill-dominated layer must not try to invert its few "semi-transparent"
+     * pixels: on a re-rendered or drifting logo those alphas are the smear of the analysis,
+     * and the per-frame warp only realigns whole pixels anyway. Everything the mask covers is
+     * filled instead; the temporal fill then rebuilds the true picture behind the logo.
+     */
+    private fun purifyToFills(layer: Layer): Layer {
+        if (layer.stats.invertedPixels == 0) return layer
+        val fill = BooleanArray(layer.fill.size) { layer.alpha[it] > 0f || layer.fill[it] }
+        val stats = Stats(
+            layer.stats.frames, layer.stats.presentFrames, layer.stats.motion,
+            layer.stats.maskPixels, 0, layer.stats.maskPixels, layer.stats.components, layer.stats.reason,
+        )
+        return Layer(
+            layer.width, layer.height,
+            FloatArray(layer.colour.size), FloatArray(layer.alpha.size),
+            fill, fillDistances(fill, layer.width, layer.height), stats,
+        )
+    }
+
+
+
+    /**
+     * Where the watermark sits in each frame, relative to the chunk the template was built
+     * from, and with which match score (0 = not found; frames of the chunk itself are the
+     * reference). Also the takeover's safety net: a chunk of locally still background would
+     * produce a template that is found nowhere outside the chunk.
+     */
+    private fun estimateTemplateOffsets(
+        template: OpaqueTemplate.Template,
+        frames: List<ByteArray>,
+        chunkStart: Int,
+        chunkEnd: Int,
+        w: Int,
+        h: Int,
+    ): List<Triple<Int, Int, Float>> {
+        val img = FloatArray(w * h * 3)
+        return frames.mapIndexed { i, f ->
+            if (i >= chunkStart && i < chunkEnd) return@mapIndexed Triple(0, 0, 1f)
+            OpaqueTemplate.unpack(f, img)
+            var bestScore = -1f
+            var bestX = 0
+            var bestY = 0
+            var zeroScore = -1f
+            for (dy in -ALIGN_SEARCH..ALIGN_SEARCH) for (dx in -ALIGN_SEARCH..ALIGN_SEARCH) {
+                val sc = OpaqueTemplate.match(template, img, dx, dy)
+                if (dx == 0 && dy == 0) zeroScore = sc
+                if (sc > bestScore) { bestScore = sc; bestX = dx; bestY = dy }
+            }
+            // An argmax at the edge of the window is a lost match, not a position; a non-zero
+            // offset must clearly beat the zero one (a still logo must not be moved by noise).
+            if (abs(bestX) >= ALIGN_SEARCH || abs(bestY) >= ALIGN_SEARCH) return@mapIndexed Triple(0, 0, 0f)
+            if (bestScore >= TEMPLATE_VERIFY_SCORE &&
+                ((bestX == 0 && bestY == 0) || bestScore > zeroScore + 0.08f)
+            ) Triple(bestX, bestY, bestScore) else Triple(0, 0, 0f)
+        }
+    }
+
+    /**
+     * Re-aligns every sampled frame onto the watermark position of [base] and re-analyses the
+     * whole set. Returns null (and the caller keeps [base]) when the frames were already
+     * aligned or the re-analysis is not better.
+     */
+    private fun alignAndReanalyse(frames: List<ByteArray>, w: Int, h: Int, base: Layer): Layer? {
+        // Only an inversion-dominated layer can localise its watermark: a fill-dominated one
+        // has no reliable watermark taps (its few "inverted" pixels are usually background
+        // false positives) and the alignment would follow the moving background instead.
+        var inverted = 0
+        var masked = 0
+        for (i in base.alpha.indices) {
+            if (base.alpha[i] > 0f) inverted++
+            if (base.alpha[i] > 0f || base.fill[i]) masked++
+        }
+        if (masked == 0 || inverted < masked * ALIGN_INV_FRACTION) return null
+        val offsets = estimateFrameOffsets(frames, w, h, base)
+        if (offsets.all { it.first == 0 && it.second == 0 }) return null
+        // offsets[i] = where frame i's watermark sits relative to the base layer; sampling the
+        // frame at p + off moves the watermark back onto its analysed position.
+        val aligned = frames.mapIndexed { i, f -> shiftFrame(f, w, h, offsets[i].first, offsets[i].second) }
+        val out = analyzePass(aligned, w, h) ?: return null
+        // Adopt only when the re-aligned layer really explains the frames better: the residual
+        // consistent-gradient energy after inversion must drop clearly. A spurious alignment
+        // produces an over-detected mask that leaves the background unexplained (high energy).
+        // An empty layer has no residual at all: require the mask to be at least as complete.
+        if (out.stats.maskPixels < base.stats.maskPixels * 0.9f) return null
+        val baseResidual = residualEnergy(frames, w, h, base)
+        val outResidual = residualEnergy(aligned, w, h, out)
+        return if (outResidual < 0.85f * baseResidual) out else null
+    }
+
+    /** Total consistent-gradient energy left over the mask after inverting with [layer]. */
+    private fun residualEnergy(frames: List<ByteArray>, w: Int, h: Int, layer: Layer): Float {
+        val px = w * h
+        val e = consistentEnergy(frames, w, h, frames.size, Inversion(layer.colour, layer.alpha, layer.fill))
+        var total = 0f
+        for (i in 0 until px) if (layer.alpha[i] > 0f || layer.fill[i]) total += e[i]
+        return total
+    }
+
+    /**
+     * Where the watermark sits in each frame, relative to its position in [base]: the offset
+     * whose tap regression (edge pairs of the layer vs the frame) scores best. Frames where
+     * nothing scores are left at (0, 0).
+     */
+    private fun estimateFrameOffsets(frames: List<ByteArray>, w: Int, h: Int, base: Layer): List<Pair<Int, Int>> {
+        val px = w * h
+        val mask = BooleanArray(px) { base.alpha[it] > 0f || base.fill[it] }
+        if (mask.none { it }) return frames.map { 0 to 0 }
+        val nearest = RegionRestorer.nearestCleanIndices(mask, w, h)
+        // Edge taps: horizontal and vertical neighbours straddling the watermark border.
+        val tp = ArrayList<Int>(); val tq = ArrayList<Int>(); val tn = ArrayList<Int>()
+        val tda = ArrayList<Float>(); val tdc = ArrayList<FloatArray>()
+        fun consider(p: Int, q: Int) {
+            val aP = base.alpha[p]; val aQ = base.alpha[q]
+            if ((aP <= 0f && !base.fill[p]) == (aQ <= 0f && !base.fill[q])) return
+            // Only strong watermark pixels: an over-detected layer also covers background,
+            // and its weak taps would align on the moving background instead of the logo.
+            if (max(aP, aQ) < ALIGN_TAP_ALPHA || abs(aQ - aP) < ALIGN_TAP_ALPHA * 0.5f) return
+            var m = 0f
+            for (c in 0 until 3) m = max(m, abs(base.colour[q * 3 + c] - base.colour[p * 3 + c]))
+            if (m < 0.02f) return
+            val anchor = if (aP >= aQ) p else q
+            tp.add(p); tq.add(q); tn.add(nearest[anchor])
+            tda.add(aQ - aP)
+            tdc.add(FloatArray(3) { c -> base.colour[q * 3 + c] - base.colour[p * 3 + c] })
+        }
+        for (y in 0 until h) for (x in 0 until w) {
+            val p = y * w + x
+            if (x + 1 < w) consider(p, p + 1)
+            if (y + 1 < h) consider(p, p + w)
+        }
+        if (tp.isEmpty()) return frames.map { 0 to 0 }
+        return frames.map { f ->
+            var bestScore = -Float.MAX_VALUE
+            var bestX = 0
+            var bestY = 0
+            var zeroScore = -1f
+            for (dy in -ALIGN_SEARCH..ALIGN_SEARCH) for (dx in -ALIGN_SEARCH..ALIGN_SEARCH) {
+                val d = dy * w + dx
+                var num = 0.0
+                var den = 0.0
+                var obs2 = 0.0
+                for (k in tp.indices) {
+                    val p = tp[k] + d; val q = tq[k] + d; val n = tn[k] + d
+                    if (p < 0 || q < 0 || n < 0 || p >= px || q >= px || n >= px) continue
+                    val da = tda[k]
+                    if (da == 0f) continue
+                    for (c in 0 until 3) {
+                        val e = tdc[k][c] - v(f, n * 3 + c) * da
+                        val o = v(f, q * 3 + c) - v(f, p * 3 + c)
+                        num += o * e
+                        den += e * e
+                        obs2 += o * o
+                    }
+                }
+                // Normalised correlation (-1..1): cannot blow up on a coincidental pattern.
+                val scale = den * obs2
+                val s = if (scale > 1e-4) (num / kotlin.math.sqrt(scale)).toFloat() else -1f
+                if (dx == 0 && dy == 0) zeroScore = s
+                if (s > bestScore) { bestScore = s; bestX = dx; bestY = dy }
+            }
+            // An offset at the edge of the search window is a lost match, not a position.
+            if (abs(bestX) >= ALIGN_SEARCH || abs(bestY) >= ALIGN_SEARCH) return@map 0 to 0
+            // A non-zero offset must be clearly better than the zero one: a static watermark
+            // must not get shifted by estimation noise.
+            if (bestScore >= ALIGN_MIN_SCORE &&
+                ((bestX == 0 && bestY == 0) || bestScore > zeroScore + ALIGN_MARGIN)
+            ) bestX to bestY else 0 to 0
+        }
+    }
+
+    /** Shifts an RGB frame by (dx, dy), edge-clamped. */
+    private fun shiftFrame(f: ByteArray, w: Int, h: Int, dx: Int, dy: Int): ByteArray {
+        if (dx == 0 && dy == 0) return f
+        val out = ByteArray(f.size)
+        for (y in 0 until h) {
+            val sy = (y + dy).coerceIn(0, h - 1)
+            for (x in 0 until w) {
+                val sx = (x + dx).coerceIn(0, w - 1)
+                val dst = (y * w + x) * 3
+                val s = (sy * w + sx) * 3
+                out[dst] = f[s]; out[dst + 1] = f[s + 1]; out[dst + 2] = f[s + 2]
+            }
+        }
+        return out
+    }
+
+    /**
+     * Layer for a still background. The temporal machinery is blind there (nothing ever moves,
+     * so "consistent over time" is true of the whole picture, and the semi-transparent pixels
+     * never vary enough to be regressed): the logo is found as the zone's high-contrast
+     * OUTLIER on the temporal median, and the mask is the union of the bounding boxes of the
+     * strongest contrast components - antialiased strokes and faint shadow parts of the logo
+     * live inside those boxes. Everything the mask covers is filled: under a still logo the
+     * true picture is never revealed, so the restorer rebuilds it from the surroundings.
+     * A detection that fails its guards falls back to the whole inner zone (what the user
+     * circled): a reconstructed zone always beats a shader blur of it.
+     */
+    private fun staticLayer(frames: List<ByteArray>, w: Int, h: Int, motion: Float): Layer? {
+        val px = w * h
+        // Temporal median = the clean still picture plus the logo, free of sensor noise.
+        val median = FloatArray(px * 3)
+        val tmp = FloatArray(frames.size)
+        for (i in 0 until px) {
+            for (c in 0 until 3) {
+                for (t in frames.indices) tmp[t] = v(frames[t], i * 3 + c)
+                median[i * 3 + c] = medianOf(tmp, frames.size)
+            }
+        }
+        val lum = FloatArray(px) { i -> (median[i * 3] + median[i * 3 + 1] + median[i * 3 + 2]) * (1f / 3f) }
+        val contrast = localRange(lum, w, h, 1)
+
+        // Inner area = the region minus the border ring (the logo never lives in the ring).
+        val x0 = RING
+        val x1 = w - RING
+        val y0 = RING
+        val y1 = h - RING
+        if (x1 - x0 < 4 || y1 - y0 < 4) return null
+        val innerCount = (x1 - x0) * (y1 - y0)
+
+        // Adaptive threshold, anchored on the BACKGROUND (the vast majority of the zone):
+        // median + k*MAD of the local contrast. A percentile of the zone would drift into
+        // the logo's own contrast whenever the user's zone is snug around it.
+        val values = ArrayList<Float>(innerCount)
+        for (y in y0 until y1) for (x in x0 until x1) values.add(contrast[y * w + x])
+        values.sort()
+        val bgMedian = percentileOfSorted(values, 0.5f)
+        var madSum = 0f
+        for (v in values) madSum += abs(v - bgMedian)
+        val mad = madSum / max(values.size, 1)
+        val thr = max(STATIC_MIN_CONTRAST, bgMedian + STATIC_CONTRAST_MAD * mad)
+        if (DEBUG) println("staticLayer: bgMedian=" + "%.3f".format(bgMedian) + " mad=" + "%.3f".format(mad) + " thr=" + "%.3f".format(thr))
+
+        // Contrast components, scored by their total excess contrast ("mass"): background
+        // texture fires everywhere but weakly, a logo concentrates strong edges.
+        val detected = BooleanArray(px) { i ->
+            val x = i % w
+            val y = i / w
+            x >= x0 && x < x1 && y >= y0 && y < y1 && contrast[i] > thr
+        }
+        val labels = Components.label(detected, w, h)
+        val nComp = labels.max()
+        if (nComp > 0) {
+            val mass = FloatArray(nComp + 1)
+            val size = IntArray(nComp + 1)
+            val minX = IntArray(nComp + 1) { w }
+            val maxX = IntArray(nComp + 1)
+            val minY = IntArray(nComp + 1) { h }
+            val maxY = IntArray(nComp + 1)
+            for (y in y0 until y1) for (x in x0 until x1) {
+                val comp = labels[y * w + x]
+                if (comp == 0) continue
+                mass[comp] += contrast[y * w + x] - thr
+                size[comp]++
+                if (x < minX[comp]) minX[comp] = x
+                if (x > maxX[comp]) maxX[comp] = x
+                if (y < minY[comp]) minY[comp] = y
+                if (y > maxY[comp]) maxY[comp] = y
+            }
+            val order = (1..nComp).filter { size[it] >= STATIC_MIN_COMPONENT && mass[it] > 0f }
+                .sortedByDescending { mass[it] }
+            if (DEBUG) println(
+                "staticLayer: thr=" + "%.3f".format(thr) + " nComp=" + nComp + " " +
+                    (1..nComp).joinToString(",") {
+                        "[$it] x${minX[it]}-${maxX[it]} y${minY[it]}-${maxY[it]} n${size[it]} m" + "%.1f".format(mass[it])
+                    }
+            )
+            if (order.isNotEmpty()) {
+                val bestMass = mass[order.first()]
+                val bestComp = order.first()
+                // The logo's parts are adjacent by construction (one mark, one wordmark); a
+                // strong blob far from the strongest one is background, not logo.
+                val kept = order.take(STATIC_MAX_COMPONENTS).filter { comp ->
+                    mass[comp] >= STATIC_MASS_KEEP * bestMass &&
+                        abs(minX[comp] - minX[bestComp]) + abs(maxX[comp] - maxX[bestComp]) +
+                        abs(minY[comp] - minY[bestComp]) + abs(maxY[comp] - maxY[bestComp]) <= STATIC_CLUSTER * 4
+                }
+                if (kept.isNotEmpty()) {
+                    // One single bounding box over everything kept: faint strokes, soft
+                    // shadows and the gaps between glyphs live inside it. Growing and a
+                    // small dilation then cover the antialiased fringe of the logo.
+                    var bx0 = w; var bx1 = 0; var by0 = h; var by1 = 0
+                    for (comp in kept) {
+                        bx0 = min(bx0, minX[comp]); bx1 = max(bx1, maxX[comp])
+                        by0 = min(by0, minY[comp]); by1 = max(by1, maxY[comp])
+                    }
+                    // Recruitment: a solid mark only fires on its thin perimeter and loses
+                    // the mass ranking to an all-edges wordmark, yet it is part of the logo.
+                    // Any small-but-real component sitting next to the detected box joins it.
+                    for (comp in 1..nComp) {
+                        if (size[comp] < STATIC_MIN_COMPONENT) continue
+                        if (mass[comp] < STATIC_RECRUIT_MASS * bestMass) continue
+                        val gapX = max(bx0 - maxX[comp], minX[comp] - bx1)
+                        val gapY = max(by0 - maxY[comp], minY[comp] - by1)
+                        if (max(gapX, gapY) > STATIC_CLUSTER) continue
+                        bx0 = min(bx0, minX[comp]); bx1 = max(bx1, maxX[comp])
+                        by0 = min(by0, minY[comp]); by1 = max(by1, maxY[comp])
+                    }
+                    bx0 = (bx0 - STATIC_GROW).coerceAtLeast(x0)
+                    bx1 = (bx1 + STATIC_GROW).coerceAtMost(x1 - 1)
+                    by0 = (by0 - STATIC_GROW).coerceAtLeast(y0)
+                    by1 = (by1 + STATIC_GROW).coerceAtMost(y1 - 1)
+                    val mask = BooleanArray(px)
+                    var covered = 0
+                    for (y in by0..by1) for (x in bx0..bx1) {
+                        mask[y * w + x] = true; covered++
+                    }
+                    repeat(2) { dilate(mask, w, h) }
+                    // Guard: a detection that swallows the zone (busy background, logo over
+                    // detailed content) is not a localisation - erase the circled zone instead.
+                    if (covered in 1..(STATIC_MAX_COVER * innerCount).toInt()) {
+                        return buildStaticLayer(mask, frames, w, h, motion, px)
+                    }
+                }
+            }
+        }
+        // Fallback: the whole inner zone.
+        val mask = BooleanArray(px) { i ->
+            val x = i % w
+            val y = i / w
+            x >= x0 && x < x1 && y >= y0 && y < y1
+        }
+        return buildStaticLayer(mask, frames, w, h, motion, px)
+    }
+
+    private fun buildStaticLayer(mask: BooleanArray, frames: List<ByteArray>, w: Int, h: Int, motion: Float, px: Int): Layer? {
+        if (mask.none { it }) return null
+        if (DEBUG) {
+            var x0 = w; var x1 = 0; var y0 = h; var y1 = 0
+            for (i in 0 until px) if (mask[i]) {
+                val x = i % w; val y = i / w
+                if (x < x0) x0 = x; if (x > x1) x1 = x
+                if (y < y0) y0 = y; if (y > y1) y1 = y
+            }
+            println("buildStaticLayer: mask bbox x$x0-$x1 y$y0-$y1 count=${mask.count { it }}")
+        }
+        // The logo is static (the picture is), so its median appearance is a valid tracking
+        // template should it still be re-rendered a few pixels away between clips.
+        val template = OpaqueTemplate.build(frames, w, h, mask, mask, TEMPLATE_MAX_MAD, TEMPLATE_MIN_PIXELS)
+        var count = 0
+        for (i in 0 until px) if (mask[i]) count++
+        val stats = Stats(frames.size, frames.size, motion, count, 0, count, 1, "static-fill")
+        return Layer(w, h, FloatArray(px * 3), FloatArray(px), mask, fillDistances(mask, w, h), stats, template)
+    }
+
+    /** One full analysis pass over the given frames (present-frame selection included). */
+    private fun analyzePass(inputFrames: List<ByteArray>, w: Int, h: Int): Layer? {
+        val px = w * h
+        val empty = { reason: String, motion: Float, present: Int ->
+            Layer(w, h, FloatArray(px * 3), FloatArray(px), BooleanArray(px), ByteArray(px * 4),
+                Stats(inputFrames.size, present, motion, 0, 0, 0, 0, reason))
+        }
+
+        // --- 0. which frames contain the logo? ----------------------------------------------
+        val presentIdx = selectPresentFrames(inputFrames, w, h)
+        val frames = presentIdx.map { inputFrames[it] }
+        val n = frames.size
+        if (n < MIN_PRESENT_FRAMES) return null
+
+        // --- temporal median / spread of the pixel values -----------------------------------
+        val median = FloatArray(px * 3)
+        val spread = FloatArray(px)
+        val tmp = FloatArray(n)
+        for (i in 0 until px) {
+            var s = 0f
+            for (c in 0 until 3) {
+                for (t in 0 until n) tmp[t] = v(frames[t], i * 3 + c)
+                val (m, mad) = medianMad(tmp, n)
+                median[i * 3 + c] = m
+                s += mad
+            }
+            spread[i] = s / 3f
+        }
+        // Motion measured on the ring around the zone (the logo never lives there): temporal
+        // spread of the pixels once each frame's global brightness is normalised, so that a still
+        // picture with exposure changes / fades is still recognised as still.
+        val ringIdx = ArrayList<Int>()
+        for (y in 0 until h) for (x in 0 until w) {
+            if (x < RING || x >= w - RING || y < RING || y >= h - RING) ringIdx.add(y * w + x)
+        }
+        // Per frame gain / offset of the ring w.r.t. the temporal median (exposure model).
+        val ringGain = FloatArray(n)
+        val ringOffset = FloatArray(n)
+        for (t in 0 until n) {
+            var sx = 0.0; var sy = 0.0; var sxx = 0.0; var sxy = 0.0
+            for (i in ringIdx) for (c in 0 until 3) {
+                val x = median[i * 3 + c].toDouble()
+                val y = v(frames[t], i * 3 + c).toDouble()
+                sx += x; sy += y; sxx += x * x; sxy += x * y
+            }
+            val cnt = 3.0 * ringIdx.size
+            val varX = sxx / cnt - (sx / cnt) * (sx / cnt)
+            val g = if (varX > 1e-5) ((sxy / cnt - (sx / cnt) * (sy / cnt)) / varX).coerceIn(0.3, 3.0) else 1.0
+            ringGain[t] = g.toFloat()
+            ringOffset[t] = ((sy - g * sx) / cnt).toFloat()
+        }
+        val ringValues = FloatArray(ringIdx.size)
+        val tmpRing = FloatArray(n)
+        ringIdx.forEachIndexed { k, i ->
+            var s = 0f
+            for (c in 0 until 3) {
+                for (t in 0 until n) tmpRing[t] = v(frames[t], i * 3 + c) - (ringGain[t] * median[i * 3 + c] + ringOffset[t])
+                s += medianMad(tmpRing, n).second
+            }
+            ringValues[k] = s / 3f
+        }
+        val motion = medianOf(ringValues, ringValues.size)
+        if (motion < MIN_MOTION) return empty("static", motion, n)
+
+        // --- 1. consistent median gradients -> divergence -----------------------------------
+        val gx = FloatArray(px * 3)   // gradient between (x, y) and (x + 1, y)
+        val gy = FloatArray(px * 3)   // gradient between (x, y) and (x, y + 1)
+        consistentGradients(frames, w, h, n, dx = 1, dy = 0, out = gx, inv = null)
+        consistentGradients(frames, w, h, n, dx = 0, dy = 1, out = gy, inv = null)
+
+        // --- 2. Poisson integration per channel -> relief V ---------------------------------
+        val relief = FloatArray(px * 3)
+        val f = FloatArray(px)
+        for (c in 0 until 3) {
+            for (y in 0 until h) for (x in 0 until w) {
+                val i = y * w + x
+                var d = gx[i * 3 + c] + gy[i * 3 + c]
+                if (x > 0) d -= gx[(i - 1) * 3 + c]
+                if (y > 0) d -= gy[(i - w) * 3 + c]
+                f[i] = d
+            }
+            val sol = PoissonSolver.solve(f, w, h)
+            for (i in 0 until px) relief[i * 3 + c] = sol[i]
+        }
+        val reliefMax = FloatArray(px) { i -> max(abs(relief[i * 3]), max(abs(relief[i * 3 + 1]), abs(relief[i * 3 + 2]))) }
+
+        // --- mask -------------------------------------------------------------------------
+        // A slowly moving background leaves a smooth, elevated plateau in the relief (its
+        // gradients stay "consistent" for the whole analysis window); a real watermark has
+        // sharp edges. Require local contrast in the relief, then fill the enclosed interiors
+        // (glyph cores, thick logo centres) so only genuinely flat plateaus are rejected.
+        val reliefRange = localRange(reliefMax, w, h, 2)
+        var tauRelief = TAU_RELIEF
+        // Guard against a barely moving background: its own texture survives the temporal
+        // median and inflates the relief over the WHOLE zone, which would flag the entire
+        // picture as watermark. When that happens, only the strongest structures are kept
+        // (a real watermark is the high-relief outlier, not the floor).
+        run {
+            var inner = 0
+            var above = 0
+            for (y in RING until h - RING) for (x in RING until w - RING) {
+                inner++
+                if (reliefMax[y * w + x] > tauRelief) above++
+            }
+            if (inner > 0 && above > inner * OVERMASK_FRACTION) {
+                val values = ArrayList<Float>(inner)
+                for (y in RING until h - RING) for (x in RING until w - RING) values.add(reliefMax[y * w + x])
+                values.sort()
+                tauRelief = max(tauRelief, percentileOfSorted(values, OVERMASK_KEEP))
+            }
+        }
+        val mask = BooleanArray(px) { reliefMax[it] > tauRelief && reliefRange[it] > TAU_RELIEF_HF }
+        var labels = Components.label(mask, w, h)
+        Components.removeSmall(mask, labels, MIN_COMPONENT)
+        fillHoles(mask, w, h)
+        repeat(DILATE) { dilate(mask, w, h) }
+        for (y in 0 until h) for (x in 0 until w) {
+            if (x < RING || x >= w - RING || y < RING || y >= h - RING) mask[y * w + x] = false
+        }
+        if (mask.none { it }) return empty("no watermark", motion, n)
+        labels = Components.label(mask, w, h)
+        val componentCount = labels.max()
+
+        // --- background statistics under the logo (harmonic interpolation) --------------------
+        val background = HarmonicFill.fill(median, 3, mask, w, h)
+        val spreadRef = HarmonicFill.fill(spread, 1, mask, w, h)
+        // Per-pixel opacity from the variance cue (valid where the background really varies),
+        // smoothed with a 3x3 median inside the mask to kill the estimation noise.
+        val aVarRaw = FloatArray(px) { p ->
+            if (mask[p] && spreadRef[p] > 0.02f) (1f - spread[p] / spreadRef[p]).coerceIn(0f, 1f) else -1f
+        }
+        val aVar = medianFilterMasked(aVarRaw, w, h)
+
+        // --- 3. per component opacity + colour, per pixel refinement -----------------------
+        val alpha = FloatArray(px)
+        val colour = FloatArray(px * 3)
+        val fill = BooleanArray(px)
+        val compColours = Array(componentCount + 1) { FloatArray(3) }
+        val compAlphas = FloatArray(componentCount + 1)
+        for (comp in 1..componentCount) {
+            val members = ArrayList<Int>()
+            for (i in 0 until px) if (labels[i] == comp) members.add(i)
+            // Core = the strongest part of the relief (avoids anti-aliased edges).
+            val strengths = FloatArray(members.size) { reliefMax[members[it]] }
+            val p90 = percentile(strengths, 0.9f)
+            val core = members.filter { reliefMax[it] >= 0.5f * p90 }.ifEmpty { members }
+            val sRef = medianOf(FloatArray(core.size) { spreadRef[core[it]] }, core.size)
+            var aComp = if (sRef > 0.02f) {
+                medianOf(FloatArray(core.size) { i -> val p = core[i]; (1f - spread[p] / max(spreadRef[p], 1e-4f)).coerceIn(0f, 1f) }, core.size)
+            } else {
+                // Regression cue: J~ = a*W + (1-a)*I~ -> slope of J~ vs I~ is (1 - a).
+                regressionAlpha(median, background, core)
+            }
+            aComp = aComp.coerceIn(0.05f, 1f)
+            // Logo colour: W = I~ + V / a (median over the core, per channel).
+            val compColour = FloatArray(3) { c ->
+                val vals = FloatArray(core.size) { i -> val p = core[i]; (background[p * 3 + c] + relief[p * 3 + c] / aComp) }
+                medianOf(vals, vals.size).coerceIn(0f, 1f)
+            }
+            compColour.copyInto(compColours[comp])
+            compAlphas[comp] = aComp
+            for (p in members) {
+                // Projection of the relief on (W - I~): coverage of this pixel by the logo.
+                var num = 0f
+                var den = 0f
+                for (c in 0 until 3) {
+                    val d = compColour[c] - background[p * 3 + c]
+                    num += relief[p * 3 + c] * d
+                    den += d * d
+                }
+                val aProj = if (den > 0.01f) (num / den).coerceIn(0f, 1f) else aComp
+                // Blend with the variance cue where it is reliable.
+                val wVar = ((spreadRef[p] - 0.02f) / 0.05f).coerceIn(0f, 1f)
+                val ap = if (aVar[p] >= 0f && wVar > 0f) (aProj + wVar * aVar[p]) / (1f + wVar) else aProj
+                val a = ap.coerceIn(0f, min(1f, aComp + 0.15f))
+                // Only the pixels that are REALLY opaque are filled: a logo with an opaque
+                // core (aComp ~ 1) still has anti-aliased edges whose semi-transparent pixels
+                // are invertible - filling them would blur the whole glyph contour.
+                if (a > MAX_INVERT_ALPHA) {
+                    fill[p] = true
+                } else {
+                    alpha[p] = a
+                    for (c in 0 until 3) colour[p * 3 + c] = (relief[p * 3 + c] + a * background[p * 3 + c]).coerceIn(0f, 1f)
+                }
+            }
+        }
+
+        // --- 3b. soft edge band -----------------------------------------------------------------
+        // The fixed thresholds of steps 1-2 mishandle the anti-aliased (or compression-softened)
+        // tails of the logo: their ramp is under-estimated while the relief bleeds between close
+        // glyphs — either way a faint, blurred copy of the text survives the inversion as a halo.
+        // The faint pixels are re-estimated directly from the data instead.
+        extendSoftEdges(
+            w, h, median, mask, labels, reliefMax,
+            alpha, colour, fill, compColours, compAlphas, componentCount,
+        )
+
+        // --- 3c. component re-calibration by temporal regression -------------------------------
+        // Both the variance cue of step 3 and the projection of step 3b lean on an interpolated
+        // background, which is biased wherever the logo is dense (thin glyphs close together) —
+        // exactly where a faint text residue is most visible. The opacity also follows from how
+        // much a pixel is DAMPED against a neighbouring clean pixel: J_p = a*W + (1-a)*I_p and
+        // I_p ~ gamma * I_r locally, so the slope of J_p against J_r is (1-a)*gamma. Gamma is
+        // measured on clean pairs at the same distance, and the slope needs no background at all.
+        refineAlphaByRegression(frames, w, h, n, labels, componentCount, mask, alpha, colour, fill)
+
+        // --- 4. ghost removal on the inverted frames ----------------------------------------------
+        // The thresholded gradients of step 1 miss the faint tails of the logo edges, so c is
+        // slightly under-estimated and a pale copy of the logo survives the inversion. The median
+        // gradients of the INVERTED frames inside the mask integrate to exactly that ghost: fold
+        // it back into c (a few passes, the estimate converges quickly). When the ghost demands
+        // more colour than the opacity allows (c = a*W <= a), it is a that was under-estimated:
+        // let it grow, else the correction saturates and the residue stays.
+        val invert = BooleanArray(px) { mask[it] && !fill[it] }
+        if (invert.any { it }) repeat(REFINE_PASSES) { removeGhost(frames, w, h, n, colour, alpha, fill, invert) }
+
+        // --- validation: does the inversion really remove the consistent gradients? ------------
+        val energyBefore = consistentEnergy(frames, w, h, n, null)
+        val energyAfter = consistentEnergy(frames, w, h, n, Inversion(colour, alpha, fill))
+        for (comp in 1..componentCount) {
+            var e0 = 0f
+            var e1 = 0f
+            for (i in 0 until px) if (labels[i] == comp && !fill[i]) { e0 += energyBefore[i]; e1 += energyAfter[i] }
+            if (e0 > 0f && e1 > 0.6f * e0) {
+                for (i in 0 until px) if (labels[i] == comp) fill[i] = true
+            }
+        }
+        for (i in 0 until px) if (fill[i]) { alpha[i] = 0f; colour[i * 3] = 0f; colour[i * 3 + 1] = 0f; colour[i * 3 + 2] = 0f }
+
+        val distances = fillDistances(fill, w, h)
+        val maskCount = mask.count { it }
+        val filled = fill.count { it }
+        val invertedCount = alpha.count { it > 0f }
+        return Layer(w, h, colour, alpha, fill, distances,
+            Stats(inputFrames.size, n, motion, maskCount, invertedCount, filled, componentCount, "ok"))
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Indices of the frames that contain the logo. The mean gradient over all frames shows the
+     * logo (background gradients average out); each frame is then scored against it and the
+     * scores are split at their largest gap when they are clearly bimodal.
+     */
+    fun selectPresentFrames(frames: List<ByteArray>, w: Int, h: Int): List<Int> {
+        val all = frames.indices.toList()
+        val total = frames.size
+        if (total < MIN_FRAMES + 2) return all
+        val px = w * h
+        // Per-pixel MEDIAN gradient over all frames: the logo's edges survive it (present in at
+        // least half of the frames), the picture's edges do not (unless the picture is static,
+        // in which case every frame scores alike and nothing is excluded).
+        val medX = FloatArray(px * 3)
+        val medY = FloatArray(px * 3)
+        val tmp = FloatArray(total)
+        for (y in 0 until h) for (x in 0 until w) {
+            val i = y * w + x
+            for (c in 0 until 3) {
+                if (x + 1 < w) {
+                    for (t in 0 until total) tmp[t] = v(frames[t], (i + 1) * 3 + c) - v(frames[t], i * 3 + c)
+                    medX[i * 3 + c] = medianOf(tmp, total)
+                }
+                if (y + 1 < h) {
+                    for (t in 0 until total) tmp[t] = v(frames[t], (i + w) * 3 + c) - v(frames[t], i * 3 + c)
+                    medY[i * 3 + c] = medianOf(tmp, total)
+                }
+            }
+        }
+        val magnitudes = FloatArray(px * 2)
+        for (i in 0 until px) {
+            magnitudes[i] = max(abs(medX[i * 3]), max(abs(medX[i * 3 + 1]), abs(medX[i * 3 + 2])))
+            magnitudes[px + i] = max(abs(medY[i * 3]), max(abs(medY[i * 3 + 1]), abs(medY[i * 3 + 2])))
+        }
+        val threshold = max(percentile(magnitudes, 0.98f), 0.02f)
+        val tapsX = ArrayList<Int>()
+        val tapsY = ArrayList<Int>()
+        var den = 0.0
+        for (i in 0 until px) {
+            if (magnitudes[i] >= threshold) { tapsX.add(i); for (c in 0 until 3) den += medX[i * 3 + c] * medX[i * 3 + c] }
+            if (magnitudes[px + i] >= threshold) { tapsY.add(i); for (c in 0 until 3) den += medY[i * 3 + c] * medY[i * 3 + c] }
+        }
+        if (den <= 1e-6 || tapsX.size + tapsY.size < 20) return all
+        // Score of each frame = regression of its gradients on the median ones (1 = logo there).
+        val scores = FloatArray(total)
+        for (t in 0 until total) {
+            val fr = frames[t]
+            var num = 0.0
+            for (i in tapsX) for (c in 0 until 3) num += (v(fr, (i + 1) * 3 + c) - v(fr, i * 3 + c)) * medX[i * 3 + c]
+            for (i in tapsY) for (c in 0 until 3) num += (v(fr, (i + w) * 3 + c) - v(fr, i * 3 + c)) * medY[i * 3 + c]
+            scores[t] = (num / den).toFloat()
+        }
+        val sorted = scores.copyOf().also { it.sort() }
+        val top = sorted.last()
+        if (top <= 0f) return all
+        // Split at the largest gap of the sorted scores, when clearly bimodal.
+        var bestGap = 0f
+        var bestK = -1
+        for (k in 0 until total - 1) {
+            val gap = sorted[k + 1] - sorted[k]
+            if (gap > bestGap && total - 1 - k >= MIN_PRESENT_FRAMES) { bestGap = gap; bestK = k }
+        }
+        if (bestK < 0 || bestGap < 0.4f * top) return all
+        val cut = sorted[bestK]
+        // The low cluster must really look like "no logo" (scores near zero): a logo that is
+        // always there but sits on backgrounds of varying brightness spreads its scores
+        // continuously and must not be split (that would enable per-frame gating for nothing).
+        if (cut > 0.3f * top) return all
+        return all.filter { scores[it] > cut }
+    }
+
+    /** Max-minus-min of [v] in a (2r+1)x(2r+1) window (local contrast, edge aware). */
+    private fun localRange(v: FloatArray, w: Int, h: Int, r: Int): FloatArray {
+        val out = FloatArray(v.size)
+        for (y in 0 until h) {
+            val from = max(0, y - r)
+            val to = min(h - 1, y + r)
+            for (x in 0 until w) {
+                var mn = Float.MAX_VALUE
+                var mx = -Float.MAX_VALUE
+                for (yy in from..to) for (xx in max(0, x - r)..min(w - 1, x + r)) {
+                    val s = v[yy * w + xx]
+                    if (s < mn) mn = s
+                    if (s > mx) mx = s
+                }
+                out[y * w + x] = mx - mn
+            }
+        }
+        return out
+    }
+
+    /** Adds to [mask] the pixels that [mask] fully encloses (glyph cores, logo centres). */
+    private fun fillHoles(mask: BooleanArray, w: Int, h: Int) {
+        val visited = BooleanArray(mask.size)
+        val stack = IntArray(mask.size)
+        var sp = 0
+        fun push(i: Int) {
+            if (!visited[i] && !mask[i]) { visited[i] = true; stack[sp++] = i }
+        }
+        for (x in 0 until w) { push(x); push((h - 1) * w + x) }
+        for (y in 0 until h) { push(y * w); push(y * w + w - 1) }
+        while (sp > 0) {
+            val i = stack[--sp]
+            val x = i % w
+            val y = i / w
+            if (x > 0) push(i - 1)
+            if (x < w - 1) push(i + 1)
+            if (y > 0) push(i - w)
+            if (y < h - 1) push(i + w)
+        }
+        for (i in mask.indices) if (!visited[i]) mask[i] = true
+    }
+
+    /** Median of the per-frame gradients, kept only when consistent across frames. */
+    private fun consistentGradients(
+        frames: List<ByteArray>, w: Int, h: Int, n: Int, dx: Int, dy: Int, out: FloatArray, inv: Inversion?,
+    ) {
+        val tmp = FloatArray(n)
+        val med = FloatArray(3)
+        for (y in 0 until h - dy) for (x in 0 until w - dx) {
+            val i = y * w + x
+            val j = (y + dy) * w + (x + dx)
+            var maxAbs = 0f
+            var madSum = 0f
+            for (c in 0 until 3) {
+                for (t in 0 until n) tmp[t] = sample(frames[t], j, c, inv) - sample(frames[t], i, c, inv)
+                val (m, mad) = medianMad(tmp, n)
+                med[c] = m
+                maxAbs = max(maxAbs, abs(m))
+                madSum += mad
+            }
+            val consistent = maxAbs > TAU_GRADIENT && maxAbs > K_CONSISTENT * (madSum / 3f)
+            for (c in 0 until 3) out[i * 3 + c] = if (consistent) med[c] else 0f
+        }
+    }
+
+    @Suppress("NOTHING_TO_INLINE")
+    private inline fun sample(frame: ByteArray, p: Int, c: Int, inv: Inversion?): Float {
+        val value = v(frame, p * 3 + c)
+        if (inv == null) return value
+        if (inv.fill[p]) return value
+        return ((value - inv.colour[p * 3 + c]) / (1f - min(inv.alpha[p], MAX_INVERT_ALPHA))).coerceIn(0f, 1f)
+    }
+
+    /** Per-pixel energy of the consistent gradients (used to validate the inversion). */
+    private fun consistentEnergy(frames: List<ByteArray>, w: Int, h: Int, n: Int, inv: Inversion?): FloatArray {
+        val px = w * h
+        val gx = FloatArray(px * 3)
+        val gy = FloatArray(px * 3)
+        consistentGradients(frames, w, h, n, 1, 0, gx, inv)
+        consistentGradients(frames, w, h, n, 0, 1, gy, inv)
+        val e = FloatArray(px)
+        for (y in 0 until h) for (x in 0 until w) {
+            val i = y * w + x
+            val ex = gx[i * 3] * gx[i * 3] + gx[i * 3 + 1] * gx[i * 3 + 1] + gx[i * 3 + 2] * gx[i * 3 + 2]
+            val ey = gy[i * 3] * gy[i * 3] + gy[i * 3 + 1] * gy[i * 3 + 1] + gy[i * 3 + 2] * gy[i * 3 + 2]
+            e[i] += ex + ey
+            if (x + 1 < w) e[i + 1] += ex
+            if (y + 1 < h) e[i + w] += ey
+        }
+        return e
+    }
+
+    /** Step 4: integrates the median residual gradients of the inverted frames into [colour] /
+     * [alpha] (they are tied by `c = a*W`). */
+    private fun removeGhost(
+        frames: List<ByteArray>, w: Int, h: Int, n: Int,
+        colour: FloatArray, alpha: FloatArray, fill: BooleanArray, invert: BooleanArray,
+    ) {
+        val px = w * h
+        val gxr = FloatArray(px * 3)
+        val gyr = FloatArray(px * 3)
+        val inv = Inversion(colour, alpha, fill)
+        medianGradients(frames, w, h, n, 1, 0, gxr, inv, invert)
+        medianGradients(frames, w, h, n, 0, 1, gyr, inv, invert)
+        val ghosts = Array(3) { c ->
+            val div = FloatArray(px)
+            for (y in 0 until h) for (x in 0 until w) {
+                val i = y * w + x
+                var d = gxr[i * 3 + c] + gyr[i * 3 + c]
+                if (x > 0) d -= gxr[(i - 1) * 3 + c]
+                if (y > 0) d -= gyr[(i - w) * 3 + c]
+                div[i] = d
+            }
+            PoissonMasked.solve(div, invert, w, h)
+        }
+        for (i in 0 until px) if (invert[i]) {
+            val a = min(alpha[i], MAX_INVERT_ALPHA)
+            // What the ghost says the colour should be, per channel.
+            var maxTarget = 0f
+            for (c in 0 until 3) maxTarget = max(maxTarget, colour[i * 3 + c] + REFINE_GAIN * ghosts[c][i] * (1f - a))
+            var newA = alpha[i]
+            // c = a*W never exceeds a (W <= 1): when the correction wants more colour than the
+            // opacity allows, the opacity itself was under-estimated. Grow it (bounded) so the
+            // colour can follow, instead of saturating at a + 0.02 and leaving a pale logo.
+            if (maxTarget > newA + 0.03f && newA < MAX_INVERT_ALPHA - 0.01f) {
+                newA = min(MAX_INVERT_ALPHA, newA + REFINE_GAIN * (maxTarget - 0.02f - newA))
+            }
+            alpha[i] = newA
+            for (c in 0 until 3) {
+                val target = colour[i * 3 + c] + REFINE_GAIN * ghosts[c][i] * (1f - min(newA, MAX_INVERT_ALPHA))
+                colour[i * 3 + c] = target.coerceIn(0f, min(1f, newA + 0.02f))
+            }
+        }
+    }
+
+    /**
+     * Median of the per-frame gradients for taps touching [where], kept when statistically
+     * significant (larger than twice the standard error of the median, ~1.25 sigma / sqrt(n)),
+     * so that the picture's own gradients, which average out, are not mistaken for the ghost.
+     */
+    private fun medianGradients(
+        frames: List<ByteArray>, w: Int, h: Int, n: Int, dx: Int, dy: Int, out: FloatArray,
+        inv: Inversion?, where: BooleanArray,
+    ) {
+        out.fill(0f)
+        val tmp = FloatArray(n)
+        val med = FloatArray(3)
+        val significance = 2f * 1.25f / kotlin.math.sqrt(n.toFloat())
+        for (y in 0 until h - dy) for (x in 0 until w - dx) {
+            val i = y * w + x
+            val j = (y + dy) * w + (x + dx)
+            if (!where[i] && !where[j]) continue
+            var maxAbs = 0f
+            var madSum = 0f
+            for (c in 0 until 3) {
+                for (t in 0 until n) tmp[t] = sample(frames[t], j, c, inv) - sample(frames[t], i, c, inv)
+                val (m, mad) = medianMad(tmp, n)
+                med[c] = m
+                maxAbs = max(maxAbs, abs(m))
+                madSum += mad
+            }
+            if (maxAbs > significance * (madSum / 3f)) for (c in 0 until 3) out[i * 3 + c] = med[c]
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Soft edge band (step 3b)
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Step 3b: re-estimates the opacity of the faint parts of the logo directly from the data.
+     * The relief of step 2 is a Poisson integral of thresholded gradients: on anti-aliased or
+     * compression-softened glyph edges its taps are cut (under-estimated ramp) while between
+     * close glyphs it bleeds over clean pixels (over-estimated) — either way a pale, blurred
+     * copy of the text survives the inversion. Here the faint pixels — those of the mask whose
+     * relief is weak, plus a thin band around it — get their opacity from the projection of
+     * `(temporal median - interpolated background)` on the component colour, which is unbiased
+     * for thin features; pixels that turn out to hold no logo at all are zeroed out instead of
+     * being over-inverted.
+     */
+    private fun extendSoftEdges(
+        w: Int, h: Int, median: FloatArray,
+        mask: BooleanArray, labels: IntArray, reliefMax: FloatArray,
+        alpha: FloatArray, colour: FloatArray, fill: BooleanArray,
+        compColours: Array<FloatArray>, compAlphas: FloatArray, componentCount: Int,
+    ) {
+        if (componentCount == 0) return
+        val px = w * h
+
+        // Outside band: pixels within EDGE_BAND of the mask (BFS from the mask, each carrying
+        // the label of the mask pixel it comes from).
+        val bandLabel = IntArray(px) // 0 = not reached, else the label of the nearest mask pixel
+        val bandDist = IntArray(px)  // 0 = not reached, else the BFS distance to the mask
+        var frontier = IntArray(px)
+        var frontierCount = 0
+        for (i in 0 until px) if (mask[i]) frontier[frontierCount++] = i
+        for (step in 1..EDGE_BAND) {
+            val next = ArrayList<Int>()
+            for (k in 0 until frontierCount) {
+                val i = frontier[k]
+                val x = i % w
+                val y = i / w
+                val l = if (mask[i]) labels[i] else bandLabel[i]
+                if (l <= 0) continue
+                if (x > 0 && !mask[i - 1] && bandLabel[i - 1] == 0) { bandLabel[i - 1] = l; bandDist[i - 1] = step; next.add(i - 1) }
+                if (x < w - 1 && !mask[i + 1] && bandLabel[i + 1] == 0) { bandLabel[i + 1] = l; bandDist[i + 1] = step; next.add(i + 1) }
+                if (y > 0 && !mask[i - w] && bandLabel[i - w] == 0) { bandLabel[i - w] = l; bandDist[i - w] = step; next.add(i - w) }
+                if (y < h - 1 && !mask[i + w] && bandLabel[i + w] == 0) { bandLabel[i + w] = l; bandDist[i + w] = step; next.add(i + w) }
+            }
+            if (next.isEmpty()) break
+            frontier = next.toIntArray()
+            frontierCount = next.size
+        }
+
+        // Targets: weak-relief pixels of the mask (the truncated / bleeding estimate of the
+        // main pass) plus the outside band.
+        val targets = BooleanArray(px) { (mask[it] && reliefMax[it] < FRINGE_KEEP) || bandDist[it] in 1..EDGE_BAND }
+        if (!targets.any { it }) return
+
+        // Interpolated background under the mask AND the band (the observed median there still
+        // contains the faint logo).
+        val fillMask = BooleanArray(px) { mask[it] || bandDist[it] in 1..EDGE_BAND }
+        val bg = HarmonicFill.fill(median, 3, fillMask, w, h)
+
+        // Opacity by projection of the observed median on the logo colour direction.
+        val cand = FloatArray(px) { -1f }
+        for (i in 0 until px) if (targets[i]) {
+            val comp = if (mask[i]) labels[i] else bandLabel[i]
+            if (comp <= 0) continue
+            val cap = min(MAX_INVERT_ALPHA, compAlphas[comp] + 0.05f)
+            var num = 0f
+            var den = 0f
+            for (c in 0 until 3) {
+                val d = compColours[comp][c] - bg[i * 3 + c]
+                num += (median[i * 3 + c] - bg[i * 3 + c]) * d
+                den += d * d
+            }
+            val aData = if (den > 0.01f) (num / den).coerceIn(0f, cap) else -1f
+            cand[i] = if (aData >= EDGE_MIN_ALPHA) aData else -1f
+        }
+        // Isolated specks are dropped (the projection itself already rejects noise: it is not
+        // aligned with the logo colour direction, so it does not reach [EDGE_MIN_ALPHA]).
+        val accepted = BooleanArray(px) { targets[it] && cand[it] >= EDGE_MIN_ALPHA }
+        val accLabels = Components.label(accepted, w, h)
+        Components.removeSmall(accepted, accLabels, 3)
+
+        for (i in 0 until px) if (targets[i]) {
+            val comp = if (mask[i]) labels[i] else bandLabel[i]
+            if (comp <= 0) continue
+            if (accepted[i]) {
+                val a = cand[i]
+                if (mask[i]) {
+                    // Re-estimated faint pixel: replace the truncated estimate. A fill pixel
+                    // that turns out to be semi-transparent joins the inversion set instead;
+                    // one that stays near the opacity ceiling keeps being filled (inverting
+                    // there would only amplify noise).
+                    if (fill[i] && a >= MAX_INVERT_ALPHA - 0.05f) continue
+                    fill[i] = false
+                } else {
+                    mask[i] = true
+                    labels[i] = bandLabel[i]
+                }
+                alpha[i] = a
+                for (c in 0 until 3) colour[i * 3 + c] = (a * compColours[comp][c]).coerceIn(0f, min(1f, a + 0.02f))
+            } else if (mask[i] && !fill[i] && reliefMax[i] < FRINGE_KEEP) {
+                // No faint logo here: the weak relief was Poisson bleed between glyph parts.
+                // Zero it out instead of over-inverting clean pixels.
+                alpha[i] = 0f
+                colour[i * 3] = 0f
+                colour[i * 3 + 1] = 0f
+                colour[i * 3 + 2] = 0f
+            }
+        }
+    }
+
+    /**
+     * Step 3c: re-estimates the opacity from how much each pixel is DAMPED against neighbouring
+     * clean pixels. Both the variance cue of step 3 and the projection of step 3b lean on an
+     * interpolated background, biased wherever the logo is dense (thin glyphs close together) —
+     * exactly where a faint text residue is most visible. The damping needs no background at
+     * all: `J_p = a*W + (1-a)*I_p` and `I_p ~ gamma * I_r` locally, so the slope of J_p against
+     * J_r over time is `(1-a)*gamma`, and gamma is measured on clean pairs sharing the same
+     * offset vector (a moving texture does not correlate isotropically). With ~20 analysed
+     * frames a single pixel estimate is noisy, so it is averaged over up to five references and
+     * used in two bounded ways: one scaling factor per component (measured on its core) and a
+     * clamped per-pixel correction on the faint fringe, whose step 3b estimate is the most
+     * biased and whose residue is the visible one.
+     */
+    private fun refineAlphaByRegression(
+        frames: List<ByteArray>, w: Int, h: Int, n: Int,
+        labels: IntArray, componentCount: Int,
+        mask: BooleanArray, alpha: FloatArray, colour: FloatArray, fill: BooleanArray,
+    ) {
+        if (componentCount == 0 || n < REGRESS_MIN_FRAMES) return
+        val px = w * h
+        val clean = ArrayList<Int>()
+        for (i in 0 until px) if (!mask[i]) clean.add(i)
+        if (clean.size < 4 * REGRESS_MAX_DIST) return
+
+        // Correlation of clean pixel pairs per offset vector, computed on demand.
+        val gammaCache = HashMap<Long, FloatArray>()
+        fun gammaAt(dx: Int, dy: Int): FloatArray? {
+            val key = dx.toLong() * 65536L + dy
+            gammaCache[key]?.let { return it }
+            val rnd = Random(dx * 31 + dy * 7 + 5)
+            val samples = Array(3) { ArrayList<Float>() }
+            var tries = 0
+            var used = 0
+            while (used < REGRESS_GAMMA_SAMPLES * 2 && tries < REGRESS_GAMMA_SAMPLES * 20) {
+                tries++
+                val q = clean[rnd.nextInt(clean.size)]
+                val x2 = q % w + dx
+                val y2 = q / w + dy
+                if (x2 < 0 || y2 < 0 || x2 >= w || y2 >= h) continue
+                val q2 = y2 * w + x2
+                if (mask[q2]) continue
+                used++
+                for (c in 0 until 3) {
+                    var mx = 0.0; var my = 0.0; var sxx = 0.0; var syy = 0.0; var sxy = 0.0
+                    for (t in 0 until n) {
+                        val a = v(frames[t], q * 3 + c).toDouble()
+                        val b = v(frames[t], q2 * 3 + c).toDouble()
+                        mx += a; my += b; sxx += a * a; syy += b * b; sxy += a * b
+                    }
+                    mx /= n; my /= n
+                    val varA = sxx / n - mx * mx
+                    val varB = syy / n - my * my
+                    if (varA < REGRESS_MIN_VAR || varB < REGRESS_MIN_VAR) continue
+                    samples[c].add(((sxy / n - mx * my) / sqrt(varA * varB)).toFloat())
+                }
+            }
+            val out = FloatArray(3)
+            for (c in 0 until 3) {
+                val s = samples[c]
+                out[c] = if (s.size >= 4) medianOf(s.toFloatArray(), s.size).coerceIn(0f, 1f) else 0f
+            }
+            gammaCache[key] = out
+            return out
+        }
+
+        // Nearest clean pixels: BFS nearest plus the first clean one left / right / up / down.
+        val nearest = RegionRestorer.nearestCleanIndices(mask, w, h)
+        val nLeft = IntArray(px) { -1 }
+        val nRight = IntArray(px) { -1 }
+        val nUp = IntArray(px) { -1 }
+        val nDown = IntArray(px) { -1 }
+        for (y in 0 until h) {
+            var last = -1
+            for (x in 0 until w) { val i = y * w + x; if (!mask[i]) last = i else nLeft[i] = last }
+            last = -1
+            for (x in w - 1 downTo 0) { val i = y * w + x; if (!mask[i]) last = i else nRight[i] = last }
+        }
+        for (x in 0 until w) {
+            var last = -1
+            for (y in 0 until h) { val i = y * w + x; if (!mask[i]) last = i else nUp[i] = last }
+            last = -1
+            for (y in h - 1 downTo 0) { val i = y * w + x; if (!mask[i]) last = i else nDown[i] = last }
+        }
+
+        // Pass 1: per-pixel regression estimate, averaged over up to five clean references.
+        val aRegPx = FloatArray(px) { -1f }
+        for (p in 0 until px) {
+            if (!mask[p] || fill[p] || alpha[p] <= 0f) continue
+            var num = 0f
+            var den = 0f
+            for (r in intArrayOf(nLeft[p], nRight[p], nUp[p], nDown[p], nearest[p])) {
+                if (r < 0 || r == p) continue
+                val dx = (p % w) - (r % w)
+                val dy = (p / w) - (r / w)
+                if (dx * dx + dy * dy > REGRESS_MAX_DIST * REGRESS_MAX_DIST) continue
+                val gamma = gammaAt(dx, dy) ?: continue
+                for (c in 0 until 3) {
+                    val g = gamma[c]
+                    if (g < REGRESS_MIN_GAMMA) continue
+                    var sx = 0.0; var sy = 0.0; var sxx = 0.0; var sxy = 0.0
+                    for (t in 0 until n) {
+                        val x = v(frames[t], r * 3 + c).toDouble()
+                        val y = v(frames[t], p * 3 + c).toDouble()
+                        sx += x; sy += y; sxx += x * x; sxy += x * y
+                    }
+                    val varX = sxx / n - (sx / n) * (sx / n)
+                    if (varX < REGRESS_MIN_VAR) continue
+                    val slope = ((sxy / n - (sx / n) * (sy / n)) / varX).toFloat()
+                    val aC = (1f - slope / g).coerceIn(0f, 1f)
+                    val weight = (g * g * varX).toFloat()
+                    num += aC * weight
+                    den += weight
+                }
+            }
+            if (den > 0f) aRegPx[p] = num / den
+        }
+
+        // Pass 2: one scaling factor per component, measured on its CORE (its strongest pixels
+        // — the faint fringe may hold false positives whose regression would drag the factor
+        // towards zero). Bounded and shrunk by the evidence.
+        val compFringe = FloatArray(componentCount + 1) { Float.MAX_VALUE }
+        for (comp in 1..componentCount) {
+            val alphas = ArrayList<Float>()
+            for (p in 0 until px) if (labels[p] == comp && !fill[p] && alpha[p] > 0f) alphas.add(alpha[p])
+            if (alphas.size < REGRESS_MIN_PIXELS) continue
+            val sorted = alphas.toFloatArray().also { it.sort() }
+            val p90 = sorted[(sorted.size * 0.9f).toInt().coerceIn(0, sorted.size - 1)]
+            val fringe = max(0.5f * p90, 0.12f)
+            compFringe[comp] = fringe
+            val ratios = ArrayList<Float>()
+            for (p in 0 until px) {
+                if (labels[p] != comp || fill[p] || alpha[p] <= 0f || aRegPx[p] < 0f) continue
+                if (alpha[p] < fringe) continue
+                ratios.add(aRegPx[p] / alpha[p])
+            }
+            if (ratios.size < REGRESS_MIN_PIXELS / 2) continue
+            val ratio = medianOf(ratios.toFloatArray(), ratios.size)
+            val shrink = ratios.size.toFloat() / (ratios.size + REGRESS_SHRINK_EVIDENCE)
+            val k = 1f + shrink * (ratio - 1f).coerceIn(-REGRESS_MAX_SCALE, REGRESS_MAX_SCALE)
+            if (abs(k - 1f) < 0.02f) continue
+            for (p in 0 until px) {
+                if (labels[p] != comp || fill[p] || alpha[p] <= 0f) continue
+                val a2 = (alpha[p] * k).coerceIn(0.02f, MAX_INVERT_ALPHA)
+                val ratioP = a2 / alpha[p]
+                for (c in 0 until 3) colour[p * 3 + c] = (colour[p * 3 + c] * ratioP).coerceIn(0f, a2 + 0.02f)
+                alpha[p] = a2
+            }
+        }
+
+        // Pass 3: clamped per-pixel correction on the faint fringe, whose step 3b estimate is
+        // the most polluted (the interpolated background crosses other glyphs around it).
+        for (p in 0 until px) {
+            if (!mask[p] || fill[p] || alpha[p] <= 0f || aRegPx[p] < 0f) continue
+            val comp = labels[p]
+            if (comp <= 0 || alpha[p] >= compFringe[comp]) continue
+            val aOld = alpha[p]
+            val aNew = (aOld + REGRESS_FRINGE_GAIN * (aRegPx[p] - aOld).coerceIn(-REGRESS_MAX_DRIFT, REGRESS_MAX_DRIFT))
+                .coerceIn(0.02f, MAX_INVERT_ALPHA)
+            if (abs(aNew - aOld) < 0.005f) continue
+            val ratio = aNew / aOld
+            for (c in 0 until 3) colour[p * 3 + c] = (colour[p * 3 + c] * ratio).coerceIn(0f, aNew + 0.02f)
+            alpha[p] = aNew
+        }
+    }
+
+    private fun regressionAlpha(median: FloatArray, background: FloatArray, core: List<Int>): Float {
+        var sx = 0.0; var sy = 0.0; var sxx = 0.0; var sxy = 0.0
+        var cnt = 0
+        for (p in core) for (c in 0 until 3) {
+            val x = background[p * 3 + c].toDouble()
+            val y = median[p * 3 + c].toDouble()
+            sx += x; sy += y; sxx += x * x; sxy += x * y; cnt++
+        }
+        if (cnt == 0) return 0.5f
+        val varX = sxx / cnt - (sx / cnt) * (sx / cnt)
+        if (varX < 0.003) return 0.5f
+        val slope = (sxy / cnt - (sx / cnt) * (sy / cnt)) / varX
+        return (1.0 - slope.coerceIn(0.0, 1.0)).toFloat()
+    }
+
+    private fun dilate(mask: BooleanArray, w: Int, h: Int) {
+        val src = mask.copyOf()
+        for (y in 0 until h) for (x in 0 until w) {
+            if (src[y * w + x]) continue
+            var any = false
+            for (dy in -1..1) for (dx in -1..1) {
+                val xx = x + dx; val yy = y + dy
+                if (xx in 0 until w && yy in 0 until h && src[yy * w + xx]) any = true
+            }
+            if (any) mask[y * w + x] = true
+        }
+    }
+
+    /** 3x3 median of the valid (>= 0) values; -1 where fewer than 3 valid neighbours exist. */
+    private fun medianFilterMasked(values: FloatArray, w: Int, h: Int): FloatArray {
+        val out = FloatArray(w * h) { -1f }
+        val buf = FloatArray(9)
+        for (y in 0 until h) for (x in 0 until w) {
+            if (values[y * w + x] < 0f) continue
+            var k = 0
+            for (dy in -1..1) for (dx in -1..1) {
+                val xx = x + dx; val yy = y + dy
+                if (xx in 0 until w && yy in 0 until h) {
+                    val s = values[yy * w + xx]
+                    if (s >= 0f) buf[k++] = s
+                }
+            }
+            if (k >= 3) out[y * w + x] = medianOf(buf, k)
+        }
+        return out
+    }
+
+    /** Distances from fill pixels to the nearest non-fill pixel: 4 bytes per pixel (L, R, T, B). */
+    fun fillDistances(fill: BooleanArray, w: Int, h: Int): ByteArray {
+        val out = ByteArray(w * h * 4)
+        for (y in 0 until h) {
+            var last = -1
+            for (x in 0 until w) {
+                val i = y * w + x
+                if (!fill[i]) last = x else out[i * 4] = clampByte(if (last >= 0) x - last else 255)
+            }
+            last = -1
+            for (x in w - 1 downTo 0) {
+                val i = y * w + x
+                if (!fill[i]) last = x else out[i * 4 + 1] = clampByte(if (last >= 0) last - x else 255)
+            }
+        }
+        for (x in 0 until w) {
+            var last = -1
+            for (y in 0 until h) {
+                val i = y * w + x
+                if (!fill[i]) last = y else out[i * 4 + 2] = clampByte(if (last >= 0) y - last else 255)
+            }
+            last = -1
+            for (y in h - 1 downTo 0) {
+                val i = y * w + x
+                if (!fill[i]) last = y else out[i * 4 + 3] = clampByte(if (last >= 0) last - y else 255)
+            }
+        }
+        return out
+    }
+
+    private fun clampByte(v: Int): Byte = min(v, 255).toByte()
+
+    /** Returns (median, MAD * 1.4826). Destroys the order of [values]. */
+    private fun medianMad(values: FloatArray, n: Int): Pair<Float, Float> {
+        val m = medianOf(values, n)
+        for (t in 0 until n) values[t] = abs(values[t] - m)
+        return m to medianOf(values, n) * 1.4826f
+    }
+
+    /** Median of the first [n] values (sorts a copy). */
+    fun medianOf(values: FloatArray, n: Int): Float {
+        if (n == 0) return 0f
+        val a = values.copyOf(n)
+        a.sort()
+        return if (n % 2 == 1) a[n / 2] else 0.5f * (a[n / 2 - 1] + a[n / 2])
+    }
+
+    private fun percentileOfSorted(values: ArrayList<Float>, q: Float): Float {
+        if (values.isEmpty()) return 0f
+        val i = (q * (values.size - 1)).toInt().coerceIn(0, values.size - 1)
+        return values[i]
+    }
+
+    private fun percentile(values: FloatArray, q: Float): Float {
+        if (values.isEmpty()) return 0f
+        val a = values.copyOf()
+        a.sort()
+        return a[((a.size - 1) * q).toInt().coerceIn(0, a.size - 1)]
+    }
+}
+
+/** Exact solver of `lap(u) = f` with u = 0 on the border, via a discrete sine transform (DST-I). */
+object PoissonSolver {
+
+    fun solve(f: FloatArray, w: Int, h: Int): FloatArray {
+        val rowBasis = basis(w)
+        val colBasis = basis(h)
+        val tmp = DoubleArray(w * h)
+        val coef = DoubleArray(w * h)
+        // Forward DST-I along rows then columns.
+        for (y in 0 until h) {
+            for (k in 0 until w) {
+                var s = 0.0
+                for (x in 0 until w) s += f[y * w + x] * rowBasis[k * w + x]
+                tmp[y * w + k] = s
+            }
+        }
+        for (k in 0 until w) {
+            for (l in 0 until h) {
+                var s = 0.0
+                for (y in 0 until h) s += tmp[y * w + k] * colBasis[l * h + y]
+                coef[l * w + k] = s
+            }
+        }
+        // Divide by the eigenvalues of the 5-point Laplacian.
+        for (l in 0 until h) for (k in 0 until w) {
+            val lambda = 2.0 * cos(Math.PI * (k + 1) / (w + 1)) + 2.0 * cos(Math.PI * (l + 1) / (h + 1)) - 4.0
+            coef[l * w + k] /= lambda
+        }
+        // Inverse (DST-I is its own inverse up to a factor 2/(n+1) per axis).
+        val scale = (2.0 / (w + 1)) * (2.0 / (h + 1))
+        for (l in 0 until h) {
+            for (x in 0 until w) {
+                var s = 0.0
+                for (k in 0 until w) s += coef[l * w + k] * rowBasis[k * w + x]
+                tmp[l * w + x] = s
+            }
+        }
+        val out = FloatArray(w * h)
+        for (x in 0 until w) {
+            for (y in 0 until h) {
+                var s = 0.0
+                for (l in 0 until h) s += tmp[l * w + x] * colBasis[l * h + y]
+                out[y * w + x] = (s * scale).toFloat()
+            }
+        }
+        return out
+    }
+
+    /** basis[k * n + x] = sin(pi (k+1)(x+1) / (n+1)) */
+    private fun basis(n: Int): DoubleArray {
+        val b = DoubleArray(n * n)
+        for (k in 0 until n) for (x in 0 until n) b[k * n + x] = sin(Math.PI * (k + 1) * (x + 1) / (n + 1))
+        return b
+    }
+}
+
+/** Solves `lap(u) = f` on the pixels of a mask, with u = 0 everywhere else (SOR, per pixel). */
+object PoissonMasked {
+
+    fun solve(f: FloatArray, mask: BooleanArray, w: Int, h: Int): FloatArray {
+        val out = FloatArray(w * h)
+        val idx = IntArray(w * h)
+        var count = 0
+        var minX = w; var maxX = -1; var minY = h; var maxY = -1
+        for (y in 0 until h) for (x in 0 until w) if (mask[y * w + x]) {
+            idx[count++] = y * w + x
+            minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
+        }
+        if (count == 0) return out
+        val extent = max(maxX - minX + 1, maxY - minY + 1)
+        val omega = (2.0 / (1.0 + sin(Math.PI / (extent + 1)))).toFloat()
+        val iterations = min(extent * 3 + 60, 900)
+        for (it in 0 until iterations) {
+            val forward = it % 2 == 0
+            var maxDelta = 0f
+            for (kk in 0 until count) {
+                val k = if (forward) kk else count - 1 - kk
+                val i = idx[k]
+                val x = i % w; val y = i / w
+                var nb = 0f
+                if (x > 0) nb += out[i - 1]
+                if (x < w - 1) nb += out[i + 1]
+                if (y > 0) nb += out[i - w]
+                if (y < h - 1) nb += out[i + w]
+                val old = out[i]
+                val new = old + omega * (0.25f * (nb - f[i]) - old)
+                out[i] = new
+                maxDelta = max(maxDelta, abs(new - old))
+            }
+            if (maxDelta < 1e-5f) break
+        }
+        return out
+    }
+}
+
+/** Harmonic (Laplace) interpolation of the values under a mask from the values around it. */
+object HarmonicFill {
+
+    /** [data] has [channels] interleaved values per pixel. Returns a new array. */
+    fun fill(data: FloatArray, channels: Int, mask: BooleanArray, w: Int, h: Int): FloatArray {
+        val out = data.copyOf()
+        val idx = IntArray(w * h)
+        var count = 0
+        var minX = w; var maxX = -1; var minY = h; var maxY = -1
+        for (y in 0 until h) for (x in 0 until w) if (mask[y * w + x]) {
+            idx[count++] = y * w + x
+            minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
+        }
+        if (count == 0) return out
+        // Initial guess: mean of the known values.
+        val mean = FloatArray(channels)
+        var known = 0
+        for (i in 0 until w * h) if (!mask[i]) { for (c in 0 until channels) mean[c] += data[i * channels + c]; known++ }
+        if (known == 0) return out
+        for (c in 0 until channels) mean[c] /= known
+        for (k in 0 until count) for (c in 0 until channels) out[idx[k] * channels + c] = mean[c]
+        // Gauss-Seidel with over-relaxation, alternating sweep direction.
+        val extent = max(maxX - minX + 1, maxY - minY + 1)
+        val omega = (2.0 / (1.0 + sin(Math.PI / (extent + 1)))).toFloat()
+        val iterations = min(extent * 3 + 60, 900)
+        for (it in 0 until iterations) {
+            val forward = it % 2 == 0
+            var maxDelta = 0f
+            for (kk in 0 until count) {
+                val k = if (forward) kk else count - 1 - kk
+                val i = idx[k]
+                val x = i % w; val y = i / w
+                val l = if (x > 0) i - 1 else i
+                val r = if (x < w - 1) i + 1 else i
+                val u = if (y > 0) i - w else i
+                val d = if (y < h - 1) i + w else i
+                for (c in 0 until channels) {
+                    val nb = 0.25f * (out[l * channels + c] + out[r * channels + c] + out[u * channels + c] + out[d * channels + c])
+                    val old = out[i * channels + c]
+                    val new = old + omega * (nb - old)
+                    out[i * channels + c] = new
+                    maxDelta = max(maxDelta, abs(new - old))
+                }
+            }
+            if (maxDelta < 1e-4f) break
+        }
+        return out
+    }
+}
+
+/** 8-connected component labelling. */
+object Components {
+
+    /** Returns labels 1..n (0 = background). */
+    fun label(mask: BooleanArray, w: Int, h: Int): IntArray {
+        val labels = IntArray(w * h)
+        val stack = IntArray(w * h)
+        var next = 0
+        for (start in 0 until w * h) {
+            if (!mask[start] || labels[start] != 0) continue
+            next++
+            var sp = 0
+            stack[sp++] = start
+            labels[start] = next
+            while (sp > 0) {
+                val i = stack[--sp]
+                val x = i % w; val y = i / w
+                for (dy in -1..1) for (dx in -1..1) {
+                    val xx = x + dx; val yy = y + dy
+                    if (xx !in 0 until w || yy !in 0 until h) continue
+                    val j = yy * w + xx
+                    if (mask[j] && labels[j] == 0) { labels[j] = next; stack[sp++] = j }
+                }
+            }
+        }
+        return labels
+    }
+
+    fun removeSmall(mask: BooleanArray, labels: IntArray, minSize: Int) {
+        val n = labels.max()
+        if (n == 0) return
+        val sizes = IntArray(n + 1)
+        for (l in labels) sizes[l]++
+        for (i in labels.indices) if (labels[i] != 0 && sizes[labels[i]] < minSize) { mask[i] = false }
+    }
+}
+
+/**
+ * Appearance template of an opaque (fill-dominated) watermark, and the matcher that follows
+ * such a watermark from frame to frame.
+ *
+ * An opaque logo hides the picture completely: its pixels hold the logo's own colour, which is
+ * constant over time while the background moves. The template is the temporal median of the
+ * layer's *stable* fill pixels (median absolute deviation below a threshold, so anti-aliased
+ * or semi-transparent fringes and any background bleed-through are excluded), plus a one-pixel
+ * ring just outside the mask.
+ *
+ * The match score combines two cues:
+ *  - the *core agreement*: the frame, shifted by (dx, dy), must reproduce the template values
+ *    on the support pixels;
+ *  - the *ring contrast*: the pixels just outside the shifted mask must differ from the logo's
+ *    mean colour. Without it, a flat patch of background the colour of the logo (white logo
+ *    over a white sky) would match everywhere and the tracker would wander off.
+ * The score is ~1 at the true position (both cues strong), around 0 on plain background, and
+ * negative when the core actively disagrees. Brightness changes of the whole video are not
+ * corrected for: an opaque watermark is composited after any camera fade, so its colour does
+ * not follow the picture.
+ */
+object OpaqueTemplate {
+
+    private const val INV255 = 1f / 255f
+    /** Per-pixel, per-channel difference cap: outliers (edges, compression) must not dominate. */
+    private const val CAP = 0.25f
+    /** Mean capped difference that maps to a core agreement of 0. */
+    private const val TAU = 0.10f
+    /** Weight of the core agreement in the score (the rest is the ring contrast). */
+    private const val CORE_WEIGHT = 0.6f
+
+    class Template(
+        val width: Int,
+        val height: Int,
+        /** Median RGB (0..1) over the analysis frames; only [idx] entries are meaningful. */
+        val values: FloatArray,
+        /** Indices of the stable (truly opaque) fill pixels. */
+        val idx: IntArray,
+        /** Indices of the one-pixel ring just outside the whole watermark mask. */
+        val ring: IntArray,
+    ) {
+        val coreMean = FloatArray(3)
+
+        init {
+            for (k in idx.indices) for (c in 0 until 3) coreMean[c] += values[idx[k] * 3 + c]
+            if (idx.isNotEmpty()) for (c in 0 until 3) coreMean[c] /= idx.size
+        }
+    }
+
+    /**
+     * Builds the template of [fill] pixels that are stable across [frames] (temporal MAD at or
+     * below [maxMad]); [mask] (fill + inverted) only serves to place the contrast ring.
+     * Returns null when fewer than [minPixels] stable pixels remain.
+     */
+    fun build(
+        frames: List<ByteArray>,
+        w: Int,
+        h: Int,
+        mask: BooleanArray,
+        fill: BooleanArray,
+        maxMad: Float,
+        minPixels: Int,
+    ): Template? {
+        val px = w * h
+        val tmp = FloatArray(frames.size)
+        val values = FloatArray(px * 3)
+        val idx = ArrayList<Int>()
+        for (i in 0 until px) {
+            if (!fill[i]) continue
+            var mad = 0f
+            for (c in 0 until 3) {
+                for (t in frames.indices) tmp[t] = (frames[t][i * 3 + c].toInt() and 0xFF) * INV255
+                val (m, md) = medianMadOf(tmp, frames.size)
+                values[i * 3 + c] = m
+                if (md > mad) mad = md
+            }
+            if (mad <= maxMad) idx.add(i)
+        }
+        if (idx.size < minPixels) return null
+        // One-pixel ring just outside the mask.
+        val ringMask = BooleanArray(px)
+        for (y in 0 until h) for (x in 0 until w) {
+            val i = y * w + x
+            if (mask[i]) continue
+            var near = false
+            for (dy in -1..1) {
+                for (dx in -1..1) {
+                    val xx = x + dx
+                    val yy = y + dy
+                    if (xx in 0 until w && yy in 0 until h && mask[yy * w + xx]) near = true
+                }
+            }
+            ringMask[i] = near
+        }
+        val ring = IntArray(px)
+        var n = 0
+        for (i in 0 until px) if (ringMask[i]) ring[n++] = i
+        return Template(w, h, values, idx.toIntArray(), ring.copyOf(n))
+    }
+
+    /** Match score of [t] against the image [img] (RGB floats, same size) shifted by (dx, dy). */
+    fun match(t: Template, img: FloatArray, dx: Int, dy: Int): Float {
+        val w = t.width
+        val h = t.height
+        val px = w * h
+        var sad = 0f
+        var n = 0
+        for (k in t.idx.indices) {
+            val src = t.idx[k]
+            val x = src % w + dx
+            val y = src / w + dy
+            if (x < 0 || y < 0 || x >= w || y >= h) continue
+            val p = y * w + x
+            var diff = 0f
+            for (c in 0 until 3) diff += abs(img[p * 3 + c] - t.values[src * 3 + c])
+            sad += if (diff > 3f * CAP) CAP else diff * (1f / 3f)
+            n++
+        }
+        if (n < t.idx.size / 2) return -1f
+        val core = 1f - (sad / n) / TAU
+        if (t.ring.isEmpty()) return core.coerceIn(-1f, 1f)
+        var ring = 0f
+        var rn = 0
+        for (q in t.ring) {
+            val x = q % w + dx
+            val y = q / w + dy
+            if (x < 0 || y < 0 || x >= w || y >= h) continue
+            val p = y * w + x
+            var diff = 0f
+            for (c in 0 until 3) diff += abs(img[p * 3 + c] - t.coreMean[c])
+            ring += if (diff > 3f * CAP) CAP else diff * (1f / 3f)
+            rn++
+        }
+        if (rn < 8) return core.coerceIn(-1f, 1f)
+        val contrast = ((ring / rn) / TAU).coerceIn(0f, 1f)
+        return CORE_WEIGHT * core.coerceIn(-1f, 1f) + (1f - CORE_WEIGHT) * contrast
+    }
+
+    /** Unpacks an RGB byte frame into [out] as 0..1 floats. */
+    fun unpack(frame: ByteArray, out: FloatArray) {
+        for (i in 0 until out.size) out[i] = (frame[i].toInt() and 0xFF) * INV255
+    }
+
+    /** (median, MAD * 1.4826) of the first [n] entries; destroys their order. */
+    private fun medianMadOf(values: FloatArray, n: Int): Pair<Float, Float> {
+        val a = values.copyOf(n)
+        a.sort()
+        val m = if (n % 2 == 1) a[n / 2] else 0.5f * (a[n / 2 - 1] + a[n / 2])
+        for (t in 0 until n) values[t] = abs(values[t] - m)
+        val b = values.copyOf(n)
+        b.sort()
+        val md = if (n % 2 == 1) b[n / 2] else 0.5f * (b[n / 2 - 1] + b[n / 2])
+        return m to md * 1.4826f
+    }
+}
