@@ -114,6 +114,7 @@ jobs:
       - name: Build release APK
         run: >
           ./gradlew assembleRelease --no-daemon --stacktrace
+          -PrequireReleaseSigning=true
           -PversionName=${{ steps.ver.outputs.version }}
           -PversionCode=${{ steps.ver.outputs.code }}
 

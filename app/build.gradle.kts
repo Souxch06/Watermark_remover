@@ -13,8 +13,9 @@ plugins {
 //   1. `keystore.properties` at the repo root (git-ignored), written by CI or by the developer.
 //   2. `signing/keystore.properties` + the keystore it points at (git-ignored) – for a developer
 //      who keeps the key outside the repository and only the properties file here.
-//   3. Debug key: local `assembleRelease` only. `./gradlew` refuses to publish with it (see the
-//      check at the end of this file), and the release workflow verifies the certificate too.
+//   3. Debug key: `assembleRelease` still builds (CI needs it) but a *publish* is refused: run
+//      `./gradlew publishReleaseApk` or pass -PrequireReleaseSigning=true (the release workflow
+//      does). The workflow verifies the certificate too.
 val keystorePropsFile: File? = listOf(
     rootProject.file("keystore.properties"),
     rootProject.file("signing/keystore.properties"),
@@ -31,9 +32,6 @@ val keystoreFile: File? = keystoreProps.getProperty("storeFile")?.let { path ->
     }
 }
 val hasReleaseKeystore = keystoreFile?.exists() == true
-/** True for the tasks that produce something users install (APKs, bundles). */
-fun isPublishableBuildTask(taskName: String): Boolean =
-    taskName.startsWith("assemble") || taskName.startsWith("bundle") || taskName.startsWith("package")
 
 android {
     namespace = "com.souxch.watermarkremover"
@@ -163,18 +161,34 @@ dependencies {
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
 }
-// Guard rail: publishing an APK signed with the debug key is what breaks in-place updates (and what
-// the release workflow's certificate check catches on CI). Fail early instead, unless the developer
-// asks for it explicitly with -PallowDebugSigning=true.
+// Guard rail: an APK signed with the debug key cannot update an installed release, so it must never
+// be *published*. The check therefore only arms itself when a publish is actually requested — the
+// plain CI job (assembleDebug assembleRelease) must keep working without any keystore, otherwise
+// every build without secrets would turn red.
+//   * `publishReleaseApk`   : opt-in marker task, used by whoever wants the guard locally.
+//   * `-PrequireReleaseSigning=true` : arms it for one invocation (the release workflow does this).
+val requireReleaseSigning = project.hasProperty("requireReleaseSigning")
+
+/** Marker task: running `./gradlew publishReleaseApk` refuses to continue without a real keystore. */
+tasks.register("publishReleaseApk") {
+    group = "publishing"
+    description = "Checks that a release keystore is available before a release APK is published."
+    doFirst {
+        if (!hasReleaseKeystore) {
+            throw GradleException(
+                "No release keystore found: refusing to publish an APK that would be signed with the " +
+                    "debug key.\nProvide keystore.properties + the keystore file (see README).",
+            )
+        }
+    }
+}
+
 gradle.taskGraph.whenReady {
-    val debugSignedPublish = allTasks.any { task ->
-        task.project.path == ":app" && isPublishableBuildTask(task.name) && task.name.contains("Release")
-    } && !hasReleaseKeystore && !project.hasProperty("allowDebugSigning")
-    if (debugSignedPublish) {
+    val publishingRelease = requireReleaseSigning || allTasks.any { it.name == "publishReleaseApk" }
+    if (publishingRelease && !hasReleaseKeystore) {
         throw GradleException(
-            "No release keystore found: refusing to assemble a release APK with the debug key.\n" +
-                "Provide keystore.properties + the keystore file, or pass -PallowDebugSigning=true " +
-                "(for local testing only – such an APK cannot update an installed release).",
+            "No release keystore found: refusing to publish an APK signed with the debug key.\n" +
+                "Provide keystore.properties + the keystore file, or drop -PrequireReleaseSigning.",
         )
     }
 }
