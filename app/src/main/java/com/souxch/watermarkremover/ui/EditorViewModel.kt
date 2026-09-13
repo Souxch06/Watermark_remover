@@ -178,7 +178,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         }
         // Flou / pixellisation / recadrage n'utilisent pas le calque récupéré : lancer l'analyse
         // coûterait plusieurs secondes de CPU et de DÉCODAGE pour un résultat jamais lu.
-        if (key.editor.settings.method != RemovalMethod.INPAINT) {
+        if (key.method != RemovalMethod.INPAINT) {
             _state.update { it.copy(layer = null, analysisProgress = null, analysisFoundNothing = false) }
             return
         }
