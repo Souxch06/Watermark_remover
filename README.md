@@ -18,7 +18,9 @@ avant de proposer l'installation, et refuse tout téléchargement qui ne corresp
 ### Publier une version (mainteneurs)
 
 > 🔑 **La clé de signature a été publiée par erreur dans l'historique du dépôt et doit être
-> remplacée.** Guide pas-à-pas (aucune connaissance de Git requise) : **[TUTO-SECURITE.md](TUTO-SECURITE.md)**.
+> remplacée.** Guides pas-à-pas (aucune connaissance de Git requise) :
+> **[REPRISE.md](REPRISE.md)** (version courte, 10 min — clé déjà créée) ou
+> **[TUTO-SECURITE.md](TUTO-SECURITE.md)** (complet, 30 min — depuis le début).
 
 La clé de signature n'est **jamais** dans le dépôt : elle est fournie par les secrets GitHub
 (`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`). Sans eux, le workflow de

@@ -5,6 +5,9 @@
 
 ⏱️ Temps prévu : **20 à 30 minutes**. Aucune connaissance de Git n'est nécessaire, copiez-collez.
 
+> 👉 **La clé est déjà créée ?** Allez directement à **[REPRISE.md](REPRISE.md)**, la version
+> courte (10 min) qui ne traite que ce qui reste : vérifier les secrets puis nettoyer l'historique.
+
 ---
 
 ## 🤔 C'est quoi le problème ?
