@@ -106,8 +106,9 @@ class LibraryRepository(private val context: Context) {
     }
 
     suspend fun rename(item: ProcessedVideo, newName: String) = withContext(Dispatchers.IO) {
-        val clean = newName.trim().ifBlank { return@withContext }
-        val finalName = if (clean.endsWith(".mp4", ignoreCase = true)) clean else "$clean.mp4"
+        // User-typed name: sanitized as well, so it can never escape the album directory.
+        val clean = LibraryRepository.sanitize(newName.ifBlank { item.displayName })
+        val finalName = "$clean.mp4"
         runCatching {
             context.contentResolver.update(
                 Uri.parse(item.uri),
@@ -231,9 +232,24 @@ class LibraryRepository(private val context: Context) {
         private const val THUMB_MAX_DIM = 512
 
         /** `IMG_1234.mp4` -> `IMG_1234_sans_filigrane.mp4` (no double extension, never blank). */
-        fun buildDisplayName(sourceName: String): String {
-            val base = sourceName.substringBeforeLast('.').ifBlank { "video" }
-            return "${base}_sans_filigrane.mp4"
+        fun buildDisplayName(sourceName: String): String = "${sanitize(sourceName)}_sans_filigrane.mp4"
+
+        /**
+         * [sourceName] comes from the picker (a ContentProvider, i.e. another app): its result is
+         * used as a display name for MediaStore and as a file name in the album, so anything that
+         * could traverse out of the album (`/`, `\`, `..`), start/end a path oddly, or break the
+         * `.mp4` guarantee is dropped. HTML/control characters are removed as well.
+         */
+        internal fun sanitize(sourceName: String): String {
+            val base = sourceName
+                .substringBeforeLast('.', sourceName)
+                .replace(Regex("[\\\\/:*?\"<>|\u0000-\u001F]"), "")
+                .replace("..", "")
+                .trim()
+                .trimStart('.')
+                .take(96)
+                .trim()
+            return base.ifBlank { "video" }
         }
     }
 }

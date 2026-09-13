@@ -16,6 +16,8 @@ data class AppUpdate(
     /** Web page of the release (fallback if no APK asset was found). */
     val releaseUrl: String,
     val sizeBytes: Long,
+    /** SHA-256 of the APK asset, published as `<apk>.sha256` by the release workflow. */
+    val apkSha256: String? = null,
 )
 
 /**
@@ -26,6 +28,13 @@ data class AppUpdate(
  * - Any failure (offline, rate-limited, malformed) is swallowed: updates are best effort.
  */
 class UpdateChecker(context: Context, private val currentVersion: String) {
+
+    /**
+     * The update channel is pinned to the official GitHub releases of this repository. A release
+     * whose download URL points anywhere else is ignored: the APK gets install permission, so a
+     * spoofed URL (or a compromised API response) must not be able to hand over an arbitrary file.
+     */
+    private val allowedHost = "github.com"
 
     private val prefs: SharedPreferences = context.getSharedPreferences("updates", Context.MODE_PRIVATE)
 
@@ -50,7 +59,13 @@ class UpdateChecker(context: Context, private val currentVersion: String) {
     fun isDismissed(version: String): Boolean = prefs.getString(KEY_DISMISSED, null) == version
 
     private fun cached(): AppUpdate? = prefs.getString(KEY_CACHED, null)?.let { runCatching { fromJson(it) }.getOrNull() }
-        ?.takeIf { isNewer(it.version, currentVersion) }
+        ?.takeIf { isNewer(it.version, currentVersion) && isTrustedUrl(it.apkUrl) }
+
+    /** True for an https URL hosted where our own release assets live. */
+    private fun isTrustedUrl(url: String): Boolean = runCatching {
+        val parsed = URL(url)
+        parsed.protocol == "https" && parsed.host.equals(allowedHost, ignoreCase = true)
+    }.getOrDefault(false)
 
     private fun fetchLatest(): AppUpdate? {
         val conn = (URL(LATEST_RELEASE_API).openConnection() as HttpURLConnection).apply {
@@ -68,28 +83,57 @@ class UpdateChecker(context: Context, private val currentVersion: String) {
             val assets = json.optJSONArray("assets")
             var apkUrl: String? = null
             var size = 0L
+            var shaUrl: String? = null
             if (assets != null) {
                 for (i in 0 until assets.length()) {
                     val a = assets.getJSONObject(i)
-                    if (a.optString("name").endsWith(".apk", ignoreCase = true)) {
-                        apkUrl = a.optString("browser_download_url")
-                        size = a.optLong("size")
-                        break
+                    val name = a.optString("name")
+                    when {
+                        name.endsWith(".apk", ignoreCase = true) -> {
+                            val candidate = a.optString("browser_download_url")
+                            if (isTrustedUrl(candidate)) {
+                                apkUrl = candidate
+                                size = a.optLong("size")
+                            }
+                        }
+                        name.endsWith(".apk.sha256", ignoreCase = true) -> shaUrl = a.optString("browser_download_url")
                     }
                 }
             }
             val page = json.optString("html_url").ifBlank { RELEASES_PAGE }
-            return AppUpdate(version, apkUrl ?: page, page, size)
+            val sha = if (apkUrl != null && shaUrl != null && isTrustedUrl(shaUrl)) fetchSha256(shaUrl) else null
+            return AppUpdate(version, apkUrl ?: page, page, size, sha)
         } finally {
             conn.disconnect()
         }
     }
 
+    /** Reads the `<apk>.sha256` asset published next to the APK ("<hex> <file name>"). */
+    private fun fetchSha256(url: String): String? = runCatching {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 8_000
+            readTimeout = 8_000
+            setRequestProperty("User-Agent", "WatermarkRemover/$currentVersion")
+        }
+        try {
+            if (conn.responseCode != 200) return@runCatching null
+            conn.inputStream.bufferedReader().use { it.readText() }
+                .trim().substringBefore(' ').trim().lowercase()
+                .takeIf { it.length == 64 && it.all { c -> c in "0123456789abcdef" } }
+        } finally {
+            conn.disconnect()
+        }
+    }.getOrNull()
+
     private fun toJson(u: AppUpdate) = JSONObject()
-        .put("version", u.version).put("apk", u.apkUrl).put("page", u.releaseUrl).put("size", u.sizeBytes).toString()
+        .put("version", u.version).put("apk", u.apkUrl).put("page", u.releaseUrl).put("size", u.sizeBytes)
+        .put("sha", u.apkSha256).toString()
 
     private fun fromJson(s: String): AppUpdate = JSONObject(s).let {
-        AppUpdate(it.getString("version"), it.getString("apk"), it.getString("page"), it.optLong("size"))
+        AppUpdate(
+            it.getString("version"), it.getString("apk"), it.getString("page"), it.optLong("size"),
+            it.optString("sha").takeIf { sha -> sha.length == 64 },
+        )
     }
 
     companion object {

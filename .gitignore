@@ -4,14 +4,15 @@ build/
 !gradle/wrapper/gradle-wrapper.jar
 .kotlin/
 
-# Local configuration (SDK path, private signing secrets, ...)
+# Local configuration (SDK path, signing secrets, ...)
 local.properties
+keystore.properties
+# Signing material is NEVER committed: a private key in the repository lets anyone build an APK
+# that Android will install as an update of this app. CI restores it from the KEYSTORE_* secrets
+# (see .github/workflows/release.yml).
 *.jks
 *.keystore
-keystore.properties
-# ...except the public release key used by GitHub Releases (see signing/keystore.properties)
-!signing/release.jks
-!signing/keystore.properties
+signing/
 
 # IDE
 .idea/
@@ -28,3 +29,8 @@ captures/
 *.apk
 *.aab
 image-search/
+
+# Local verification harness (see verify/README.md): compiled against the Kotlin sources without
+# the Android SDK, so it is a development tool and never part of the app or the CI build.
+verify/build/
+verify/*.jar

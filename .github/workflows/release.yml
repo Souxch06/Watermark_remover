@@ -7,13 +7,14 @@ name: Release
 #   1. Push a tag:            git tag v1.0.0 && git push origin v1.0.0
 #   2. Manually:              Actions tab -> "Release" -> "Run workflow" -> enter a version
 #
-# Signing: by default the APK is signed with the public key committed in signing/ (stable, so
-# updates install over the previous version). To use a private key instead, add these
-# repository secrets (Settings -> Secrets and variables -> Actions):
+# Signing: the release keystore is NEVER committed to the repository (a public key in a public
+# repo lets anyone publish an APK that Android would install as an update). It is restored from
+# these repository secrets (Settings -> Secrets and variables -> Actions):
 #   KEYSTORE_BASE64   : base64 of your .jks file  (base64 -w0 my-release-key.jks)
 #   KEYSTORE_PASSWORD : keystore password
 #   KEY_ALIAS         : key alias
 #   KEY_PASSWORD      : key password
+# Without them the build fails on purpose: a debug-signed release cannot update an installed app.
 # (Switching keys forces existing users to uninstall once.)
 
 on:
@@ -49,12 +50,20 @@ jobs:
       - name: Resolve version
         id: ver
         shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
           else
-            VERSION="${{ github.event.inputs.version }}"
+            VERSION="${INPUT_VERSION}"
             VERSION="${VERSION#v}"
+          fi
+          # The version ends up in a tag name, a file name and the APK's versionName: it is
+          # validated instead of interpolated anywhere it could be interpreted as code or a path.
+          if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+            echo "::error::Invalid version '$VERSION' (expected e.g. 1.2.3)."
+            exit 1
           fi
           # versionCode must be a monotonically increasing integer: use the run number.
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -74,17 +83,29 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: Restore private release keystore (only if secrets are configured)
-        if: ${{ env.KEYSTORE_BASE64 != '' }}
-        shell: bash
+      # The keystore itself is never committed: it comes from the repository secrets.
+      - name: Require the release keystore secrets
+        if: ${{ env.KEYSTORE_BASE64 == '' }}
         run: |
+          echo "::error::KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD secrets are not configured. Refusing to publish an APK."
+          exit 1
+      - name: Restore private release keystore
+        shell: bash
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          umask 077
           echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
-          cat > keystore.properties <<EOF
-          storeFile=$RUNNER_TEMP/release.jks
-          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
-          keyAlias=${{ secrets.KEY_ALIAS }}
-          keyPassword=${{ secrets.KEY_PASSWORD }}
-          EOF
+          # Values are written through the environment, never interpolated into the script: a secret
+          # containing a quote, a $ or a newline cannot break out of the shell code.
+          {
+            printf 'storeFile=%s\n' "$RUNNER_TEMP/release.jks"
+            printf 'storePassword=%s\n' "$KEYSTORE_PASSWORD"
+            printf 'keyAlias=%s\n' "$KEY_ALIAS"
+            printf 'keyPassword=%s\n' "$KEY_PASSWORD"
+          } > keystore.properties
           echo "Release keystore restored."
 
       - name: Unit tests
@@ -102,19 +123,27 @@ jobs:
           APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
           APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n1)
           "$APKSIGNER" verify --print-certs "$APK" | tee cert.txt
+          if ! grep -q "Number of signers: 1" cert.txt; then
+            echo "::error::APK is not signed by exactly one certificate."
+            exit 1
+          fi
           if grep -q "Android Debug" cert.txt; then
             echo "::error::APK is signed with a debug key – updates would not install over previous versions."
             exit 1
           fi
+          # The published SHA-256 must be produced from the very file that was verified.
+          sha256sum "$APK"
 
       - name: Collect artifacts
         id: apk
         shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
           test -f "$APK"
           mkdir -p dist
-          NAME="WatermarkRemover-${{ steps.ver.outputs.version }}.apk"
+          NAME="WatermarkRemover-${VERSION}.apk"
           cp "$APK" "dist/$NAME"
           (cd dist && sha256sum "$NAME" > "$NAME.sha256")
           echo "path=dist/$NAME" >> "$GITHUB_OUTPUT"
@@ -124,8 +153,9 @@ jobs:
       - name: Create tag (manual runs only)
         if: ${{ github.event_name == 'workflow_dispatch' }}
         shell: bash
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          TAG="${{ steps.ver.outputs.tag }}"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "Tag $TAG already exists locally."
           elif git ls-remote --exit-code --tags origin "$TAG" >/dev/null 2>&1; then
@@ -158,6 +188,8 @@ jobs:
             - Les mises à jour s'installent **par-dessus** la version précédente (même clé de signature depuis la 1.4.0).
               Si vous avez une version ≤ 1.3.0, désinstallez-la une dernière fois avant d'installer celle-ci.
             - SHA-256 : `${{ steps.apk.outputs.sha }}`
+
+            > L'application vérifie ce SHA-256 avant de vous proposer la mise à jour.
 
             ---
             _Build automatique : versionCode ${{ steps.ver.outputs.code }}, commit ${{ github.sha }}_

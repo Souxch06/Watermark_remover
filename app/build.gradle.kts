@@ -7,13 +7,14 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-// Release signing. A STABLE key is what lets Android install an update over the previous
-// version instead of demanding an uninstall. Lookup order:
-//   1. `keystore.properties` at the repo root (git-ignored) – private key, written by the
-//      Release workflow when the KEYSTORE_* secrets are configured, or by hand locally.
-//   2. `signing/keystore.properties` + `signing/release.jks` – public key committed in the repo,
-//      so builds from GitHub Actions are always consistently signed with zero configuration.
-//   3. Debug key (local `assembleRelease` only, never on CI).
+// Release signing. A STABLE key is what lets Android install an update over the previous version
+// instead of demanding an uninstall. The key is NEVER in the repository: it is restored by the
+// Release workflow from the KEYSTORE_* secrets, or provided by hand for a local build.
+//   1. `keystore.properties` at the repo root (git-ignored), written by CI or by the developer.
+//   2. `signing/keystore.properties` + the keystore it points at (git-ignored) – for a developer
+//      who keeps the key outside the repository and only the properties file here.
+//   3. Debug key: local `assembleRelease` only. `./gradlew` refuses to publish with it (see the
+//      check at the end of this file), and the release workflow verifies the certificate too.
 val keystorePropsFile: File? = listOf(
     rootProject.file("keystore.properties"),
     rootProject.file("signing/keystore.properties"),
@@ -30,6 +31,9 @@ val keystoreFile: File? = keystoreProps.getProperty("storeFile")?.let { path ->
     }
 }
 val hasReleaseKeystore = keystoreFile?.exists() == true
+/** True for the tasks that produce something users install (APKs, bundles). */
+fun isPublishableBuildTask(taskName: String): Boolean =
+    taskName.startsWith("assemble") || taskName.startsWith("bundle") || taskName.startsWith("package")
 
 android {
     namespace = "com.souxch.watermarkremover"
@@ -68,6 +72,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            // No keystore configured: still build (so the code compiles), but with the debug key,
+            // which must never be published. A local `assembleRelease` therefore needs the filter
+            // below to be bypassed explicitly (-PallowDebugSigning=true).
             signingConfig = if (hasReleaseKeystore) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
         }
         debug {
@@ -155,4 +162,19 @@ dependencies {
     testImplementation(libs.json) // real org.json for JVM tests (android.jar only has stubs)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
+}
+// Guard rail: publishing an APK signed with the debug key is what breaks in-place updates (and what
+// the release workflow's certificate check catches on CI). Fail early instead, unless the developer
+// asks for it explicitly with -PallowDebugSigning=true.
+gradle.taskGraph.whenReady {
+    val debugSignedPublish = allTasks.any { task ->
+        task.project.path == ":app" && isPublishableBuildTask(task.name) && task.name.contains("Release")
+    } && !hasReleaseKeystore && !project.hasProperty("allowDebugSigning")
+    if (debugSignedPublish) {
+        throw GradleException(
+            "No release keystore found: refusing to assemble a release APK with the debug key.\n" +
+                "Provide keystore.properties + the keystore file, or pass -PallowDebugSigning=true " +
+                "(for local testing only – such an APK cannot update an installed release).",
+        )
+    }
 }
