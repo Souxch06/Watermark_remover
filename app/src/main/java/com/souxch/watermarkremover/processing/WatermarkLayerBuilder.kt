@@ -22,6 +22,14 @@ import kotlin.coroutines.coroutineContext
 class WatermarkLayerBuilder(private val context: Context) {
 
     /**
+     * Last layer handed back by [build], kept so a caller whose job was cancelled can still use the
+     * analysis it already paid for (see [EditorViewModel.awaitAnalysis]).
+     */
+    @Volatile
+    private var lastLayer: WatermarkLayer? = null
+    /** Layer produced by the most recent completed [build], if any. */
+    fun lastResult(): WatermarkLayer? = lastLayer
+    /**
      * @param onProgress 0..100
      */
     suspend fun build(
@@ -32,9 +40,13 @@ class WatermarkLayerBuilder(private val context: Context) {
         val width = info.displayWidth
         val height = info.displayHeight
         val frameCount = frameCountFor(info.durationMs)
-        val regions = zones.map { WatermarkLayer.regionOf(it, width, height) }
+        val regions = zones.take(WatermarkShader.MAX_ZONES).map { WatermarkLayer.regionOf(it, width, height) }
         val samples = regions.map { ArrayList<ByteArray>(frameCount) }
-        if (regions.any { it[2] * it[3] > WatermarkAnalyzer.MAX_REGION_PIXELS }) {
+        // Memory guard: every sampled frame of every region is kept until the analysis runs
+        // (frames x pixels x 3 bytes). Above the budget the analysis is skipped and the export
+        // falls back to the spatial reconstruction instead of risking an OutOfMemoryError.
+        val analysisBytes = regions.sumOf { it[2].toLong() * it[3] * 3 }.toDouble() * frameCount
+        if (analysisBytes > MAX_ANALYSIS_BYTES || regions.any { it[2] * it[3] > WatermarkAnalyzer.MAX_REGION_PIXELS }) {
             // Too big to analyse in reasonable time/memory: spatial reconstruction only.
             return@withContext WatermarkLayer.pack(width, height, zones, zones.map { null })
         }
@@ -83,7 +95,7 @@ class WatermarkLayerBuilder(private val context: Context) {
             onProgress(80 + ((i + 1) * 20) / regions.size)
             result
         }
-        WatermarkLayer.pack(width, height, zones, layers)
+        return@withContext WatermarkLayer.pack(width, height, zones, layers).also { lastLayer = it }
     }
 
     private fun getFrame(retriever: MediaMetadataRetriever, timeUs: Long, width: Int, height: Int, exact: Boolean): Bitmap? {
@@ -138,6 +150,8 @@ class WatermarkLayerBuilder(private val context: Context) {
     companion object {
         /** Below this many distinct sync frames, exact (slower) frame decoding is used as well. */
         const val MIN_DISTINCT_FRAMES = 8
+        /** Hard cap on the sampled pixel data held in RAM during the analysis (≈96 MB). */
+        const val MAX_ANALYSIS_BYTES = 96L * 1024 * 1024
 
         /** Number of frames sampled: enough for a robust median, bounded for speed. */
         fun frameCountFor(durationMs: Long): Int = when {

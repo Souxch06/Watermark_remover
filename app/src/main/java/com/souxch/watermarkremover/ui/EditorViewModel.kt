@@ -141,7 +141,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         // Look through the video for the watermark layer whenever the zones settle (the user
         // stopped dragging): the preview and the export then restore the picture behind it.
         viewModelScope.launch {
-            _state.map { AnalysisKey(it.screen as? Screen.Editor, it.zones) }
+            _state.map { s -> AnalysisKey(s.screen as? Screen.Editor, s.zones, s.settings.method) }
                 .distinctUntilChanged()
                 .debounce(700)
                 .collect { key -> analyzeWatermark(key) }
@@ -149,12 +149,36 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private data class PreviewKey(val editor: Screen.Editor?, val zones: List<WatermarkZone>, val settings: RemovalSettings, val layer: WatermarkLayer?)
-    private data class AnalysisKey(val editor: Screen.Editor?, val zones: List<WatermarkZone>)
+    private data class AnalysisKey(val editor: Screen.Editor?, val zones: List<WatermarkZone>, val method: RemovalMethod)
+
+    /**
+     * Cancels the running analysis without throwing its result away. The already computed value
+     * (if any) is published before cancellation, so a late caller (the export) still finds a
+     * layer instead of silently falling back to a spatial reconstruction.
+     */
+    suspend fun awaitAnalysis() {
+        val job = analysisJob ?: return
+        job.cancel()
+        job.join()
+        // The analysis coroutine may have been cancelled between the last sampling progress update
+        // and the packing step: publish the layer it did build, so the export restores the picture
+        // behind the logo instead of painting over it.
+        layerBuilder.lastResult()?.let { partial ->
+            val editor = _state.value.screen as? Screen.Editor
+            if (editor != null && _state.value.layer == null) _state.update { it.copy(layer = partial) }
+        }
+    }
 
     private fun analyzeWatermark(key: AnalysisKey) {
         analysisJob?.cancel()
         val info = key.editor?.info
         if (info == null || key.zones.isEmpty()) {
+            _state.update { it.copy(layer = null, analysisProgress = null, analysisFoundNothing = false) }
+            return
+        }
+        // Flou / pixellisation / recadrage n'utilisent pas le calque récupéré : lancer l'analyse
+        // coûterait plusieurs secondes de CPU et de DÉCODAGE pour un résultat jamais lu.
+        if (key.editor.settings.method != RemovalMethod.INPAINT) {
             _state.update { it.copy(layer = null, analysisProgress = null, analysisFoundNothing = false) }
             return
         }
@@ -289,9 +313,10 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         val output = repository.newExportFile()
         _state.update { it.copy(screen = Screen.Exporting(info, 0)) }
         exportJob = viewModelScope.launch {
-            // If the watermark analysis is still running, let it finish first: the export must
-            // restore the picture behind the logo, not paint over it.
-            analysisJob?.takeIf { it.isActive }?.join()
+            // If the watermark analysis is still running, stop it and keep whatever it already
+            // produced: the export must restore the picture behind the logo, not wait for the
+            // remaining sampled frames of an analysis that is going to be discarded anyway.
+            awaitAnalysis()
             val layer = _state.value.layer?.takeIf { settings.method == RemovalMethod.INPAINT }
             exporter.export(info, zones, settings, output, layer).collect { event ->
                 when (event) {
