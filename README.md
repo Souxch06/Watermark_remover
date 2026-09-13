@@ -12,6 +12,17 @@ téléphone, téléchargez le fichier `WatermarkRemover-x.y.z.apk`, puis ouvrez-
 Toutes les versions : [page des releases](https://github.com/Souxch06/Watermark_remover/releases).
 Chaque `git push` produit aussi un APK de test dans l'onglet **Actions** (artefact « WatermarkRemover-release »).
 
+Chaque release publie un fichier `.sha256` à côté de l'APK : l'application **vérifie cette empreinte**
+avant de proposer l'installation, et refuse tout téléchargement qui ne correspond pas.
+
+### Publier une version (mainteneurs)
+
+La clé de signature n'est **jamais** dans le dépôt : elle est fournie par les secrets GitHub
+(`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`). Sans eux, le workflow de
+release échoue volontairement, car un APK signé avec la clé de debug ne peut pas mettre à jour
+l'application installée. En local, il faut un `keystore.properties` (non versionné), sinon
+`assembleRelease` s'arrête avec un message explicite.
+
 ---
 
 Application Android native (Kotlin + Jetpack Compose + Media3 Transformer) qui supprime un
@@ -125,6 +136,12 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
   `Films/Watermark Remover` (visibles dans la galerie) ; l'index et les miniatures sont stockés en
   privé et synchronisés automatiquement si un fichier est supprimé ailleurs.
 - Thème clair / sombre, couleurs dynamiques Material You (Android 12+), FR + EN.
+- **Vie privée** : aucune vidéo ne quitte l'appareil, aucune télémétrie. Le seul accès réseau sert à
+  demander à GitHub si une version plus récente existe (une petite requête JSON) et à télécharger
+  l'APK de mise à jour, dont l'empreinte SHA-256 est vérifiée avant installation.
+- **Robustesse** : l'analyse temporelle est sautée pour les méthodes qui ne l'utilisent pas (flou,
+  pixellisation, recadrage) et le budget mémoire qu'elle peut consommer est borné ; l'export
+  récupère le résultat d'analyse déjà calculé au lieu d'attendre ou de le jeter.
 
 ## Architecture
 
