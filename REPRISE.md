@@ -31,12 +31,26 @@ J'ai inspecté votre machine et GitHub, voici l'état réel :
 > Si un secret est mal recopié, la publication échouera et l'app ne pourra plus se mettre à jour.
 
 ### 1.1 Lancer le test
+> ✅ **D'abord : êtes-vous connecté à GitHub dans votre navigateur ?** Si vous n'êtes pas connecté,
+> les pages `github.com/.../actions/...` renvoient une **page « 404 — Not Found »**. Ce n'est pas un
+> bug : GitHub cache ces pages aux visiteurs non connectés. Connectez-vous d'abord (icône en haut à
+> droite de GitHub), puis rechargez.
 
-1. Ouvrez : **https://github.com/Souxch06/Watermark_remover/actions/workflows/release.yml**
-2. Cliquez sur le bouton gris **« Run workflow »** (à droite).
-3. Dans la case qui apparaît, tapez : `1.4.0`
-4. Cliquez sur le bouton vert **« Run workflow »**.
-5. **Attendez 5 à 10 minutes** (la page se rafraîchit toute seule, ou appuyez sur F5).
+**Méthode simple, sans URL à retenir :**
+
+1. Ouvrez **[github.com/Souxch06/Watermark_remover](https://github.com/Souxch06/Watermark_remover)**
+2. En haut de la page, cliquez sur l'onglet **« Actions »**.
+3. Dans la colonne de gauche, cliquez sur **« Release »** (sous « Workflows »).
+4. À droite, cliquez sur le bouton **« Run workflow »** ▾.
+5. Dans la case qui apparaît, tapez : `1.4.0`
+6. Cliquez sur le bouton vert **« Run workflow »**.
+7. **Attendez 5 à 10 minutes** (appuyez sur F5 pour rafraîchir).
+
+> 💡 Si l'onglet **« Actions »** n'apparaît pas du tout : votre navigateur est probablement sur un
+> autre compte GitHub, ou vous n'êtes pas connecté. Reconnectez-vous.
+>
+> 💡 Si vous voyez **« Actions »** mais pas **« Release »** dans la colonne de gauche : cliquez sur
+> le bouton **« All workflows »** en haut de cette colonne.
 
 ### 1.2 Lire le résultat
 
@@ -47,13 +61,36 @@ J'ai inspecté votre machine et GitHub, voici l'état réel :
 | ❌ Rouge : `refusing to publish an APK that would be signed with the debug key` | Même chose : la clé n'est pas trouvée | Faites **1.3** |
 | ❌ Rouge : `keytool error` ou `Keystore was tampered with` | Mot de passe erroné | Faites **1.3**, vérifiez `KEYSTORE_PASSWORD` |
 | ❌ Rouge : `Invalid version` | La version est mal écrite | Recommencez avec exactement `1.4.0` |
+| ❌ Libre : `Unit tests → Unresolved reference` ou autre erreur de code | Ce n'est pas vos secrets, c'est le code | Montrez-moi le message : c'est moi qui corrige |
 
 Pour voir **laquelle** des étapes a échoué : cliquez sur le run rouge, puis sur la ligne rouge
 (« ✗ ») dans la liste de gauche. Elle se déplie et montre l'erreur en clair.
 
-### 1.3 (Seulement si c'est rouge) Recréer les 4 secrets
+### 1.2 bis 🆘 « La page Run workflow renvoie une erreur / 404 »
 
-1. Ouvrez : **https://github.com/Souxch06/Watermark_remover/settings/secrets/actions**
+Trois causes possibles, dans l'ordre de probabilité :
+
+**a) Vous n'êtes pas connecté à GitHub.** → Connectez-vous, puis rouvrez la page.
+Les pages Actions d'un dépôt public sont invisibles pour les visiteurs non connectés.
+
+**b) Vous avez ouvert un lien avec `.yml` dans l'adresse.** → Ces liens
+(`.../actions/workflows/release.yml`) ne s'ouvrent **pas** dans un navigateur. Utilisez la
+navigation par clics de 1.1 : onglet **Actions** → **Release** dans la colonne de gauche.
+
+**c) Le dépôt n'est pas le vôtre / l'onglet Actions est masqué.** → Vérifiez que l'onglet
+**Actions** est bien présent sur [la page du dépôt](https://github.com/Souxch06/Watermark_remover).
+S'il manque, allez dans **Settings → Actions → General** et choisissez
+« Allow all actions and reusable workflows », puis **Save**.
+
+> ⚠️ **Ce qu'il ne faut PAS conclure :** cette erreur de page **n'a rien à voir** avec vos secrets
+> GitHub, ni avec la clé, ni avec le nettoyage de l'historique. C'est uniquement un problème
+d'affichage de page. Vous pouvez passer directement à l'**étape 2** si vous préférez : elle ne
+dépend pas du tout de l'onglet Actions.
+
+### 1.3 (Seulement si c'est rouge) Recréer les 4 secrets
+1. Allez sur **[la page du dépôt](https://github.com/Souxch06/Watermark_remover)** → onglet
+   **« Settings »** (en haut, à droite) → dans la colonne de gauche : **« Secrets and variables »**
+   → **« Actions »**.
 2. Supprimez les secrets existants s'il y en a (icône corbeille à droite de chacun).
 3. Créez les 4 à nouveau avec **« New repository secret »** :
 
