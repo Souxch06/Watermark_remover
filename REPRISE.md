@@ -31,26 +31,47 @@ J'ai inspecté votre machine et GitHub, voici l'état réel :
 > Si un secret est mal recopié, la publication échouera et l'app ne pourra plus se mettre à jour.
 
 ### 1.1 Lancer le test
-> ✅ **D'abord : êtes-vous connecté à GitHub dans votre navigateur ?** Si vous n'êtes pas connecté,
-> les pages `github.com/.../actions/...` renvoient une **page « 404 — Not Found »**. Ce n'est pas un
-> bug : GitHub cache ces pages aux visiteurs non connectés. Connectez-vous d'abord (icône en haut à
-> droite de GitHub), puis rechargez.
-
-**Méthode simple, sans URL à retenir :**
-
-1. Ouvrez **[github.com/Souxch06/Watermark_remover](https://github.com/Souxch06/Watermark_remover)**
-2. En haut de la page, cliquez sur l'onglet **« Actions »**.
-3. Dans la colonne de gauche, cliquez sur **« Release »** (sous « Workflows »).
-4. À droite, cliquez sur le bouton **« Run workflow »** ▾.
-5. Dans la case qui apparaît, tapez : `1.4.0`
-6. Cliquez sur le bouton vert **« Run workflow »**.
-7. **Attendez 5 à 10 minutes** (appuyez sur F5 pour rafraîchir).
-
-> 💡 Si l'onglet **« Actions »** n'apparaît pas du tout : votre navigateur est probablement sur un
-> autre compte GitHub, ou vous n'êtes pas connecté. Reconnectez-vous.
+> 🚫 **Ces adresses ne marchent PAS** — c'est normal, elles n'existent pas :
+> `.../actions/manual` • `.../actions/workflows/release.yml` • `.../actions/workflows/release.yml/dispatches`
 >
-> 💡 Si vous voyez **« Actions »** mais pas **« Release »** dans la colonne de gauche : cliquez sur
-> le bouton **« All workflows »** en haut de cette colonne.
+> ✅ **La seule adresse qui marche :**
+> **[github.com/Souxch06/Watermark_remover/actions](https://github.com/Souxch06/Watermark_remover/actions)**
+> ⬅️ **le `/actions` à la fin est obligatoire**
+
+**5 clics, aucune autre adresse à taper :**
+
+1. Ouvrez **[github.com/Souxch06/Watermark_remover/actions](https://github.com/Souxch06/Watermark_remover/actions)**
+2. Si GitHub propose **« Sign in »** (en haut à droite), **connectez-vous d'abord** :
+   sans connexion, cette page renvoie « 404 » même si tout va bien.
+3. **Colonne de gauche**, sous le mot « Workflows » : cliquez sur **« Release »**.
+4. Sur la page « Release », à droite du titre : cliquez sur le bouton gris **« Run workflow » ▾**.
+5. Un panneau se déplie : tapez ``1.4.0`` dans la case, puis cliquez sur le bouton **vert
+   « Run workflow »** du panneau.
+6. **Attendez 5 à 10 minutes**, puis appuyez sur **F5** pour rafraîchir la page.
+
+**Ce que vous devez voir, clic par clic :**
+
+| Étape | Ce qui doit s'afficher |
+|---|---|
+| 1 | Une liste de runs, et à gauche la liste : **Android CI**, **Release** |
+| 3 | Le grand titre **« Release »** en haut de la page |
+| 4 | Un petit panneau avec une case de texte + un bouton vert |
+
+**Si quelque chose ne s'affiche pas :**
+
+- ❌ **Page « 404 » / « Page not found »** → l'adresse ne finit pas par `/actions`, ou vous n'êtes pas
+  connecté. Retapez **à la main** dans la barre du navigateur :
+  `github.com/Souxch06/Watermark_remover/actions`
+- ❌ **Colonne de gauche vide (pas de « Release »)** → cliquez sur **« All workflows »** en haut de
+  cette colonne.
+- ❌ **Pas de bouton « Run workflow »** → vous êtes sur le mauvais workflow. Le titre affiché doit
+  être **« Release »** (⚠️ pas « Android CI », qui en a un aussi).
+- ❌ **Pas d'onglet « Actions » du tout** → **Settings → Actions → General** → cochez
+  **« Allow all actions and reusable workflows »** → **Save**.
+
+> ⏭️ **Vous pouvez aussi sauter ce test.** Il sert *uniquement* à vérifier vos 4 secrets. L'**étape 2**
+> (nettoyage de l'historique) ne dépend **pas** de l'onglet Actions : faites-la d'abord si vous
+> préférez, et revenez ici plus tard.
 
 ### 1.2 Lire le résultat
 
