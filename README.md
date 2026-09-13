@@ -17,6 +17,9 @@ avant de proposer l'installation, et refuse tout téléchargement qui ne corresp
 
 ### Publier une version (mainteneurs)
 
+> 🔑 **La clé de signature a été publiée par erreur dans l'historique du dépôt et doit être
+> remplacée.** Guide pas-à-pas (aucune connaissance de Git requise) : **[TUTO-SECURITE.md](TUTO-SECURITE.md)**.
+
 La clé de signature n'est **jamais** dans le dépôt : elle est fournie par les secrets GitHub
 (`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`). Sans eux, le workflow de
 release échoue volontairement, car un APK signé avec la clé de debug ne peut pas mettre à jour
