@@ -43,7 +43,7 @@ jobs:
       KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -78,7 +78,7 @@ jobs:
           java-version: "17"
 
       - name: Set up Gradle (with cache)
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v5
 
       - name: Make gradlew executable
         run: chmod +x ./gradlew
@@ -121,15 +121,36 @@ jobs:
       - name: Verify signing certificate
         shell: bash
         run: |
+          set -euo pipefail
           APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
           APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n1)
+          # apksigner verifies the signature AND prints the signer certificates. Its wording is
+          # NOT stable across SDK build-tools:
+          #   <= 36.1.0: "Signer #1 certificate SHA-256 digest: <hex>"
+          #   >= 37.0.0: "V2 Signer: certificate SHA-256 digest: <hex>" (one line per scheme)
+          # so this step must never grep for those exact words (that is what broke the release:
+          # the APK was signed correctly but "Number of signers: 1" no longer existed, so the
+          # check reported a false failure). Only stable facts are asserted here:
+          #   - apksigner exited 0 (the signature verifies);
+          #   - exactly one DISTINCT signer certificate (same key under v2+v3 counts once).
           "$APKSIGNER" verify --print-certs "$APK" | tee cert.txt
-          if ! grep -q "Number of signers: 1" cert.txt; then
-            echo "::error::APK is not signed by exactly one certificate."
+          # Every line that names a certificate digest, whatever its prefix; hex is lowercase.
+          mapfile -t CERTS < <(grep -ioE "certificate SHA-256 digest: [0-9a-fA-F]{64}" cert.txt \
+            | tr 'A-F' 'a-f' | sed 's/.*: //' | sort -u)
+          if [ "${#CERTS[@]}" -eq 0 ]; then
+            echo "::error::apksigner printed no certificate SHA-256 digest (its output format changed again) — see cert.txt above."
             exit 1
           fi
+          if [ "${#CERTS[@]}" -ne 1 ]; then
+            echo "::error::APK is signed by ${#CERTS[@]} distinct certificates instead of exactly one."
+            exit 1
+          fi
+          echo "Signing certificate SHA-256: ${CERTS[0]}"
+          # Defense in depth (the Gradle guard above already refuses to build a release APK with
+          # the debug key): the published APK must never be debug-signed. The DN is present in
+          # both output formats, so a plain substring keeps working either way.
           if grep -q "Android Debug" cert.txt; then
-            echo "::error::APK is signed with a debug key – updates would not install over previous versions."
+            echo "::error::APK is signed with the Android debug key – updates would not install over previous versions."
             exit 1
           fi
           # The published SHA-256 must be produced from the very file that was verified.

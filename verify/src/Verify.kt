@@ -22,6 +22,15 @@ private fun check(what: String, condition: Boolean, detail: String = "") {
 }
 
 fun main() {
+    // --- guard: the local mirror must match the app sources it mirrors (see Mirror.kt) ---
+    val drift = VerifyMirrorSync.drift()
+    drift.forEach { println("FAIL $it") }
+    if (drift.isNotEmpty()) {
+        println("${drift.size} mirrored declaration(s) have drifted — refusing to run stale checks.")
+        throw AssertionError("mirror drift: ${drift.size} declaration(s)")
+    }
+    println("ok   mirror in sync with the app sources")
+
     // --- file names derived from untrusted input (picker name / GitHub release version) ---
     for (hostile in listOf("../../evil.mp4", "..\\..\\evil.mp4", "/sdcard/evil.mp4", "a/b/c.mp4", "a\u0000b.mp4", "..", "...")) {
         val name = LibraryRepository.buildDisplayName(hostile)
