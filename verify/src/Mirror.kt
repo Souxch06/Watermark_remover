@@ -48,11 +48,21 @@ object UpdateChecker {
     }
 }
 
-enum class ExportQuality(private val sourceFactor: Float, private val bitsPerPixel: Float) {
-    STANDARD(1.0f, 0.10f),
-    HIGH(1.5f, 0.16f),
-    MAXIMUM(2.0f, 0.30f);
+enum class ExportQuality(
+    /** Multiplier applied to the source bitrate. */
+    val sourceFactor: Float,
+    /** Bits per pixel per frame used for the resolution-based floor (H.264 High, 30 fps). */
+    val bitsPerPixel: Float,
+) {
+    STANDARD(sourceFactor = 1.0f, bitsPerPixel = 0.10f),
+    HIGH(sourceFactor = 1.5f, bitsPerPixel = 0.16f),
+    /** ~2x the source bitrate and a generous floor: visually lossless re-encode. */
+    MAXIMUM(sourceFactor = 2.0f, bitsPerPixel = 0.30f);
 
+    /**
+     * Target encoder bitrate (bits/s) for a [width] x [height] video at [frameRate] fps whose
+     * source bitrate is [sourceBitrate] (0 = unknown).
+     */
     fun targetBitrate(width: Int, height: Int, frameRate: Float, sourceBitrate: Int): Int {
         val fps = if (frameRate > 1f) frameRate else 30f
         val floor = (width.toLong() * height * bitsPerPixel * fps).toLong()
@@ -62,6 +72,7 @@ enum class ExportQuality(private val sourceFactor: Float, private val bitsPerPix
 
     companion object {
         const val MIN_BITRATE = 2_000_000L
+        /** Above this, hardware encoders start failing; also far beyond visual transparency. */
         const val MAX_BITRATE = 120_000_000L
     }
 }
