@@ -43,9 +43,9 @@ android {
         // but we fall back gracefully below that (see VideoSaver).
         minSdk = 24
         targetSdk = 35
-        // Overridable from CI: -PversionCode=42 -PversionName=1.2.0
-        versionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 1
-        versionName = (project.findProperty("versionName") as String?) ?: "1.0.0"
+        // Overridable from CI: -PversionCode=42 -PversionName=1.3.0
+        versionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 3
+        versionName = (project.findProperty("versionName") as String?) ?: "1.3.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -112,7 +112,7 @@ android {
         }
     }
 
-    // Human-friendly artifact names: WatermarkRemover-1.0.0-release.apk
+    // Human-friendly artifact names: WatermarkRemover-1.2.0-release.apk
     applicationVariants.all {
         val variant = this
         variant.outputs
