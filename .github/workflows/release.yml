@@ -23,9 +23,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to publish (e.g. 1.0.0). A tag v<version> is created if missing."
+        description: "Version to publish (e.g. 1.2.0). A tag v<version> is created if missing."
         required: true
-        default: "1.0.0"
+        default: "1.2.0"
       prerelease:
         description: "Mark as pre-release"
         type: boolean
