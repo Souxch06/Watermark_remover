@@ -43,9 +43,9 @@ android {
         // but we fall back gracefully below that (see VideoSaver).
         minSdk = 24
         targetSdk = 35
-        // Overridable from CI: -PversionCode=42 -PversionName=1.2.0
-        versionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 1
-        versionName = (project.findProperty("versionName") as String?) ?: "1.2.0"
+        // Overridable from CI: -PversionCode=42 -PversionName=1.3.0
+        versionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 3
+        versionName = (project.findProperty("versionName") as String?) ?: "1.3.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }

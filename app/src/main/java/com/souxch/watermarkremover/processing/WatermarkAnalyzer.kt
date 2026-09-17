@@ -44,7 +44,7 @@ object WatermarkAnalyzer {
     /** Step between bootstrap chunks (overlapping, so a pure-clip chunk is likely). */
     private const val ALIGN_CHUNK_STEP = 3
     /** Search range (+- px) of the per-frame watermark alignment in the analysis. */
-    private const val ALIGN_SEARCH = 12
+    private const val ALIGN_SEARCH = 16
     /** Minimum correlation for a frame offset to be used. */
     private const val ALIGN_MIN_SCORE = 0.45f
     /** Margin over the zero offset before a non-zero alignment is used. */
@@ -70,7 +70,7 @@ object WatermarkAnalyzer {
     /** Smallest subset of frames on which the logo may be analysed when it is not always there. */
     const val MIN_PRESENT_FRAMES = 4
     /** Largest region analysed (pixels); bigger zones fall back to the spatial reconstruction. */
-    const val MAX_REGION_PIXELS = 300_000
+    const val MAX_REGION_PIXELS = 800_000
 
     // ---- static-scene (spatial) detection ----
     /** Minimum local contrast (luminance range over 3x3) for the spatial logo detection. */
@@ -815,7 +815,104 @@ object WatermarkAnalyzer {
         for (y in 0 until h) for (x in 0 until w) {
             if (x < RING || x >= w - RING || y < RING || y >= h - RING) mask[y * w + x] = false
         }
-        if (mask.none { it }) return empty("no watermark", motion, n)
+        if (mask.none { it }) {
+            // Fallback for high-frequency backgrounds where the gradient cue is drowned.
+            // Only when the background itself is highly varying (HF checker) - otherwise the
+            // direct pass being empty is the correct signal for the chunk/bootstrap logic
+            // (e.g. a smeared opaque logo that will be found on a single clip chunk).
+            // Require enough frames and strong background variation to avoid false positives
+            // on small chunks or low-contrast backgrounds.
+            if (n < 12) return empty("no watermark", motion, n)
+            val inner = ArrayList<Float>()
+            for (y in RING until h - RING) for (x in RING until w - RING) inner.add(spread[y * w + x])
+            inner.sort()
+            val med = percentileOfSorted(inner, 0.5f)
+            if (med < 0.18f) return empty("no watermark", motion, n)
+            val fallback = BooleanArray(px)
+            // Use a permissive global threshold (med*0.65): the watermark damps variance by
+            // ~1-a (0.5), so its spread is ~0.5*background.
+            val thr = med * 0.65f
+            for (y in RING until h - RING) for (x in RING until w - RING) {
+                val p = y * w + x
+                if (spread[p] < thr && spread[p] < med - 0.02f) fallback[p] = true
+            }
+            var fbLabels = Components.label(fallback, w, h)
+            Components.removeSmall(fallback, fbLabels, MIN_COMPONENT)
+            fillHoles(fallback, w, h)
+            repeat(DILATE) { dilate(fallback, w, h) }
+            for (y in 0 until h) for (x in 0 until w) if (x < RING || x >= w - RING || y < RING || y >= h - RING) fallback[y * w + x] = false
+            if (fallback.any { it }) {
+                for (i in 0 until px) mask[i] = fallback[i]
+            } else {
+                return empty("no watermark", motion, n)
+            }
+        } else {
+            // Supplement the gradient mask when it is fragmented (e.g. a smooth colour
+            // gradient where the centre relief crosses zero): the variance cue fills the
+            // interior that the gradient cue misses.
+            val inner = ArrayList<Float>()
+            for (y in RING until h - RING) for (x in RING until w - RING) inner.add(spread[y * w + x])
+            inner.sort()
+            val med = percentileOfSorted(inner, 0.5f)
+            val vThr = med * 0.65f
+            var needsUnion = false
+            run {
+                val tmpLabels = Components.label(mask, w, h)
+                val comps = tmpLabels.max()
+                if (comps == 2) {
+                    // Count sizes to avoid merging small text strokes (opaque text has many
+                    // small components, gradient blocks are larger).
+                    val sizes = IntArray(3)
+                    for (l in tmpLabels) if (l in 1..2) sizes[l]++
+                    if (sizes[1] < 80 || sizes[2] < 80) return@run
+                    var minX1 = w; var maxX1 = -1; var minY1 = h; var maxY1 = -1
+                    var minX2 = w; var maxX2 = -1; var minY2 = h; var maxY2 = -1
+                    for (i in 0 until px) {
+                        val l = tmpLabels[i]
+                        if (l == 0) continue
+                        val x = i % w; val y = i / w
+                        if (l == 1) {
+                            if (x < minX1) minX1 = x; if (x > maxX1) maxX1 = x
+                            if (y < minY1) minY1 = y; if (y > maxY1) maxY1 = y
+                        } else if (l == 2) {
+                            if (x < minX2) minX2 = x; if (x > maxX2) maxX2 = x
+                            if (y < minY2) minY2 = y; if (y > maxY2) maxY2 = y
+                        }
+                    }
+                    val gapX = max(minX1 - maxX2, minX2 - maxX1)
+                    val overlapY = min(maxY1, maxY2) - max(minY1, minY2)
+                    val h1 = maxY1 - minY1 + 1
+                    val h2 = maxY2 - minY2 + 1
+                    val heightRatio = max(h1, h2).toFloat() / max(1, min(h1, h2))
+                    if (gapX in 2..30 && overlapY > 5 && heightRatio < 1.6f) needsUnion = true
+                }
+            }
+            if (needsUnion) {
+                val vMask = BooleanArray(px)
+                for (y in RING until h - RING) for (x in RING until w - RING) {
+                    val p = y * w + x
+                    if (spread[p] < vThr && spread[p] < med - 0.015f) vMask[p] = true
+                }
+                var vLabels = Components.label(vMask, w, h)
+                Components.removeSmall(vMask, vLabels, MIN_COMPONENT)
+                // Do not fill/dilate vMask alone yet; union first then process
+                if (vMask.any { it }) {
+                    val union = BooleanArray(px) { mask[it] || vMask[it] }
+                    var uLabels = Components.label(union, w, h)
+                    Components.removeSmall(union, uLabels, MIN_COMPONENT)
+                    fillHoles(union, w, h)
+                    for (y in 0 until h) for (x in 0 until w) if (x < RING || x >= w - RING || y < RING || y >= h - RING) union[y * w + x] = false
+                    // Adopt if it connects components or fills a genuine hole without blowing up
+                    val beforeCount = mask.count { it }
+                    val afterCount = union.count { it }
+                    val beforeComp = Components.label(mask, w, h).max()
+                    val afterComp = Components.label(union, w, h).max()
+                    if (afterCount > beforeCount && afterCount < px * 0.5f && afterCount < beforeCount * 1.8f && (afterComp < beforeComp || afterCount > beforeCount * 1.15f)) {
+                        for (i in 0 until px) mask[i] = union[i]
+                    }
+                }
+            }
+        }
         labels = Components.label(mask, w, h)
         val componentCount = labels.max()
 

@@ -1153,13 +1153,13 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         private const val MAX_TEMPLATE = 2500
         private const val MIN_TEMPLATE = 60
         /** Half size of the motion search window, in pixels per frame. */
-        private const val SEARCH = 16
+        private const val SEARCH = 24
         /** Largest deviation accepted for a motion match. */
         private const val MAX_MATCH_ERROR = 0.06f
         /** Max gap between the one-frame estimate and the 3-frame refinement of it. */
         private const val MOTION_REFINE_MAX_DELTA = 1.5f
         /** Search range (+- px) of the per-frame watermark alignment. */
-        private const val WM_OFF_SEARCH = 12
+        private const val WM_OFF_SEARCH = 16
         /** Opacity step for a tap to count towards watermark localisation. */
         private const val WM_OFF_TAP_ALPHA = 0.08f
         /** Minimum strong taps before the watermark position is tracked at all. */
@@ -1171,7 +1171,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         /** Margin required over the current offset before switching (anti-flicker). */
         private const val WM_OFF_MARGIN = 0.08f
         /** Search range (+- px) of the opaque-template watermark alignment. */
-        private const val WM_TM_SEARCH = 16
+        private const val WM_TM_SEARCH = 24
         /** Minimum template match score for an offset to be adopted. */
         private const val WM_TM_MIN_SCORE = 0.55f
         /** Minimum template support pixels before the watermark position is tracked at all. */
