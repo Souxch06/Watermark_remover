@@ -20,6 +20,8 @@
     <string name="home_subtitle">Pick a video already saved on this device, frame the watermark, then export.</string>
     <string name="pick_video">Choose a video</string>
     <string name="pick_video_hint">The video must already be in the gallery or in the phone\'s files.</string>
+    <string name="pick_file">Clean a file</string>
+    <string name="pick_file_hint">Text, image, audio or document: remove metadata and invisible characters.</string>
     <string name="recent_title">Recently processed</string>
     <string name="how_it_works">How it works</string>
     <string name="step1_title">Pick the video</string>
@@ -30,6 +32,22 @@
     <string name="step3_desc">The video is saved to the gallery and to \"My videos\".</string>
     <string name="about_note">100% on-device processing, no video is ever uploaded.</string>
     <string name="legal_note">Only use this tool on videos you own the rights to.</string>
+
+    <!-- File provenance cleaner -->
+    <string name="file_clean_title">Clean a file</string>
+    <string name="file_clean_subtitle">Remove provenance traces without uploading the file.</string>
+    <string name="file_scope">Offline cleaning</string>
+    <string name="file_scope_details">The Android pass ports the deterministic cleaner from the Exemple repository: invisible Unicode characters, XML fields, C2PA and common metadata. Pixels, visible text and audio samples stay untouched.</string>
+    <string name="file_limited_format">This format normally needs qpdf/Ghostscript or a specialised TIFF rewrite. Android keeps the original bytes instead of risking an unreadable file.</string>
+    <string name="file_clean_action">Clean and save</string>
+    <string name="file_cleaning">Cleaning…</string>
+    <string name="file_cleaning_message">Processing “%1$s” on this device.</string>
+    <string name="file_done_title">File cleaned</string>
+    <string name="file_done_unchanged">No marker found</string>
+    <string name="file_save_location">Saved to Downloads / Watermark Remover.</string>
+    <string name="file_open">Open result</string>
+    <string name="file_share">Share</string>
+    <string name="file_another">Clean another file</string>
 
     <!-- Library -->
     <string name="library_title">My videos</string>
