@@ -131,7 +131,11 @@ fun HomeScreen(
                     Spacer(Modifier.width(10.dp))
                     Text(stringResource(R.string.pick_video), fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
                 }
-                Spacer(Modifier.height(10.dp))
+                // Each hint sits directly under the button it describes: the two paths do very
+                // different things (visible watermark vs provenance metadata) and mixing them up is
+                // exactly what makes the app look like it "does nothing".
+                HintRow(R.string.pick_video_hint)
+                Spacer(Modifier.height(14.dp))
                 OutlinedButton(
                     onClick = pickFile,
                     border = BorderStroke(1.dp, Color.White.copy(alpha = 0.72f)),
@@ -143,12 +147,7 @@ fun HomeScreen(
                     Spacer(Modifier.width(10.dp))
                     Text(stringResource(R.string.pick_file), style = MaterialTheme.typography.titleSmall)
                 }
-                Spacer(Modifier.height(10.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Outlined.Info, null, Modifier.size(14.dp), tint = Color.White.copy(alpha = 0.8f))
-                    Spacer(Modifier.width(6.dp))
-                    Text(stringResource(R.string.pick_video_hint), style = MaterialTheme.typography.labelMedium, color = Color.White.copy(alpha = 0.8f))
-                }
+                HintRow(R.string.pick_file_hint)
             }
         }
 
@@ -226,5 +225,29 @@ fun HomeScreen(
             }
         }
         Spacer(Modifier.height(96.dp)) // room for the bottom bar
+    }
+}
+
+/**
+ * Small caption shown immediately under the button it explains. The two entry points of the home
+ * screen do different things — "Choisir une vidéo" removes the *visible* watermark, "Nettoyer un
+ * fichier" only strips provenance metadata — and an unlabelled hint made users expect the wrong one.
+ */
+@Composable
+private fun HintRow(textRes: Int) {
+    Spacer(Modifier.height(6.dp))
+    Row(verticalAlignment = Alignment.Top) {
+        Icon(
+            Icons.Outlined.Info,
+            null,
+            Modifier.size(14.dp).padding(top = 1.dp),
+            tint = Color.White.copy(alpha = 0.8f),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            stringResource(textRes),
+            style = MaterialTheme.typography.labelMedium,
+            color = Color.White.copy(alpha = 0.8f),
+        )
     }
 }

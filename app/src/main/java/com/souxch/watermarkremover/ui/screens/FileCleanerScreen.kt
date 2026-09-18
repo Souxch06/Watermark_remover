@@ -277,10 +277,33 @@ fun FileDoneScreen(
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
+        // A file with no provenance mark comes out byte-identical: without this paragraph the user
+        // reads "nothing found" as "the feature is missing" (the visible watermark case).
+        if (!report.changed) {
+            Spacer(Modifier.height(12.dp))
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.medium,
+                color = MaterialTheme.colorScheme.tertiaryContainer,
+            ) {
+                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.Top) {
+                    Icon(Icons.Default.Info, null, Modifier.size(19.dp), tint = MaterialTheme.colorScheme.tertiary)
+                    Spacer(Modifier.size(10.dp))
+                    Text(
+                        stringResource(R.string.file_done_unchanged_details),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+        }
         Spacer(Modifier.height(18.dp))
         ReportCard(report)
         Spacer(Modifier.height(10.dp))
-        Text(stringResource(R.string.file_save_location), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(
+            stringResource(if (report.changed) R.string.file_save_location else R.string.file_save_location_identical),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Spacer(Modifier.height(18.dp))
         Button(onClick = onOpen, modifier = Modifier.fillMaxWidth().height(52.dp), shape = MaterialTheme.shapes.small) {
             Icon(Icons.Default.OpenInNew, null)
