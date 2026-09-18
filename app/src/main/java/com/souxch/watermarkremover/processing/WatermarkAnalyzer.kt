@@ -92,6 +92,54 @@ object WatermarkAnalyzer {
     /** A detection covering more than this fraction of the inner zone falls back to all of it. */
     private const val STATIC_MAX_COVER = 0.70f
 
+    // ---- solid plate / bar watermark (lower thirds, logos printed on a bar) ----
+    /**
+     * A solid bar has no contrast of its own: its only signature is a pair of long, straight,
+     * parallel edges. The background-anchored threshold (`bgMedian + k*MAD`) can sit ABOVE that
+     * edge contrast whenever the picture is smooth but sloped - a large MAD inflates the
+     * threshold - and the bar was then localised only through the glyphs printed on it: the rest
+     * of the bar kept the watermark's own dark pixels, and the export showed a dark band where
+     * the logo was. This detector looks for the two edges directly, with an absolute floor.
+     */
+    private const val PLATE_EDGE_MIN = 0.05f
+    /**
+     * Fraction of the zone width that must carry the edge for it to count as a straight one.
+     * Deliberately low: a bar whose colour matches the picture behind it is invisible over
+     * whole stretches, and demanding a near-complete edge would miss exactly the bars that
+     * leave the worst dark residue. The real guards are the flat interior and the two colour
+     * steps (a textured or structured picture fails those).
+     */
+    private const val PLATE_EDGE_FRAC = 0.40f
+    /**
+     * How far a pixel of a plate row may sit from that row's dominant colour and still count as
+     * the solid fill. The plate is a solid colour along its length, text on it stays a minority
+     * of the row, and a semi-transparent plate only inherits a fraction of the picture behind
+     * it. Values are bucketed into a histogram (bin 0.02, tolerance +-3 bins) and the row's
+     * dominant bucket is the plate: O(columns) per row with no sort, because this runs for
+     * every candidate pair of edge rows - a 1080p zone holds hundreds of thousands of pixels.
+     */
+    private const val PLATE_FILL_BIN = 0.02f
+    private const val PLATE_FILL_BINS = 64
+    private const val PLATE_FILL_SPAN = 3
+    /** Fraction of a row's plate width that must sit on that solid fill for the row to count. */
+    private const val PLATE_ROW_FLAT = 0.60f
+    /** Fraction of the plate's rows that must be solid (text covers part of a bar). */
+    private const val PLATE_FLAT_FRACTION = 0.50f
+    private const val PLATE_MIN_THICK = 2
+    private const val PLATE_MAX_THICK = 72
+    /** Colour step required against the rows just above and just below the plate. */
+    private const val PLATE_SIDE_STEP = 0.06f
+    /**
+     * Columns the edge may be missing over before the plate is considered finished. A bar whose
+     * plate colour happens to match the picture behind it is locally invisible - the edge step
+     * drops to zero there - so a strict "edge at every column" walk would cut the bar in two and
+     * leave the far part dark again. The walk therefore bridges an invisible stretch (but not a
+     * different object, which would sit further away than this).
+     */
+    private const val PLATE_GAP = 12
+    /** Rows sampled on each side when measuring that colour step. */
+    private const val PLATE_SIDE_ROWS = 3
+
     /** Frames of the analysed region: each `width*height*3` RGB bytes (row-major). */
     class Frames(val width: Int, val height: Int, val frames: List<ByteArray>)
 
@@ -538,6 +586,174 @@ object WatermarkAnalyzer {
         return out
     }
 
+    /** Bounding box of a detected solid plate. */
+    private class Plate(val x0: Int, val x1: Int, val y0: Int, val y1: Int)
+
+    /**
+     * Finds a solid horizontal plate (bar) in the temporal median: two long straight parallel
+     * vertical steps, a flat interior, and a real colour step against BOTH sides. Returns the
+     * bounds it covers, or null. Deliberately conservative: a scene horizon alone, a letterbox
+     * bar touching the zone border or a busy area never qualifies.
+     */
+    private fun plateMask(lum: FloatArray, w: Int, h: Int, x0: Int, x1: Int, y0: Int, y1: Int): Plate? {
+        val span = x1 - x0
+        if (span < 16) return null
+        // Vertical step at row y (between y-1 and y).
+        val frac = FloatArray(h)
+        for (y in y0 + 1 until y1) {
+            var c = 0
+            for (x in x0 until x1) if (abs(lum[(y - 1) * w + x] - lum[y * w + x]) > PLATE_EDGE_MIN) c++
+            frac[y] = c.toFloat() / span
+        }
+        val rowVals = FloatArray(span)
+        val edgeCol = BooleanArray(span)
+        val hist = IntArray(PLATE_FILL_BINS)
+
+        // Fraction of a row's plate columns that sit on that row's own dominant colour. A bar
+        // keeps one solid colour along its length and the text printed on it stays a minority of
+        // a row, so the mode is the plate; a structured picture has no such dominant colour.
+        fun rowFill(y: Int): Float {
+            var n = 0
+            for (x in x0 until x1) if (edgeCol[x - x0]) rowVals[n++] = lum[y * w + x]
+            if (n == 0) return 0f
+            java.util.Arrays.fill(hist, 0)
+            for (i in 0 until n) hist[histBin(rowVals[i])]++
+            var best = 0
+            var bestBin = 0
+            for (b in 0 until PLATE_FILL_BINS) if (hist[b] > best) { best = hist[b]; bestBin = b }
+            var solid = 0
+            val lo = max(0, bestBin - PLATE_FILL_SPAN)
+            val hi = min(PLATE_FILL_BINS - 1, bestBin + PLATE_FILL_SPAN)
+            for (b in lo..hi) solid += hist[b]
+            return solid.toFloat() / n
+        }
+
+        var bestTop = -1
+        var bestBot = -1
+        var bestScore = 0f
+        for (top in y0 + 1 until y1 - PLATE_MIN_THICK) {
+            if (frac[top] < PLATE_EDGE_FRAC) continue
+            val maxBot = min(y1 - 1, top + PLATE_MAX_THICK)
+            for (bot in top + PLATE_MIN_THICK..maxBot) {
+                if (frac[bot] < PLATE_EDGE_FRAC) continue
+                // The plate is measured on the columns that carry BOTH edges (its own columns).
+                java.util.Arrays.fill(edgeCol, false)
+                var edgeCols = 0
+                for (x in x0 until x1) {
+                    if (abs(lum[(top - 1) * w + x] - lum[top * w + x]) > PLATE_EDGE_MIN &&
+                        abs(lum[(bot - 1) * w + x] - lum[bot * w + x]) > PLATE_EDGE_MIN
+                    ) {
+                        edgeCol[x - x0] = true
+                        edgeCols++
+                    }
+                }
+                if (edgeCols < span / 4) continue
+                // Cheap reject before the full scan: a plate is solid right up to its own edges,
+                // and this rejects the overwhelming majority of the candidate pairs in
+                // O(columns) instead of O(thickness x columns).
+                if (rowFill(top + 1) < PLATE_ROW_FLAT) continue
+                if (bot - 2 > top + 1 && rowFill(bot - 2) < PLATE_ROW_FLAT) continue
+                // Solid interior, ROW BY ROW, each row against its OWN dominant colour: a bar is
+                // one solid colour along its length even when text is printed on it (the strokes
+                // stay a minority of a row), whereas a structured picture has no such row. The
+                // mode is what makes it robust - the local neighbourhood range is not, because a
+                // glyph row bleeds into the plate rows next to it through its 3x3 window.
+                var flatRows = 0
+                var rows = 0
+                for (y in top + 1 until bot - 1) {
+                    rows++
+                    if (rowFill(y) >= PLATE_ROW_FLAT) flatRows++
+                }
+                if (rows == 0 || flatRows.toFloat() / rows < PLATE_FLAT_FRACTION) continue
+                // Colour step against both sides, measured on a ROBUST plate colour: the mean
+                // would be pulled towards the (light) text printed on a dark bar and towards
+                // the dark text printed on a light one, hiding the step. A low / high
+                // percentile gives the plate itself in either case.
+                java.util.Arrays.fill(hist, 0)
+                var n = 0
+                for (y in top until bot) for (x in x0 until x1) {
+                    hist[histBin(lum[y * w + x])]++
+                    n++
+                }
+                val p25 = histPercentile(hist, n, 0.25f)
+                val p75 = histPercentile(hist, n, 0.75f)
+                val above = meanLum(lum, max(y0, top - PLATE_SIDE_ROWS), top, x0, x1, w)
+                val below = meanLum(lum, bot, min(y1, bot + PLATE_SIDE_ROWS), x0, x1, w)
+                val dark = abs(p25 - above) > PLATE_SIDE_STEP && abs(p25 - below) > PLATE_SIDE_STEP
+                val light = abs(p75 - above) > PLATE_SIDE_STEP && abs(p75 - below) > PLATE_SIDE_STEP
+                if (!dark && !light) continue
+                // Prefer the strongest pair, slight bonus for a thicker plate.
+                val score = frac[top] + frac[bot] + min(bot - top, 24) * 0.04f
+                if (score > bestScore) {
+                    bestScore = score
+                    bestTop = top
+                    bestBot = bot
+                }
+            }
+        }
+        if (bestTop < 0) return null
+        // Columns where BOTH edges are present.
+        fun edgeAt(x: Int): Boolean =
+            abs(lum[(bestTop - 1) * w + x] - lum[bestTop * w + x]) > PLATE_EDGE_MIN &&
+                abs(lum[(bestBot - 1) * w + x] - lum[bestBot * w + x]) > PLATE_EDGE_MIN
+        // A bar is also bounded by SHORT VERTICAL edges at its ends. They stop the walk wherever
+        // the horizontal edge is locally invisible (plate colour == picture colour), which is
+        // exactly where a plain "edge at every column" walk would cut the bar short.
+        fun endEdgeAt(x: Int): Boolean {
+            if (x <= x0 || x >= x1) return false
+            var c = 0
+            var n = 0
+            for (y in bestTop until bestBot) {
+                if (abs(lum[y * w + x - 1] - lum[y * w + x]) > PLATE_EDGE_MIN) c++
+                n++
+            }
+            return n > 0 && c.toFloat() / n >= 0.6f
+        }
+        var centre = -1
+        for (x in x0 until x1) if (edgeAt(x)) { centre = x; break }
+        if (centre < 0) return null
+        var cx0 = centre
+        var cx1 = centre
+        var gap = 0
+        var x = centre - 1
+        while (x >= x0 && gap <= PLATE_GAP) {
+            if (edgeAt(x)) { cx0 = x; gap = 0 } else if (endEdgeAt(x)) break else gap++
+            x--
+        }
+        x = centre + 1
+        gap = 0
+        while (x < x1 && gap <= PLATE_GAP) {
+            if (edgeAt(x)) { cx1 = x; gap = 0 } else if (endEdgeAt(x)) break else gap++
+            x++
+        }
+        if (cx1 - cx0 < span / 4) return null
+        return Plate(cx0, cx1, bestTop, bestBot - 1)
+    }
+
+    /** Bucket of a 0..1 luminance in the plate-fill histogram. */
+    private fun histBin(v: Float): Int = (v / PLATE_FILL_BIN).toInt().coerceIn(0, PLATE_FILL_BINS - 1)
+
+    /** Quantile of a filled histogram, as the centre of the bucket it falls in (bin 0.02). */
+    private fun histPercentile(hist: IntArray, n: Int, q: Float): Float {
+        val target = (n * q).toInt()
+        var acc = 0
+        for (b in hist.indices) {
+            acc += hist[b]
+            if (acc > target) return (b + 0.5f) * PLATE_FILL_BIN
+        }
+        return (hist.size - 0.5f) * PLATE_FILL_BIN
+    }
+
+    private fun meanLum(v: FloatArray, yFrom: Int, yTo: Int, x0: Int, x1: Int, w: Int): Float {
+        var s = 0f
+        var n = 0
+        for (y in yFrom until yTo) for (x in x0 until x1) {
+            s += v[y * w + x]
+            n++
+        }
+        return if (n == 0) 0f else s / n
+    }
+
     /**
      * Layer for a still background. The temporal machinery is blind there (nothing ever moves,
      * so "consistent over time" is true of the whole picture, and the semi-transparent pixels
@@ -591,15 +807,19 @@ object WatermarkAnalyzer {
             val y = i / w
             x >= x0 && x < x1 && y >= y0 && y < y1 && contrast[i] > thr
         }
+        val plate = plateMask(lum, w, h, x0, x1, y0, y1)
+        if (DEBUG && plate != null) println("staticLayer: plate x" + plate.x0 + "-" + plate.x1 + " y" + plate.y0 + "-" + plate.y1)
         val labels = Components.label(detected, w, h)
         val nComp = labels.max()
+        // Declared outside the block below: the plate branch reuses them for the text that
+        // sticks out of the bar.
+        val mass = FloatArray(nComp + 1)
+        val size = IntArray(nComp + 1)
+        val minX = IntArray(nComp + 1) { w }
+        val maxX = IntArray(nComp + 1)
+        val minY = IntArray(nComp + 1) { h }
+        val maxY = IntArray(nComp + 1)
         if (nComp > 0) {
-            val mass = FloatArray(nComp + 1)
-            val size = IntArray(nComp + 1)
-            val minX = IntArray(nComp + 1) { w }
-            val maxX = IntArray(nComp + 1)
-            val minY = IntArray(nComp + 1) { h }
-            val maxY = IntArray(nComp + 1)
             for (y in y0 until y1) for (x in x0 until x1) {
                 val comp = labels[y * w + x]
                 if (comp == 0) continue
@@ -618,6 +838,42 @@ object WatermarkAnalyzer {
                         "[$it] x${minX[it]}-${maxX[it]} y${minY[it]}-${maxY[it]} n${size[it]} m" + "%.1f".format(mass[it])
                     }
             )
+            // A detected plate is the stronger localisation: a solid bar leaves no contrast inside,
+            // so the component path may only see the text printed on it, and its bounding box (which
+            // returned early) stopped where that text ended - the rest of the bar then kept the dark
+            // watermark pixels. The plate is handled first, with the glyph components that sit on it.
+            if (plate != null) {
+                val mask = BooleanArray(px)
+                var covered = 0
+                val top = (plate.y0 - STATIC_GROW).coerceAtLeast(y0)
+                val bot = (plate.y1 + STATIC_GROW).coerceAtMost(y1 - 1)
+                var left = plate.x0
+                var right = plate.x1
+                for (y in plate.y0..plate.y1) for (x in plate.x0..plate.x1) {
+                    mask[y * w + x] = true
+                    covered++
+                }
+                for (comp in 1..nComp) {
+                    if (size[comp] < STATIC_MIN_COMPONENT) continue
+                    if (minY[comp] > bot || maxY[comp] < top) continue
+                    // A far-away background blob does not ride on the bar.
+                    if (maxX[comp] - minX[comp] > 4 * (plate.x1 - plate.x0)) continue
+                    left = min(left, minX[comp])
+                    right = max(right, maxX[comp])
+                }
+                left = (left - STATIC_GROW).coerceAtLeast(x0)
+                right = (right + STATIC_GROW).coerceAtMost(x1 - 1)
+                for (y in top..bot) for (x in left..right) {
+                    if (!mask[y * w + x]) {
+                        mask[y * w + x] = true
+                        covered++
+                    }
+                }
+                repeat(2) { dilate(mask, w, h) }
+                if (covered in 1..(STATIC_MAX_COVER * innerCount).toInt()) {
+                    return buildStaticLayer(mask, frames, w, h, motion, px)
+                }
+            }
             if (order.isNotEmpty()) {
                 val bestMass = mass[order.first()]
                 val bestComp = order.first()

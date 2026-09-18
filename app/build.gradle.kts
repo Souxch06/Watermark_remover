@@ -45,7 +45,7 @@ android {
         targetSdk = 35
         // Overridable from CI: -PversionCode=42 -PversionName=1.3.0
         versionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 6
-        versionName = (project.findProperty("versionName") as String?) ?: "1.6.0"
+        versionName = (project.findProperty("versionName") as String?) ?: "1.6.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }

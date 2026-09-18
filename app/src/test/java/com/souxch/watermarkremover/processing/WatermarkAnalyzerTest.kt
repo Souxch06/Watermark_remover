@@ -57,6 +57,55 @@ class WatermarkAnalyzerTest {
         }
     }
 
+    // ---- "dark bar" fixture: a lower-third bar (dark plate + light glyphs) over a still picture.
+    // The background is smooth but SLOPED, which is what inflates the background-anchored
+    // threshold (4*MAD) above the bar's own edge step.
+    private fun barMask(x: Int, y: Int): Boolean = x in 10..84 && y in 30..41
+
+    private fun barGlyph(x: Int, y: Int): Boolean {
+        if (!barMask(x, y)) return false
+        val ly = y - 30
+        val lx = x - 10
+        return when {
+            ly < 3 || ly > 8 -> false
+            lx in 3..5 -> true
+            lx in 11..19 && (ly == 3 || ly == 8) -> true
+            lx in 23..31 && ly in 3..8 -> true
+            lx in 35..51 && (ly == 3 || ly == 8 || lx == 37 || lx == 49) -> true
+            else -> false
+        }
+    }
+
+    /**
+     * Smooth but steeply sloped picture: its own contrast (0.3 over three pixels) is what
+     * inflates the background-anchored threshold, so the bar's edge (0.2..0.4) falls below it
+     * while the glyphs printed on the bar stay well above.
+     */
+    private fun barBackground(x: Int, y: Int): FloatArray {
+        val r = 0.55f + 0.25f * sin(x * 0.5f)
+        val g = 0.58f + 0.22f * sin(x * 0.43f + 1f)
+        val b = 0.62f + 0.20f * sin(x * 0.37f + 2f)
+        return floatArrayOf(r.coerceIn(0f, 1f), g.coerceIn(0f, 1f), b.coerceIn(0f, 1f))
+    }
+
+    /** Frames of a still video: the same picture every time, with the bar composited on it. */
+    private fun darkBarFrames(n: Int, noise: Float = 0.004f): List<ByteArray> {
+        val rnd = Random(11)
+        return (0 until n).map {
+            val out = ByteArray(w * h * 3)
+            for (y in 0 until h) for (x in 0 until w) {
+                val bg = barBackground(x, y)
+                val a = if (barMask(x, y)) (if (barGlyph(x, y)) 1f else 0.85f) else 0f
+                val c = if (barGlyph(x, y)) 0.96f else 0.05f
+                for (ch in 0 until 3) {
+                    val v = (a * c + (1f - a) * bg[ch] + (rnd.nextFloat() - 0.5f) * 2f * noise).coerceIn(0f, 1f)
+                    out[(y * w + x) * 3 + ch] = (v * 255f + 0.5f).toInt().toByte()
+                }
+            }
+            out
+        }
+    }
+
     /** Chebyshev distance to the hard logo shape (0 = inside). */
     private fun logoDistance(x: Int, y: Int): Int {
         fun cheb(x0: Int, y0: Int, x1: Int, y1: Int) =
@@ -260,6 +309,45 @@ class WatermarkAnalyzerTest {
         assertTrue("motion found", restorer.motionFound)
         // The texture is sampled at (x + 3t, y + 2t): the content moves by (-3, -2) per frame.
         assertTrue("motion ${restorer.motionX},${restorer.motionY}", abs(restorer.motionX + 3f) < 0.6f && abs(restorer.motionY + 2f) < 0.6f)
+    }
+
+    @Test
+    fun `a dark bar leaves no dark band on a still background`() {
+        // A solid bar carries no contrast inside: its only signature is a pair of long straight
+        // edges. On a smooth but sloped picture the background-anchored threshold (bgMedian +
+        // 4*MAD) can sit ABOVE the bar's own edge step, so the analysis used to localise only the
+        // glyphs printed on the bar; the rest of the bar kept the watermark's own dark pixels and
+        // the result showed a dark band where the logo was (measured: -0.26 of luminance).
+        val fr = darkBarFrames(12)
+        val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, fr))
+        assertNotNull("the bar must be analysed, not given up on", layer)
+        layer!!
+        assertTrue("watermark expected", layer.hasWatermark)
+        assertEquals("static-fill", layer.stats.reason)
+        // Every pixel of the bar is in the mask: an ignored pixel keeps its dark colour.
+        var bar = 0
+        var covered = 0
+        for (y in 0 until h) for (x in 0 until w) {
+            if (!barMask(x, y)) continue
+            bar++
+            val p = y * w + x
+            if (layer.alpha[p] > 0f || layer.fill[p]) covered++
+        }
+        assertTrue("bar covered $covered/$bar", covered >= bar * 0.97f)
+        // End to end: the restored bar must not be left dark.
+        val restorer = RegionRestorer(layer)
+        val out = rgba(fr[0], false).also { restorer.process(it, false, it) }
+        var outLum = 0f
+        var cleanLum = 0f
+        var n = 0
+        for (y in 0 until h) for (x in 0 until w) {
+            if (!barMask(x, y)) continue
+            outLum += (out[(y * w + x) * 4].toInt() and 0xFF) / 255f
+            cleanLum += barBackground(x, y)[0]
+            n++
+        }
+        val bias = outLum / n - cleanLum / n
+        assertTrue("dark band residue: bias $bias", abs(bias) < 0.06f)
     }
 
     private fun rgba(frame: ByteArray, flip: Boolean): ByteArray {
