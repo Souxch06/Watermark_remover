@@ -99,6 +99,42 @@ l'entrée** — et où retirer un filigrane visible.
 
 ---
 
+## 4 bis. Les artefacts visibles autour du filigrane (versions 1.6.1 et 1.6.2)
+
+Deux défauts d'affichage ont été signalés puis corrigés ; ils n'avaient rien à voir avec le `.zip`,
+mais avec l'éditeur vidéo lui-même :
+
+- **1.6.1 — bandeau sombre laissé à la place du filigrane.** Un bandeau plein n'a aucun contraste
+  en son intérieur : sa seule signature est une paire de bords parallèles. Le seuil de détection
+  étant ancré sur l'arrière-plan, une image lisse mais pentue pouvait le placer **au-dessus** du pas
+  de couleur du bandeau : l'analyse ne repérait que le texte imprimé dessus, et le reste du bandeau
+  gardait les pixels sombres du filigrane. Le détecteur cherche maintenant ces deux bords
+  directement, avec un plancher absolu.
+- **1.6.2 — « cadre » flou et coloré autour du filigrane.** Trois causes, toutes corrigées :
+  1. le calque restauré était collé **en entier** sur la vidéo (tout le rectangle analysé, pas
+     seulement le filigrane) → un rectangle de pixels synthétisés à l'écran. Le calque ne remplace
+     désormais **que** les pixels qu'il a réellement restaurés (l'alpha sert de masque au shader) ;
+  2. quand l'analyse ne trouvait rien, elle effaçait **toute la zone** et la reconstruisait de
+     mémoire → nappe floue sur les images fixes. Elle dit maintenant « rien trouvé » et l'image est
+     recopiée telle quelle ;
+  3. sans calque, la méthode « Inpaint » recouvrait quand même la zone d'une reconstruction
+     spatiale (copie miroir + raccord de teinte) → c'est elle qui donnait l'aspect flou et coloré.
+     Cette méthode ne touche plus que les pixels d'un filigrane **localisé** ; Flou et
+     Pixellisation, choisis explicitement, continuent de s'appliquer à toute la zone.
+
+  S'y ajoutent deux garde-fous de détection sur les images fixes : un composant ne compte comme
+  marque que si son excès de contraste **moyen** dépasse 10 % de luminance (un horizon, un dégradé
+  ou le bord d'un aplat n'y arrivent pas), et une ligne fine couvrant la moitié de la zone (horizon,
+  bord de bandeau) est refusée d'office.
+
+**Vérifié hors Android** (JVM, aucune dépendance) : sur une image fixe sans filigrane, la sortie est
+**exactement** l'entrée, octet pour octet ; avec un filigrane, seuls ses pixels sont modifiés et les
+pixels voisins sont intacts. Les tests correspondants sont dans
+`app/src/test/java/com/souxch/watermarkremover/processing/WatermarkAnalyzerTest.kt` et tournent avec
+`verify/run-cleaner-tests.sh` / la suite du dépôt.
+
+---
+
 ## 5. Le point à savoir sur le dépôt
 
 `main` **ne contient pas** ce portage : il vit sur la branche

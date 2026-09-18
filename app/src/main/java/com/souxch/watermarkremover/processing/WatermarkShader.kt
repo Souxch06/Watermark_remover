@@ -326,6 +326,27 @@ object WatermarkShader {
         else -> settings.method.shaderId
     }
 
+    /**
+     * The zones the shader is allowed to touch.
+     *
+     * INPAINT rebuilds pixels: it may only do so where the analysis actually localised a
+     * watermark. A zone with no recovered layer has no watermark to rebuild, and inventing
+     * content over the whole zone is what put a smeared, colour-shifted rectangle on screen
+     * where the user's watermark was - worse than leaving the watermark alone. Such a zone is
+     * left untouched (the editor already reports that nothing was found there). BLUR and
+     * PIXELATE are explicit choices by the user and always apply.
+     */
+    fun spatialZoneFilter(
+        zones: List<WatermarkZone>,
+        settings: RemovalSettings,
+        layer: WatermarkLayer?,
+    ): List<WatermarkZone> {
+        if (settings.method != RemovalMethod.INPAINT) return zones
+        val covered = HashSet<Int>()
+        layer?.regions?.forEach { if (it.stats.maskPixels > 0) covered.add(it.zoneId) }
+        return zones.filter { it.id in covered }
+    }
+
     /** Feather expressed in texture units, based on the smaller dimension so it looks isotropic. */
     fun featherTextureUnits(settings: RemovalSettings, width: Int, height: Int): Float {
         if (width <= 0 || height <= 0) return 0f

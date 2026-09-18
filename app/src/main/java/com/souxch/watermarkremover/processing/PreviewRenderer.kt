@@ -42,7 +42,10 @@ class PreviewRenderer {
             }
             val restored = if (usable != null) BitmapRestorer(usable).restore(source) else null
             val remaining = if (usable == null) zones else zones.filter { z -> usable.regions.none { it.zoneId == z.id && it.stats.maskPixels > 0 } }
-            if (remaining.isEmpty()) return@withContext restored ?: source
+            // A zone with no localised watermark stays untouched (no invented pixels); the
+            // preview then shows exactly what the export writes.
+            val spatial = WatermarkShader.spatialZoneFilter(remaining, settings, usable)
+            if (spatial.isEmpty()) return@withContext restored ?: source
             // 2. The other zones go through the shader used by the export (spatial methods).
             val input = restored ?: source
             // GLUtils.texImage2D needs a software ARGB_8888 bitmap.
@@ -50,7 +53,7 @@ class PreviewRenderer {
             val result = try {
                 val session = EglSession(upload.width, upload.height)
                 try {
-                    session.draw(upload, remaining, settings)
+                    session.draw(upload, spatial, settings)
                 } finally {
                     session.release()
                 }

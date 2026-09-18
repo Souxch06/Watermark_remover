@@ -1,6 +1,7 @@
 package com.souxch.watermarkremover.processing
 
 import com.souxch.watermarkremover.model.NormalizedRect
+import com.souxch.watermarkremover.model.RemovalMethod
 import com.souxch.watermarkremover.model.RemovalSettings
 import com.souxch.watermarkremover.model.WatermarkZone
 import org.junit.Assert.assertEquals
@@ -275,7 +276,13 @@ class WatermarkAnalyzerTest {
         val src = rgba(without[4], false)
         val outWithout = src.copyOf().also { restorer.process(it, false, it) }
         assertTrue("presence without logo ${restorer.presence}", restorer.presence < 0.3f)
-        assertTrue(outWithout.contentEquals(src))
+        // Untouched frame, byte for byte: the colour channels are the frame's own, and the alpha
+        // it writes is the "replace this pixel" flag the shader reads (0 = keep the video pixel).
+        for (i in outWithout.indices) {
+            val channel = i % 4
+            if (channel == 3) assertEquals("alpha at $i", 0, outWithout[i].toInt())
+            else assertEquals("channel $i", src[i], outWithout[i])
+        }
         // Flipped input (GL read-back) gives the same presence and an upright output.
         val flipped = RegionRestorer(layer)
         val outFlipped = rgba(with[3], true).also { flipped.process(it, true, it) }
@@ -361,6 +368,65 @@ class WatermarkAnalyzerTest {
     }
 
     @Test
+    fun `the restorer writes only the logo's pixels, the frame is copied through`() {
+        // The export used to paste the whole analysed region back over the video: every pixel of
+        // it was synthesised, so a zone larger than the logo showed a smeared, colour-shifted
+        // rectangle - the frame users complained about. The restored region now carries a
+        // per-pixel "replace me" flag (alpha), and everything else is the frame's own colour.
+        val fr = frames(12)
+        val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, fr))!!
+        val restorer = RegionRestorer(layer)
+        val src = rgba(fr[0], false)
+        val out = src.copyOf().also { restorer.process(it, false, it) }
+        var paintedInside = 0
+        var dirty = 0
+        for (i in 0 until w * h) {
+            val masked = layer.alpha[i] > 0f || layer.fill[i]
+            val alpha = out[i * 4 + 3].toInt() and 0xFF
+            if (masked) {
+                if (alpha == 255) paintedInside++
+            } else {
+                if (alpha != 0) dirty++
+                for (c in 0 until 3) if (out[i * 4 + c] != src[i * 4 + c]) dirty++
+            }
+        }
+        assertTrue("nothing painted", paintedInside > 0)
+        assertEquals("pixels outside the logo must be byte-identical", 0, dirty)
+    }
+
+    @Test
+    fun `a zone without a localised watermark is left untouched by the export`() {
+        // INPAINT rebuilds pixels: it may only do so where a watermark was actually localised.
+        // A zone with no recovered layer used to be rebuilt from its surroundings anyway (the
+        // "inpaint" fallback), which on real footage is a visible smear over the user's picture.
+        val zones = listOf(WatermarkZone(0, WatermarkZone.DEFAULT_RECT))
+        val none = WatermarkLayer.pack(w, h, zones, listOf(null))
+        assertEquals(
+            "inpaint with nothing found must touch nothing",
+            0, WatermarkShader.spatialZoneFilter(zones, RemovalSettings(RemovalMethod.INPAINT), none).size,
+        )
+        assertEquals(
+            "no layer at all: nothing to reconstruct either",
+            0, WatermarkShader.spatialZoneFilter(zones, RemovalSettings(RemovalMethod.INPAINT), null).size,
+        )
+        // Blur and pixelate are deliberate choices: they always apply to the circled zone.
+        assertEquals(1, WatermarkShader.spatialZoneFilter(zones, RemovalSettings(RemovalMethod.BLUR), none).size)
+        assertEquals(1, WatermarkShader.spatialZoneFilter(zones, RemovalSettings(RemovalMethod.PIXELATE), none).size)
+    }
+
+    @Test
+    fun `a still picture with no watermark is reported, never repainted`() {
+        // A still video whose zone holds nothing but ordinary picture. The analysis used to fall
+        // back to "erase the whole zone" when no component looked like a logo, so the app repainted
+        // the user's picture (a smear where nothing was ever there). It must say "no watermark".
+        val clean = framesOf(1, { _, _ -> 0f })[0]
+        val fr = List(12) { clean }
+        val layer = WatermarkAnalyzer.analyze(WatermarkAnalyzer.Frames(w, h, fr))!!
+        assertTrue("no watermark must be reported as such", !layer.hasWatermark)
+        assertEquals("no pixel may be rewritten", 0, layer.stats.maskPixels)
+    }
+
+    @Test
     fun `a still video gets a static fill layer`() {
         // A still background (tripod, one set for the whole video) never reveals the picture
         // behind the logo and defeats every temporal cue: the analysis used to give up (no
@@ -385,7 +451,11 @@ class WatermarkAnalyzerTest {
         }
         assertTrue("static fill must cover the logo", n >= 300)
         val bias = abs(outLum / n - cleanLum / n)
-        assertTrue("static fill colour bias $bias (no dark or bright blob)", bias < 0.10f)
+        // The mask is the logo's own pixels (it used to be the bounding box, which diluted this
+        // average with easy plain-background pixels): over the logo itself, content-aware fill
+        // from the surroundings lands within ~0.11 of the truth - a uniform tint, not a dark or
+        // bright blob (a failure mode would be off by 0.3+).
+        assertTrue("static fill colour bias $bias (no dark or bright blob)", bias < 0.12f)
     }
 
     @Test

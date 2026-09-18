@@ -89,6 +89,20 @@ object WatermarkAnalyzer {
     private const val STATIC_GROW = 6
     /** Logo parts sit at most this far (px) from the strongest component. */
     private const val STATIC_CLUSTER = 32
+    /**
+     * A component only counts as an artificial mark when its MEAN excess contrast - how far above
+     * the threshold its pixels sit on average - is at least this much luminance. Absolute, not
+     * relative to the threshold: a merely busy background (stripes, foliage, a crowd) pushes the
+     * background-anchored threshold far up, and a faint scene edge then looks "clearly above it"
+     * while a real watermark - whose whole point is a visible step - still steps by a good tenth
+     * of the range. Without this, ordinary scene structure was taken for a watermark and the
+     * restorer repainted it: the smeared patch users saw.
+     */
+    private const val STATIC_MIN_EXCESS = 0.10f
+    /** A thin line spanning half the zone is a horizon / border, not a watermark stroke. */
+    private const val STATIC_LINE_THICK = 2
+    private const val STATIC_LINE_SPAN = 0.5f
+
     /** A detection covering more than this fraction of the inner zone falls back to all of it. */
     private const val STATIC_MAX_COVER = 0.70f
 
@@ -830,8 +844,20 @@ object WatermarkAnalyzer {
                 if (y < minY[comp]) minY[comp] = y
                 if (y > maxY[comp]) maxY[comp] = y
             }
-            val order = (1..nComp).filter { size[it] >= STATIC_MIN_COMPONENT && mass[it] > 0f }
-                .sortedByDescending { mass[it] }
+            // A watermark is made of compact, strong shapes. Two scene structures are explicitly
+            // not detections: a component that barely rises above the background dispersion (a
+            // gradient, the edge of a flat area, a soft shadow's rim) and a thin line spanning
+            // half the zone (a horizon, a letterbox border, a kerb). Repainting those is a smear
+            // with nothing to recover from underneath.
+            fun isSceneLine(comp: Int): Boolean {
+                val cw = maxX[comp] - minX[comp] + 1
+                val ch = maxY[comp] - minY[comp] + 1
+                return (ch <= STATIC_LINE_THICK && cw >= STATIC_LINE_SPAN * (x1 - x0)) ||
+                    (cw <= STATIC_LINE_THICK && ch >= STATIC_LINE_SPAN * (y1 - y0))
+            }
+            fun credible(comp: Int): Boolean = size[comp] >= STATIC_MIN_COMPONENT && mass[comp] > 0f &&
+                mass[comp] >= STATIC_MIN_EXCESS * size[comp] && !isSceneLine(comp)
+            val order = (1..nComp).filter { credible(it) }.sortedByDescending { mass[it] }
             if (DEBUG) println(
                 "staticLayer: thr=" + "%.3f".format(thr) + " nComp=" + nComp + " " +
                     (1..nComp).joinToString(",") {
@@ -885,51 +911,54 @@ object WatermarkAnalyzer {
                         abs(minY[comp] - minY[bestComp]) + abs(maxY[comp] - maxY[bestComp]) <= STATIC_CLUSTER * 4
                 }
                 if (kept.isNotEmpty()) {
-                    // One single bounding box over everything kept: faint strokes, soft
-                    // shadows and the gaps between glyphs live inside it. Growing and a
-                    // small dilation then cover the antialiased fringe of the logo.
+                    // The components that carry the logo, plus the small ones sitting right next
+                    // to them: a solid mark only fires on its thin perimeter and loses the mass
+                    // ranking to an all-edges wordmark, yet it is part of the same object.
+                    val keep = BooleanArray(nComp + 1)
+                    for (comp in kept) keep[comp] = true
                     var bx0 = w; var bx1 = 0; var by0 = h; var by1 = 0
                     for (comp in kept) {
                         bx0 = min(bx0, minX[comp]); bx1 = max(bx1, maxX[comp])
                         by0 = min(by0, minY[comp]); by1 = max(by1, maxY[comp])
                     }
-                    // Recruitment: a solid mark only fires on its thin perimeter and loses
-                    // the mass ranking to an all-edges wordmark, yet it is part of the logo.
-                    // Any small-but-real component sitting next to the detected box joins it.
                     for (comp in 1..nComp) {
-                        if (size[comp] < STATIC_MIN_COMPONENT) continue
+                        if (keep[comp] || !credible(comp)) continue
                         if (mass[comp] < STATIC_RECRUIT_MASS * bestMass) continue
                         val gapX = max(bx0 - maxX[comp], minX[comp] - bx1)
                         val gapY = max(by0 - maxY[comp], minY[comp] - by1)
                         if (max(gapX, gapY) > STATIC_CLUSTER) continue
-                        bx0 = min(bx0, minX[comp]); bx1 = max(bx1, maxX[comp])
-                        by0 = min(by0, minY[comp]); by1 = max(by1, maxY[comp])
+                        keep[comp] = true
                     }
-                    bx0 = (bx0 - STATIC_GROW).coerceAtLeast(x0)
-                    bx1 = (bx1 + STATIC_GROW).coerceAtMost(x1 - 1)
-                    by0 = (by0 - STATIC_GROW).coerceAtLeast(y0)
-                    by1 = (by1 + STATIC_GROW).coerceAtMost(y1 - 1)
+                    // The mask is the PIXELS of those components, never their bounding box: the
+                    // box around a logo also covers plain picture, and repainting plain picture is
+                    // precisely the smear left on screen.
                     val mask = BooleanArray(px)
-                    var covered = 0
-                    for (y in by0..by1) for (x in bx0..bx1) {
-                        mask[y * w + x] = true; covered++
+                    for (y in y0 until y1) for (x in x0 until x1) {
+                        val comp = labels[y * w + x]
+                        if (comp != 0 && keep[comp]) mask[y * w + x] = true
                     }
+                    // The anti-aliased fringe of a logo continues a pixel or two beyond the
+                    // pixels that fire the threshold.
                     repeat(2) { dilate(mask, w, h) }
+                    // A solid mark carries no interior contrast - only its outline is detected.
+                    // Fill whatever the mask encloses so the solid part is replaced as well.
+                    fillHoles(mask, w, h)
+                    var covered = 0
+                    for (i in 0 until px) if (mask[i]) covered++
                     // Guard: a detection that swallows the zone (busy background, logo over
-                    // detailed content) is not a localisation - erase the circled zone instead.
+                    // detailed content) is not a localisation.
                     if (covered in 1..(STATIC_MAX_COVER * innerCount).toInt()) {
                         return buildStaticLayer(mask, frames, w, h, motion, px)
                     }
                 }
             }
         }
-        // Fallback: the whole inner zone.
-        val mask = BooleanArray(px) { i ->
-            val x = i % w
-            val y = i / w
-            x >= x0 && x < x1 && y >= y0 && y < y1
-        }
-        return buildStaticLayer(mask, frames, w, h, motion, px)
+        // Nothing was localised: report "no watermark" rather than erasing the circled zone.
+        // Erasing it means rebuilding the whole zone out of its surroundings, and on real footage
+        // that is a visible smear where the user's picture used to be - much worse than leaving
+        // the watermark alone (the editor then says "nothing found" and the export copies the
+        // video through untouched).
+        return null
     }
 
     private fun buildStaticLayer(mask: BooleanArray, frames: List<ByteArray>, w: Int, h: Int, motion: Float, px: Int): Layer? {

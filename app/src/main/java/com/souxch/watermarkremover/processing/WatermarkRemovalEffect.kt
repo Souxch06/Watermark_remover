@@ -124,6 +124,9 @@ private class WatermarkShaderProgram(
     override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
         try {
             val restored = restoreRegions(inputTexId, presentationTimeUs)
+            // Only the zones the analysis localised are reconstructed (see spatialZoneFilter):
+            // the others are copied through untouched, byte for byte.
+            val effective = WatermarkShader.spatialZoneFilter(zones, settings, if (restored) layer else null)
             GLES20.glUseProgram(program)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, inputTexId)
@@ -131,13 +134,13 @@ private class WatermarkShaderProgram(
             GLES20.glUniformMatrix4fv(uTransform, 1, false, GlHelpers.IDENTITY_MATRIX, 0)
             GLES20.glUniformMatrix4fv(uTexTransform, 1, false, GlHelpers.IDENTITY_MATRIX, 0)
             GLES20.glUniform2f(uTexelSize, 1f / width, 1f / height)
-            GLES20.glUniform4fv(uZones, WatermarkShader.MAX_ZONES, WatermarkShader.zoneUniforms(zones, yUp = true), 0)
-            GLES20.glUniform1i(uZoneCount, WatermarkShader.zoneCount(zones))
+            GLES20.glUniform4fv(uZones, WatermarkShader.MAX_ZONES, WatermarkShader.zoneUniforms(effective, yUp = true), 0)
+            GLES20.glUniform1i(uZoneCount, WatermarkShader.zoneCount(effective))
             GLES20.glUniform1i(uMethod, WatermarkShader.methodId(settings, if (restored) layer else null))
             GLES20.glUniform1f(uStrength, settings.strength)
             GLES20.glUniform1f(uFeather, WatermarkShader.featherTextureUnits(settings, width, height))
-            if (restored) patcher!!.bind(program, zones, yUp = true)
-            else GlLayerTexture.bind(program, emptyTexture, null, zones, yUp = true)
+            if (restored) patcher!!.bind(program, effective, yUp = true)
+            else GlLayerTexture.bind(program, emptyTexture, null, effective, yUp = true)
 
             // Client-side vertex data: make sure no VBO is bound or the pointer would be read as an offset.
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)

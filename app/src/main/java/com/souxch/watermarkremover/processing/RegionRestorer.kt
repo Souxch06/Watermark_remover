@@ -193,6 +193,9 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
     private val ghostAcc = FloatArray(px * 3)
     private val ghostWeight = FloatArray(px)
 
+    /** True when this frame's restored pixels must replace the video (see [pack]). */
+    private var painted = false
+
     /** Presence of the logo in the last processed frame (0 = absent, 1 = fully there). */
     var presence: Float = 1f
         private set
@@ -281,6 +284,12 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
      * Restores one frame. [rgba]: region pixels, row 0 = bottom row when [flipY] (GL read-back).
      * [output] receives the restored region in display order (row 0 = top); it may be the same
      * array as [rgba].
+     *
+     * The alpha channel of [output] says which pixels were restored: 255 = this pixel replaces
+     * the video frame, 0 = the pixel was left untouched (the frame's own colour). Callers must
+     * apply the result pixel by pixel (`LayerPatcher` uploads it as the shader's mixing mask),
+     * never paint the whole region - painting it is what left a rectangle of synthesised pixels
+     * around the watermark.
      */
     fun process(rgba: ByteArray, flipY: Boolean, output: ByteArray) {
         unpack(rgba, flipY)
@@ -305,6 +314,7 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
         }
         wasPresent = s >= 0.5f
         val active = s > 0f
+        painted = active
 
         // ---- motion of the background since the previous frame ----
         motionFound = false
@@ -387,7 +397,13 @@ class RegionRestorer(private val layer: WatermarkAnalyzer.Layer) {
                 rgba[dst] = toByte(out[src])
                 rgba[dst + 1] = toByte(out[src + 1])
                 rgba[dst + 2] = toByte(out[src + 2])
-                rgba[dst + 3] = -1
+                // Alpha is the shader's "replace this pixel" flag (`mix(src, restored, restored.a)`).
+                // Only the pixels the analysis actually localised are painted: everywhere else the
+                // video frame is used untouched, byte for byte. Painting the whole region instead
+                // is what left a rectangle of synthesised pixels on screen - the smeared, coloured
+                // frame around the watermark that made the app look broken.
+                val pi = src / 3
+                rgba[dst + 3] = if (painted && mask[pi]) -1 else 0
                 dst += 4
             }
         }

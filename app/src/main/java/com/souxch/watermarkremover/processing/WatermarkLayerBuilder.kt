@@ -283,10 +283,15 @@ class BitmapRestorer(private val layer: WatermarkLayer) {
             }
             restorer.process(bytes, false, bytes)
             for (i in 0 until n) {
-                pixels[i] = (0xFF shl 24) or
-                    ((bytes[i * 4].toInt() and 0xFF) shl 16) or
-                    ((bytes[i * 4 + 1].toInt() and 0xFF) shl 8) or
-                    (bytes[i * 4 + 2].toInt() and 0xFF)
+                // Unrestored pixels (alpha 0) keep the frame's own colour: the preview must show
+                // exactly what the export writes, and that is the untouched picture everywhere
+                // outside the localised watermark.
+                if (bytes[i * 4 + 3].toInt() != 0) {
+                    pixels[i] = (0xFF shl 24) or
+                        ((bytes[i * 4].toInt() and 0xFF) shl 16) or
+                        ((bytes[i * 4 + 1].toInt() and 0xFF) shl 8) or
+                        (bytes[i * 4 + 2].toInt() and 0xFF)
+                }
             }
             out.setPixels(pixels, 0, region.width, region.left, region.top, region.width, region.height)
         }
