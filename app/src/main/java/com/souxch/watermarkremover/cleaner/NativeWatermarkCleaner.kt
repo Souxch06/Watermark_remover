@@ -359,7 +359,10 @@ object NativeWatermarkCleaner {
             "provenance", "c2pa", "c2ma", "contentcredentials", "content_credentials", "aigc", "synthid", "model", "llm", "ai_model", "ai_model_version",
             "digitalsourcetype", "digital_source_type", "trainedalgorithmicmedia", "algorithmicmedia", "claim_generator", "claimgenerator", "generated_by", "generatedby", "tool", "engine",
         )
-        val fieldRe = Regex("\"((?:\\\\.|[^\"\\\\])*)\"\\s*:\\s*\"")
+        // Match a JSON member key, not only string-valued members. Including
+        // the opening value quote would miss provenance objects such as
+        // {"c2pa": {"claim_generator": "x"}}.
+        val fieldRe = Regex("\"((?:\\\\.|[^\"\\\\])*)\"\\s*:")
         val candidates = mutableListOf<Pair<Int, Int>>()
         val actions = mutableListOf<String>()
         for (match in fieldRe.findAll(text)) {
