@@ -30,14 +30,28 @@ l'application installée. En local, il faut un `keystore.properties` (non versio
 
 ---
 
-Application Android native (Kotlin + Jetpack Compose + Media3 Transformer) qui supprime un
-filigrane d'une vidéo **déjà enregistrée sur l'appareil**. Tout le traitement se fait sur le
-téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
+Application Android native (Kotlin + Jetpack Compose + Media3 Transformer) issue du dépôt
+complet fourni dans la branche **Exemple** (`bcdc964`). L'archive `watermarks-remover-main.zip`
+(SHA-256 `41fd101c3ea19c8064add92e9a7532dc08ee48915a94910cd909f4f0c6648979`) a été extraite dans
+[`upstream/watermarks-remover-main/`](upstream/watermarks-remover-main/) pour conserver la source
+et ses tests. L'APK n'exécute pas Python : le port Android réimplémente en Kotlin le pipeline
+déterministe qui est réellement portable sur un téléphone.
+
+L'application traite toujours les filigranes visuels d'une vidéo **déjà enregistrée sur l'appareil**
+(GPU/Media3), et propose maintenant **Nettoyer un fichier** pour les marques de provenance du dépôt
+Exemple (Unicode invisible, métadonnées C2PA courantes, champs XML et tags média). Le résultat reste
+sur l'appareil : aucune vidéo ou aucun fichier n'est envoyé sur Internet.
 
 ## Fonctionnalités
 
 - **Sélection** via le sélecteur de médias système (aucune permission de stockage globale) ou via
   « Partager » depuis la galerie.
+- **Nettoyage de fichiers** : le sélecteur Android accepte les textes, images, documents, audio et
+  conteneurs courants. Le port natif retire les caractères Unicode invisibles, champs XML/C2PA,
+  segments PNG/JPEG/WebP/GIF, métadonnées BMP/TIFF, tags ID3, blocs WAV et boîtes de provenance
+  MP4/AVIF/HEIC sans toucher aux pixels ni aux échantillons. Les PDF sont traités en place pour
+  les champs Info/XMP, avec une limite clairement affichée pour les pièces jointes et images
+  embarquées. Les résultats sont déposés dans `Téléchargements/Watermark Remover`.
 - **Éditeur** : cadre pré-positionné en bas à droite, déplaçable / redimensionnable au doigt,
   jusqu'à 6 zones, guides d'alignement.
 - **Aperçu avant / après** rendu par le *même shader* que l'export (fidèle au résultat final),
@@ -154,6 +168,7 @@ téléphone (GPU) : aucune vidéo n'est envoyée sur Internet.
 app/src/main/java/com/souxch/watermarkremover
 ├── MainActivity.kt                 point d'entrée, intents "partager / ouvrir avec"
 ├── model/                          rectangles normalisés, méthodes, géométrie (pur Kotlin, testé)
+├── cleaner/                        port Kotlin hors ligne du pipeline Exemple (texte/métadonnées)
 ├── data/
 │   ├── ProcessedVideo.kt           entrée de bibliothèque + (dé)sérialisation JSON (testé)
 │   └── LibraryRepository.kt        MediaStore + index JSON + miniatures
@@ -171,7 +186,24 @@ app/src/main/java/com/souxch/watermarkremover
     ├── EditorViewModel.kt          état global, navigation, export, bibliothèque
     ├── WatermarkRemoverApp.kt      Scaffold, onglets Accueil / Mes vidéos, snackbars, back
     ├── components/                 overlay des zones, cartes, badges, helpers
-    ├── screens/                    Home, Library, Editor, Exporting / Done / Error
+    ├── screens/                    Home, Library, Editor, File cleaner, Status
     └── theme/                      palette, formes, typographie
 ```
+
+## Port Android du dépôt Exemple
+
+Le dépôt d'origine reste disponible dans `upstream/` comme référence. Ses backends facultatifs
+(serveur HTTP Python, ffmpeg, qpdf/Ghostscript, modèles Torch et réécriture statistique) ne sont
+pas embarqués dans l'APK : ils nécessitent un environnement de bureau ou un serveur et seraient
+inadaptés à une application Android hors ligne. Le port expose donc clairement son périmètre :
+
+- texte : nettoyage Layer A déterministe, espaces homoglyphes et champs XML évidents ;
+- images : retrait sans réencodage des chunks/segments C2PA et métadonnées courantes ;
+- audio/vidéo : retrait des tags/blocs de conteneur en conservant les données codées ;
+- ZIP (DOCX/XLSX/PPTX/ODT/EPUB) : nettoyage des membres XML et médias courants ;
+- BMP/TIFF : suppression des zones de métadonnées sans déplacer les pixels ; PDF : nettoyage Info/XMP en place avec limites explicites ;
+- marques pixel-par-pixel, SynthID, diffusion, ffmpeg/qpdf/Ghostscript : non embarqués dans l’APK et signalés comme indisponibles.
+
+Cette séparation évite d'envoyer les fichiers à un service distant et évite aussi de déclarer
+« nettoyé » un format qu'Android ne sait pas réécrire de façon sûre.
 

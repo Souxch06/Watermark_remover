@@ -4,6 +4,7 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -28,6 +29,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CropFree
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.VideoLibrary
@@ -37,6 +39,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -63,6 +66,7 @@ fun HomeScreen(
     recent: List<ProcessedVideo>,
     update: UpdateState,
     onPick: (Uri) -> Unit,
+    onPickFile: (Uri) -> Unit,
     onOpenLibrary: () -> Unit,
     onOpenItem: (ProcessedVideo) -> Unit,
     onInstallUpdate: () -> Unit,
@@ -71,7 +75,9 @@ fun HomeScreen(
     onCheckUpdate: () -> Unit,
 ) {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri -> uri?.let(onPick) }
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(onPickFile) }
     val pick = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)) }
+    val pickFile = { filePicker.launch(arrayOf("*/*")) }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         // App title row
@@ -124,6 +130,18 @@ fun HomeScreen(
                     Icon(Icons.Default.VideoLibrary, null)
                     Spacer(Modifier.width(10.dp))
                     Text(stringResource(R.string.pick_video), fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
+                }
+                Spacer(Modifier.height(10.dp))
+                OutlinedButton(
+                    onClick = pickFile,
+                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.72f)),
+                    colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.fillMaxWidth().height(50.dp),
+                ) {
+                    Icon(Icons.Default.Description, null)
+                    Spacer(Modifier.width(10.dp))
+                    Text(stringResource(R.string.pick_file), style = MaterialTheme.typography.titleSmall)
                 }
                 Spacer(Modifier.height(10.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
