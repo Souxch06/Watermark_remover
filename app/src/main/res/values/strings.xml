@@ -20,6 +20,8 @@
     <string name="home_subtitle">Choisissez une vidéo déjà enregistrée sur cet appareil, encadrez le filigrane, puis exportez.</string>
     <string name="pick_video">Choisir une vidéo</string>
     <string name="pick_video_hint">La vidéo doit déjà être dans la galerie ou dans les fichiers du téléphone.</string>
+    <string name="pick_file">Nettoyer un fichier</string>
+    <string name="pick_file_hint">Texte, image, audio ou document : retirez les métadonnées et caractères invisibles.</string>
     <string name="recent_title">Récemment traitées</string>
     <string name="how_it_works">Comment ça marche</string>
     <string name="step1_title">Choisissez la vidéo</string>
@@ -30,6 +32,38 @@
     <string name="step3_desc">La vidéo est enregistrée dans la galerie et dans « Mes vidéos ».</string>
     <string name="about_note">Traitement 100 % sur l\'appareil, aucune vidéo n\'est envoyée sur Internet.</string>
     <string name="legal_note">N\'utilisez cet outil que sur des vidéos dont vous détenez les droits.</string>
+
+    <!-- File provenance cleaner -->
+    <string name="file_clean_title">Nettoyer un fichier</string>
+    <string name="file_clean_subtitle">Retirez les traces de provenance sans envoyer le fichier.</string>
+    <string name="file_scope">Nettoyage hors ligne</string>
+    <string name="file_scope_details">Le passage Android reprend nativement les nettoyeurs déterministes : texte/Unicode, HTML, Markdown, LaTeX, SVG, XML/JSON, images, audio, conteneurs ISO-BMFF et archives ZIP. Les pixels, le texte visible et l’audio sont conservés.</string>
+    <string name="file_limited_format">Le PDF est nettoyé sans réécriture qpdf : les métadonnées Info et XMP sont traitées, mais les pièces jointes et métadonnées d’images peuvent nécessiter un outil de bureau.</string>
+    <string name="file_clean_action">Nettoyer et enregistrer</string>
+    <string name="file_cleaning">Nettoyage en cours…</string>
+    <string name="file_cleaning_message">Analyse de « %1$s » sur l’appareil.</string>
+    <string name="file_done_title">Fichier nettoyé</string>
+    <string name="file_done_unchanged">Aucun marqueur trouvé</string>
+    <string name="file_save_location">Résultat enregistré dans Téléchargements / Watermark Remover.</string>
+    <string name="file_open">Ouvrir le résultat</string>
+    <string name="file_share">Partager</string>
+    <string name="file_another">Nettoyer un autre fichier</string>
+    <string name="file_options_title">Options de nettoyage</string>
+    <string name="file_options_subtitle">L’audit local se relance à chaque changement et prévisualise les résidus possibles.</string>
+    <string name="file_strip_all_metadata">Supprimer toutes les métadonnées</string>
+    <string name="file_strip_all_metadata_hint">Désactivez pour conserver les métadonnées qui ne ressemblent pas à une provenance.</string>
+    <string name="file_normalize_spaces">Normaliser les espaces</string>
+    <string name="file_normalize_spaces_hint">Remplace les espaces Unicode inhabituels par un espace classique.</string>
+    <string name="file_nfkc">Normalisation Unicode NFKC</string>
+    <string name="file_nfkc_hint">Harmonise les formes compatibles ; peut modifier certains caractères visibles.</string>
+    <string name="file_aggressive_text">Corriger les caractères confusables</string>
+    <string name="file_aggressive_text_hint">Convertit les lettres pleine chasse et quelques confusions cyrillique/latin.</string>
+    <string name="file_strip_emoji_glue">Supprimer les sélecteurs et jointures emoji</string>
+    <string name="file_strip_emoji_glue_hint">Mode agressif : les emoji complexes peuvent changer d’apparence.</string>
+    <string name="file_strip_bidi">Supprimer les marques directionnelles</string>
+    <string name="file_strip_bidi_hint">À utiliser seulement si le texte ne dépend pas d’un ordre droite-à-gauche.</string>
+    <string name="file_audit_title">Audit avant enregistrement</string>
+    <string name="file_residuals">Résidus détectés : %1$s</string>
 
     <!-- Library -->
     <string name="library_title">Mes vidéos</string>

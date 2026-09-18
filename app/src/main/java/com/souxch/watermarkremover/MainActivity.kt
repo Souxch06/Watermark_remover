@@ -37,13 +37,25 @@ class MainActivity : ComponentActivity() {
         handleIncoming(intent)
     }
 
-    /** Supports "Share to" / "Open with" from the gallery. */
+    /** Supports "Share to" / "Open with" from the gallery and file managers. */
     private fun handleIncoming(intent: Intent?) {
         val uri: Uri? = when (intent?.action) {
             Intent.ACTION_SEND -> IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
             Intent.ACTION_VIEW -> intent.data
             else -> null
         }
-        uri?.let(viewModel::openVideo)
+        uri?.let {
+            val mime = intent?.type.orEmpty()
+            if (mime.startsWith("video/", ignoreCase = true) || looksLikeVideo(it)) {
+                viewModel.openVideo(it)
+            } else {
+                viewModel.openFile(it)
+            }
+        }
+    }
+
+    private fun looksLikeVideo(uri: Uri): Boolean {
+        val text = (uri.toString() + " " + (uri.lastPathSegment ?: "")).lowercase()
+        return listOf(".mp4", ".mov", ".m4v", ".3gp", ".3g2").any(text::contains)
     }
 }
