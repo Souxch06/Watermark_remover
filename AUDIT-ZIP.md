@@ -92,9 +92,10 @@ Deux cas, tous les deux **normaux** :
    (cas n° 5 ci-dessus). C'est le comportement correct : sans marque, il n'y a rien à retirer, et
    l'appli refuse de « inventer » une modification.
 
-Les messages affichés dans l'appli le disent déjà en partie (`file_scope_details`,
-`file_limited_format`, avertissements du rapport d'audit), mais le titre « Aucun marqueur trouvé »
-est trop sec : il ne précise pas qu'un filigrane **visible** n'est pas du ressort de cet écran.
+Depuis la **version 1.6.0**, l'appli le dit explicitement : chaque aide est placée sous son bouton
+(« Choisir une vidéo » = filigrane **visible** ; « Nettoyer un fichier » = métadonnées/Unicode
+seulement), et l'écran de fin explique, quand rien n'est trouvé, que la sortie est **identique à
+l'entrée** — et où retirer un filigrane visible.
 
 ---
 
