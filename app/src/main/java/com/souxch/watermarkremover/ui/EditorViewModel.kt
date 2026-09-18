@@ -6,6 +6,11 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.souxch.watermarkremover.BuildConfig
+import com.souxch.watermarkremover.cleaner.CleanedFileArtifact
+import com.souxch.watermarkremover.cleaner.FileCleanerRepository
+import com.souxch.watermarkremover.cleaner.FileSelection
+import com.souxch.watermarkremover.cleaner.NativeCleanOptions
+import com.souxch.watermarkremover.cleaner.NativeCleanReport
 import com.souxch.watermarkremover.data.AppUpdate
 import com.souxch.watermarkremover.data.LibraryRepository
 import com.souxch.watermarkremover.data.UpdateChecker
@@ -43,6 +48,10 @@ sealed interface Screen {
     /** Tabs: pick a video / browse processed videos. */
     data object Main : Screen
     data object Loading : Screen
+    /** File provenance cleaner imported from the Exemple repository, implemented natively for Android. */
+    data class FileCleaner(val selection: FileSelection, val report: NativeCleanReport? = null) : Screen
+    data class FileCleaning(val selection: FileSelection) : Screen
+    data class FileDone(val selection: FileSelection, val report: NativeCleanReport, val outputUri: Uri) : Screen
     /**
      * @param frame frame shown behind the zones (bounded size, safe for the UI toolkit)
      * @param fullFrame the same frame at the video's own resolution, used to render the
@@ -90,6 +99,8 @@ data class EditorState(
     val analysisProgress: Int? = null,
     /** True when the analysis ran but found no static watermark to recover in the zone(s). */
     val analysisFoundNothing: Boolean = false,
+    /** Options for the dependency-free file provenance cleaner. */
+    val fileOptions: NativeCleanOptions = NativeCleanOptions(),
     val library: List<ProcessedVideo> = emptyList(),
     val libraryLoaded: Boolean = false,
     val update: UpdateState = UpdateState(),
@@ -110,6 +121,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private val library = LibraryRepository(app)
     private val previewRenderer = PreviewRenderer()
     private val layerBuilder = WatermarkLayerBuilder(app)
+    private val fileCleaner = FileCleanerRepository(app)
     private val updateChecker = UpdateChecker(app, BuildConfig.VERSION_NAME)
     private val updateInstaller = UpdateInstaller(app)
 
@@ -121,6 +133,9 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private var exportJob: Job? = null
     private var previewJob: Job? = null
     private var analysisJob: Job? = null
+    private var fileCleaningJob: Job? = null
+    private var fileAuditJob: Job? = null
+    private var fileArtifact: CleanedFileArtifact? = null
     private var nextZoneId = 2
 
     init {
@@ -232,13 +247,116 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         messages.tryEmit(UiMessage.Error(text))
     }
 
-    fun goHome() = _state.update { it.copy(screen = Screen.Main, previewFrame = null) }
+    fun goHome() {
+        fileCleaningJob?.cancel()
+        fileAuditJob?.cancel()
+        fileCleaner.discard(fileArtifact)
+        fileArtifact = null
+        _state.update { it.copy(screen = Screen.Main, previewFrame = null) }
+    }
 
     fun goLibrary() = _state.update { it.copy(screen = Screen.Main, tab = Tab.LIBRARY, previewFrame = null) }
 
     // ------------------------------------------------------------------------------------------
     // Opening & editing
     // ------------------------------------------------------------------------------------------
+
+    /** Opens the native provenance/metadata cleaner for any supported document or media file. */
+    fun openFile(uri: Uri) {
+        // ACTION_OPEN_DOCUMENT grants a persistable read token on providers that support it;
+        // shared files may not, hence runCatching. Keeping the token lets a long clean survive a
+        // configuration change without asking for broad storage permissions.
+        runCatching {
+            getApplication<Application>().contentResolver.takePersistableUriPermission(
+                uri,
+                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
+        }
+        _state.update { it.copy(screen = Screen.Loading) }
+        viewModelScope.launch {
+            try {
+                val selection = fileCleaner.inspect(uri)
+                val options = NativeCleanOptions()
+                _state.update { it.copy(screen = Screen.FileCleaner(selection), fileOptions = options, previewFrame = null) }
+                auditFile(selection, options)
+            } catch (e: Exception) {
+                _state.update { it.copy(screen = Screen.Error(e.localizedMessage ?: "Impossible d'ouvrir le fichier", null)) }
+            }
+        }
+    }
+
+    /** Re-runs the local audit without writing a result file. */
+    fun setFileOptions(options: NativeCleanOptions) {
+        val selection = (_state.value.screen as? Screen.FileCleaner)?.selection ?: return
+        _state.update { it.copy(fileOptions = options, screen = Screen.FileCleaner(selection, null)) }
+        auditFile(selection, options)
+    }
+
+    private fun auditFile(selection: FileSelection, options: NativeCleanOptions) {
+        fileAuditJob?.cancel()
+        fileAuditJob = viewModelScope.launch {
+            runCatching { fileCleaner.audit(selection, options) }
+                .onSuccess { report ->
+                    _state.update { current ->
+                        val screen = current.screen as? Screen.FileCleaner
+                        if (screen?.selection?.uri != selection.uri || current.fileOptions != options) current
+                        else current.copy(screen = screen.copy(report = report))
+                    }
+                }
+                .onFailure { error ->
+                    _state.update { current ->
+                        val screen = current.screen as? Screen.FileCleaner
+                        if (screen?.selection?.uri != selection.uri || current.fileOptions != options) current
+                        else current.copy(screen = screen.copy(report = NativeCleanReport(
+                            selection.kind,
+                            0,
+                            0,
+                            false,
+                            emptyList(),
+                            warnings = listOf(error.localizedMessage ?: "Audit impossible"),
+                        )))
+                    }
+                }
+        }
+    }
+
+    /** Cleans and saves the selected file to Downloads/Watermark Remover. */
+    fun cleanFile(selection: FileSelection) {
+        fileAuditJob?.cancel()
+        fileCleaningJob?.cancel()
+        val options = _state.value.fileOptions
+        _state.update { it.copy(screen = Screen.FileCleaning(selection)) }
+        fileCleaningJob = viewModelScope.launch {
+            var artifact: CleanedFileArtifact? = null
+            try {
+                val cleanedArtifact = fileCleaner.clean(selection, options)
+                artifact = cleanedArtifact
+                fileArtifact = cleanedArtifact
+                val outputUri = fileCleaner.save(cleanedArtifact)
+                fileArtifact = null
+                _state.update { current ->
+                    if ((current.screen as? Screen.FileCleaning)?.selection?.uri != selection.uri) current
+                    else current.copy(screen = Screen.FileDone(selection, cleanedArtifact.report, outputUri))
+                }
+            } catch (e: CancellationException) {
+                fileCleaner.discard(artifact)
+                throw e
+            } catch (e: Exception) {
+                fileCleaner.discard(artifact)
+                fileArtifact = null
+                _state.update { current ->
+                    if ((current.screen as? Screen.FileCleaning)?.selection?.uri != selection.uri) current
+                    else current.copy(screen = Screen.FileCleaner(selection), previewFrame = null)
+                }
+                messages.tryEmit(UiMessage.Error(e.localizedMessage ?: "Nettoyage impossible"))
+            }
+        }
+    }
+
+    fun cancelFileCleaning() {
+        fileCleaningJob?.cancel()
+        goHome()
+    }
 
     fun openVideo(uri: Uri) {
         _state.update { it.copy(screen = Screen.Loading) }
@@ -402,6 +520,9 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        fileCleaningJob?.cancel()
+        fileAuditJob?.cancel()
+        fileCleaner.discard(fileArtifact)
         updateInstaller.unregister()
         super.onCleared()
     }

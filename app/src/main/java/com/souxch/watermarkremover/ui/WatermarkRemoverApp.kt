@@ -37,6 +37,11 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.souxch.watermarkremover.R
 import com.souxch.watermarkremover.ui.components.openVideo
 import com.souxch.watermarkremover.ui.screens.DoneScreen
+import com.souxch.watermarkremover.ui.screens.FileCleanerScreen
+import com.souxch.watermarkremover.ui.screens.FileDoneScreen
+import com.souxch.watermarkremover.ui.screens.FileCleaningScreen
+import com.souxch.watermarkremover.ui.screens.openCleanedFile
+import com.souxch.watermarkremover.ui.screens.shareCleanedFile
 import com.souxch.watermarkremover.ui.screens.EditorScreen
 import com.souxch.watermarkremover.ui.screens.ErrorScreen
 import com.souxch.watermarkremover.ui.screens.ExportingScreen
@@ -73,6 +78,7 @@ fun WatermarkRemoverApp(viewModel: EditorViewModel) {
     BackHandler(enabled = screen !is Screen.Main || state.tab != Tab.HOME) {
         when (screen) {
             is Screen.Exporting -> viewModel.cancelExport()
+            is Screen.FileCleaning -> viewModel.cancelFileCleaning()
             is Screen.Main -> viewModel.selectTab(Tab.HOME)
             else -> viewModel.goHome()
         }
@@ -124,6 +130,7 @@ fun WatermarkRemoverApp(viewModel: EditorViewModel) {
                                 recent = state.library,
                                 update = state.update,
                                 onPick = viewModel::openVideo,
+                                onPickFile = viewModel::openFile,
                                 onOpenLibrary = { viewModel.selectTab(Tab.LIBRARY) },
                                 onOpenItem = { openVideo(context, Uri.parse(it.uri)) },
                                 onInstallUpdate = viewModel::installUpdate,
@@ -140,6 +147,22 @@ fun WatermarkRemoverApp(viewModel: EditorViewModel) {
                         }
                     }
                     Screen.Loading -> LoadingScreen()
+                    is Screen.FileCleaner -> FileCleanerScreen(
+                        selection = target.selection,
+                        report = target.report,
+                        options = state.fileOptions,
+                        onOptionsChanged = viewModel::setFileOptions,
+                        onClean = { viewModel.cleanFile(target.selection) },
+                        onBack = viewModel::goHome,
+                    )
+                    is Screen.FileCleaning -> FileCleaningScreen(target.selection, viewModel::cancelFileCleaning)
+                    is Screen.FileDone -> FileDoneScreen(
+                        selection = target.selection,
+                        report = target.report,
+                        onAnother = viewModel::goHome,
+                        onOpen = { openCleanedFile(context, target.outputUri, target.selection.mimeType) },
+                        onShare = { shareCleanedFile(context, target.outputUri, target.selection.mimeType) },
+                    )
                     is Screen.Editor -> EditorScreen(target.info, target.frame, state, viewModel)
                     is Screen.Exporting -> ExportingScreen(target.percent, target.info.displayName, onCancel = viewModel::cancelExport)
                     is Screen.Done -> DoneScreen(

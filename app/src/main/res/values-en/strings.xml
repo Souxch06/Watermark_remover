@@ -20,6 +20,8 @@
     <string name="home_subtitle">Pick a video already saved on this device, frame the watermark, then export.</string>
     <string name="pick_video">Choose a video</string>
     <string name="pick_video_hint">The video must already be in the gallery or in the phone\'s files.</string>
+    <string name="pick_file">Clean a file</string>
+    <string name="pick_file_hint">Text, image, audio or document: remove metadata and invisible characters.</string>
     <string name="recent_title">Recently processed</string>
     <string name="how_it_works">How it works</string>
     <string name="step1_title">Pick the video</string>
@@ -30,6 +32,38 @@
     <string name="step3_desc">The video is saved to the gallery and to \"My videos\".</string>
     <string name="about_note">100% on-device processing, no video is ever uploaded.</string>
     <string name="legal_note">Only use this tool on videos you own the rights to.</string>
+
+    <!-- File provenance cleaner -->
+    <string name="file_clean_title">Clean a file</string>
+    <string name="file_clean_subtitle">Remove provenance traces without uploading the file.</string>
+    <string name="file_scope">Offline cleaning</string>
+    <string name="file_scope_details">The Android pass natively covers the deterministic cleaners: text/Unicode, HTML, Markdown, LaTeX, SVG, XML/JSON, images, audio, ISO-BMFF containers and ZIP archives. Pixels, visible text and audio samples stay untouched.</string>
+    <string name="file_limited_format">PDF is cleaned without a qpdf rewrite: Info and XMP metadata are handled, but attachments and embedded-image metadata may need a desktop tool.</string>
+    <string name="file_clean_action">Clean and save</string>
+    <string name="file_cleaning">Cleaning…</string>
+    <string name="file_cleaning_message">Processing “%1$s” on this device.</string>
+    <string name="file_done_title">File cleaned</string>
+    <string name="file_done_unchanged">No marker found</string>
+    <string name="file_save_location">Saved to Downloads / Watermark Remover.</string>
+    <string name="file_open">Open result</string>
+    <string name="file_share">Share</string>
+    <string name="file_another">Clean another file</string>
+    <string name="file_options_title">Cleaning options</string>
+    <string name="file_options_subtitle">The local audit runs again after every change and previews possible leftovers.</string>
+    <string name="file_strip_all_metadata">Remove all metadata</string>
+    <string name="file_strip_all_metadata_hint">Turn this off to keep metadata that does not look like provenance.</string>
+    <string name="file_normalize_spaces">Normalize spaces</string>
+    <string name="file_normalize_spaces_hint">Replaces unusual Unicode spaces with a regular space.</string>
+    <string name="file_nfkc">Unicode NFKC normalization</string>
+    <string name="file_nfkc_hint">Harmonizes compatibility forms; some visible characters may change.</string>
+    <string name="file_aggressive_text">Fix confusable characters</string>
+    <string name="file_aggressive_text_hint">Converts full-width letters and a few Cyrillic/Latin confusions.</string>
+    <string name="file_strip_emoji_glue">Remove emoji selectors and joiners</string>
+    <string name="file_strip_emoji_glue_hint">Aggressive mode: complex emoji may change appearance.</string>
+    <string name="file_strip_bidi">Remove direction marks</string>
+    <string name="file_strip_bidi_hint">Use only when the text does not rely on right-to-left ordering.</string>
+    <string name="file_audit_title">Audit before saving</string>
+    <string name="file_residuals">Leftovers detected: %1$s</string>
 
     <!-- Library -->
     <string name="library_title">My videos</string>

@@ -2,6 +2,11 @@
 .gradle/
 build/
 !gradle/wrapper/gradle-wrapper.jar
+
+# The source archive from branch Exemple is unpacked here for traceability. It is
+# reference material only; the Android port lives in app/ and does not execute Python.
+!/upstream/
+!/upstream/**
 .kotlin/
 
 # Local configuration (SDK path, signing secrets, ...)
