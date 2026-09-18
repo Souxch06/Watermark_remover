@@ -12,6 +12,8 @@ copies cannot silently drift from the code they mirror.
 |---|---|---|
 | `verify/src/Verify.kt` | file-name sanitisation, version comparison, update-file safety, encoder-bitrate bounds, **mirror-sync guard** | `Mirror.kt` + the copies it holds |
 | `verify/src/RunCoreTests.kt` | the entire watermark analysis + restoration pipeline (mask/opacity/inversion/motion fill/tracking) and the zone geometry — using the real `WatermarkAnalyzer`, `RegionRestorer`, `WatermarkLayer`, `WatermarkShader`, `Zones`, `VideoInfo` | the genuine `app/src/main/...` files, the genuine `app/src/test/...` test files |
+| `verify/src/RunCleanerTests.kt` | the **file-provenance cleaner ported from the `Exemple` `.zip`**: byte-level assertions for PNG/JPEG/WebP/GIF/BMP/TIFF/AVIF/HEIC/WAV/MP3/FLAC/MP4/ZIP+OOXML/PDF and the Unicode text pass | the genuine `cleaner/NativeWatermarkCleaner.kt`, `cleaner/TextUnicodeCleaner.kt` and their genuine unit tests |
+| `verify/src/DemoCleaner.kt` | not a test: prints the before/after of the cleaner on hand-built samples (Unicode carriers, PNG chunk, MP4 `uuid` C2PA box, DOCX props, and a **clean** MP4 that must come out unchanged) | the two genuine cleaner sources |
 | `AppUpdateTest` (in CI) | update JSON parsing | covered by Gradle only — it needs a real URL connection |
 
 `verify/src/Mirror.kt` is a copy of a few pure functions whose real definitions live in files that
@@ -60,6 +62,30 @@ java -jar verify-standalone.jar
   -include-runtime -d core-tests.jar
 java -jar core-tests.jar   # expect: "28 test(s), 0 failure(s)"
 ```
+
+```bash
+# 3) the ported provenance cleaner: real cleaner sources + their real unit tests
+"$KOTLINC" \
+  app/src/main/java/com/souxch/watermarkremover/cleaner/NativeWatermarkCleaner.kt \
+  app/src/main/java/com/souxch/watermarkremover/cleaner/TextUnicodeCleaner.kt \
+  app/src/test/java/com/souxch/watermarkremover/cleaner/NativeWatermarkCleanerTest.kt \
+  app/src/test/java/com/souxch/watermarkremover/cleaner/TextUnicodeCleanerTest.kt \
+  verify/src/JvmTestHarness.kt verify/src/JvmTestRunner.kt verify/src/RunCleanerTests.kt \
+  -include-runtime -d cleaner-tests.jar
+java -cp cleaner-tests.jar:$KOTLINC_DIR/../lib/kotlin-reflect.jar \
+  com.souxch.watermarkremover.verify.RunCleanerTestsKt   # expect: "19 test(s), 0 failure(s)"
+
+# 4) optional: see what the cleaner does to a marked file (and to a clean one)
+"$KOTLINC" \
+  app/src/main/java/com/souxch/watermarkremover/cleaner/NativeWatermarkCleaner.kt \
+  app/src/main/java/com/souxch/watermarkremover/cleaner/TextUnicodeCleaner.kt \
+  verify/src/DemoCleaner.kt -include-runtime -d demo-cleaner.jar
+java -Dstdout.encoding=UTF-8 -jar demo-cleaner.jar
+```
+
+`JvmTestRunner` decides the receiver per test method: a class such as `NativeWatermarkCleanerTest`
+declares its helpers in a `companion object`, and the companion is not a valid receiver for the
+instance test methods.
 
 `verify/src/android/net/Uri.kt` is a local-only stand-in for `android.net.Uri` so `VideoInfo.kt`
 compiles; the tested paths never call it. `JvmTestHarness.kt` is a minimal subset of the JUnit 4 API

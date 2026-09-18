@@ -52,6 +52,9 @@ sur l'appareil : aucune vidéo ou aucun fichier n'est envoyé sur Internet.
   MP4/AVIF/HEIC sans toucher aux pixels ni aux échantillons. Les PDF sont traités en place pour
   les champs Info/XMP, avec une limite clairement affichée pour les pièces jointes et images
   embarquées. Les résultats sont déposés dans `Téléchargements/Watermark Remover`.
+  ➡️ Ce que ce nettoyage reprend **exactement** du `.zip` fourni (et ce qu'il ne peut pas
+  reprendre, comme le retrait des filigranes **visibles**, qui reste le rôle de l'éditeur vidéo) :
+  **[AUDIT-ZIP.md](AUDIT-ZIP.md)**.
 - **Éditeur** : cadre pré-positionné en bas à droite, déplaçable / redimensionnable au doigt,
   jusqu'à 6 zones, guides d'alignement.
 - **Aperçu avant / après** rendu par le *même shader* que l'export (fidèle au résultat final),

@@ -18,9 +18,14 @@ object JvmTestRunner {
         var failed = 0
         val failures = mutableListOf<String>()
         for (cls in classes) {
-            val instance = cls.companionObjectInstance
-                ?: cls.objectInstance
+            val companion = cls.companionObjectInstance
+            // A test class can declare a companion object for its helpers (NativeWatermarkCleanerTest
+            // does): the companion is NOT a valid receiver for the class's instance test methods, so
+            // prefer a real instance and only fall back to the companion for methods that actually
+            // belong to it (a companion-declared @Test, or an object class).
+            val instance = cls.objectInstance
                 ?: runCatching { cls.constructors.first().call() }.getOrNull()
+                ?: companion
                 ?: error("cannot instantiate ${cls.simpleName}: needs a no-arg constructor")
             val methods = cls.functions.filter { it.annotations.any { a -> a is Test } }
             for (m in methods) {
@@ -28,7 +33,11 @@ object JvmTestRunner {
                 run++
                 try {
                     m.isAccessible = true
-                    m.call(instance)
+                    // The receiver is decided per method: parameter 0 is the extension/instance
+                    // receiver, and its type tells us whether the function lives on the class or on
+                    // its companion object.
+                    val receiver = if (m.parameters.firstOrNull()?.type?.classifier == cls) instance else companion ?: instance
+                    m.call(receiver)
                     println("ok   $label")
                 } catch (e: Throwable) {
                     failed++
