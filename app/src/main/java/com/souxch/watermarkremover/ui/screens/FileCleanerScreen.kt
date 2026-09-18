@@ -78,7 +78,7 @@ fun FileCleanerScreen(
                 }
             }
         }
-        if (selection.kind == CleanFileKind.PDF || selection.kind == CleanFileKind.TIFF) {
+        if (selection.kind == CleanFileKind.PDF) {
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = MaterialTheme.shapes.medium,

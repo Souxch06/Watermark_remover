@@ -172,6 +172,8 @@ class FileCleanerRepository(private val context: Context) {
         "jpg", "jpeg" -> "image/jpeg"
         "webp" -> "image/webp"
         "gif" -> "image/gif"
+        "bmp", "dib" -> "image/bmp"
+        "tif", "tiff" -> "image/tiff"
         "wav" -> "audio/wav"
         "mp3" -> "audio/mpeg"
         "flac" -> "audio/flac"

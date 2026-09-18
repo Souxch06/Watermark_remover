@@ -48,9 +48,10 @@ sur l'appareil : aucune vidéo ou aucun fichier n'est envoyé sur Internet.
   « Partager » depuis la galerie.
 - **Nettoyage de fichiers** : le sélecteur Android accepte les textes, images, documents, audio et
   conteneurs courants. Le port natif retire les caractères Unicode invisibles, champs XML/C2PA,
-  segments PNG/JPEG/WebP/GIF, tags ID3, blocs WAV et boîtes de provenance MP4 sans toucher aux
-  pixels ni aux échantillons. Les PDF et TIFF sont signalés comme limités plutôt que réécrits de
-  manière risquée. Les résultats sont déposés dans `Téléchargements/Watermark Remover`.
+  segments PNG/JPEG/WebP/GIF, métadonnées BMP/TIFF, tags ID3, blocs WAV et boîtes de provenance
+  MP4/AVIF/HEIC sans toucher aux pixels ni aux échantillons. Les PDF sont traités en place pour
+  les champs Info/XMP, avec une limite clairement affichée pour les pièces jointes et images
+  embarquées. Les résultats sont déposés dans `Téléchargements/Watermark Remover`.
 - **Éditeur** : cadre pré-positionné en bas à droite, déplaçable / redimensionnable au doigt,
   jusqu'à 6 zones, guides d'alignement.
 - **Aperçu avant / après** rendu par le *même shader* que l'export (fidèle au résultat final),
@@ -200,7 +201,8 @@ inadaptés à une application Android hors ligne. Le port expose donc clairement
 - images : retrait sans réencodage des chunks/segments C2PA et métadonnées courantes ;
 - audio/vidéo : retrait des tags/blocs de conteneur en conservant les données codées ;
 - ZIP (DOCX/XLSX/PPTX/ODT/EPUB) : nettoyage des membres XML et médias courants ;
-- PDF/TIFF et marques pixel/mélodiques : avertissement explicite, aucune fausse promesse.
+- BMP/TIFF : suppression des zones de métadonnées sans déplacer les pixels ; PDF : nettoyage Info/XMP en place avec limites explicites ;
+- marques pixel-par-pixel, SynthID, diffusion, ffmpeg/qpdf/Ghostscript : non embarqués dans l’APK et signalés comme indisponibles.
 
 Cette séparation évite d'envoyer les fichiers à un service distant et évite aussi de déclarer
 « nettoyé » un format qu'Android ne sait pas réécrire de façon sûre.

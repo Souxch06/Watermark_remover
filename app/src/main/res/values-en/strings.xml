@@ -38,7 +38,7 @@
     <string name="file_clean_subtitle">Remove provenance traces without uploading the file.</string>
     <string name="file_scope">Offline cleaning</string>
     <string name="file_scope_details">The Android pass ports the deterministic cleaner from the Exemple repository: invisible Unicode characters, XML fields, C2PA and common metadata. Pixels, visible text and audio samples stay untouched.</string>
-    <string name="file_limited_format">This format normally needs qpdf/Ghostscript or a specialised TIFF rewrite. Android keeps the original bytes instead of risking an unreadable file.</string>
+    <string name="file_limited_format">PDF is cleaned without a qpdf rewrite: Info and XMP metadata are handled, but attachments and embedded-image metadata may need a desktop tool.</string>
     <string name="file_clean_action">Clean and save</string>
     <string name="file_cleaning">Cleaning…</string>
     <string name="file_cleaning_message">Processing “%1$s” on this device.</string>

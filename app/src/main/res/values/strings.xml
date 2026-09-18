@@ -38,7 +38,7 @@
     <string name="file_clean_subtitle">Retirez les traces de provenance sans envoyer le fichier.</string>
     <string name="file_scope">Nettoyage hors ligne</string>
     <string name="file_scope_details">Le passage Android reprend le nettoyage déterministe du dépôt Exemple : caractères Unicode invisibles, champs XML, C2PA et métadonnées courantes. Les pixels, le texte visible et l’audio sont conservés.</string>
-    <string name="file_limited_format">Ce format nécessite normalement qpdf/Ghostscript ou une réécriture TIFF spécialisée. Android conserve donc le fichier original plutôt que de risquer de le rendre illisible.</string>
+    <string name="file_limited_format">Le PDF est nettoyé sans réécriture qpdf : les métadonnées Info et XMP sont traitées, mais les pièces jointes et métadonnées d’images peuvent nécessiter un outil de bureau.</string>
     <string name="file_clean_action">Nettoyer et enregistrer</string>
     <string name="file_cleaning">Nettoyage en cours…</string>
     <string name="file_cleaning_message">Analyse de « %1$s » sur l’appareil.</string>

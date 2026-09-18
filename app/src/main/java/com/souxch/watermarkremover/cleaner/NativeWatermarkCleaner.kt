@@ -16,6 +16,7 @@ enum class CleanFileKind(val label: String) {
     JPEG("JPEG"),
     WEBP("WebP"),
     GIF("GIF"),
+    BMP("BMP"),
     TIFF("TIFF"),
     AVIF("AVIF"),
     HEIC("HEIC"),
@@ -80,6 +81,7 @@ object NativeWatermarkCleaner {
             "jpg", "jpeg" -> CleanFileKind.JPEG
             "webp" -> CleanFileKind.WEBP
             "gif" -> CleanFileKind.GIF
+            "bmp", "dib" -> CleanFileKind.BMP
             "tif", "tiff" -> CleanFileKind.TIFF
             "avif" -> CleanFileKind.AVIF
             "heic", "heif" -> CleanFileKind.HEIC
@@ -99,6 +101,11 @@ object NativeWatermarkCleaner {
         if (mime == "image/jpeg") return CleanFileKind.JPEG
         if (mime == "image/webp") return CleanFileKind.WEBP
         if (mime == "image/gif") return CleanFileKind.GIF
+        if (mime == "image/bmp") return CleanFileKind.BMP
+        if (mime == "image/tiff") return CleanFileKind.TIFF
+        if (mime == "application/pdf") return CleanFileKind.PDF
+        if (mime == "image/avif") return CleanFileKind.AVIF
+        if (mime == "image/heic" || mime == "image/heif") return CleanFileKind.HEIC
         if (mime.startsWith("audio/")) {
             return when {
                 mime.contains("wav") -> CleanFileKind.WAV
@@ -114,6 +121,9 @@ object NativeWatermarkCleaner {
                 startsWith(data, PNG_SIGNATURE) -> return CleanFileKind.PNG
                 startsWith(data, JPEG_SIGNATURE) -> return CleanFileKind.JPEG
                 startsWith(data, GIF87_SIGNATURE) || startsWith(data, GIF89_SIGNATURE) -> return CleanFileKind.GIF
+                startsWith(data, BMP_SIGNATURE) -> return CleanFileKind.BMP
+                startsWith(data, TIFF_LE_SIGNATURE) || startsWith(data, TIFF_BE_SIGNATURE) || startsWith(data, TIFF_LE_BIG_SIGNATURE) || startsWith(data, TIFF_BE_BIG_SIGNATURE) -> return CleanFileKind.TIFF
+                startsWith(data, PDF_SIGNATURE) -> return CleanFileKind.PDF
                 startsWith(data, RIFF_SIGNATURE) && data.size >= 12 && data.copyOfRange(8, 12).contentEquals(WAVE_SIGNATURE) -> return CleanFileKind.WAV
                 startsWith(data, ID3_SIGNATURE) -> return CleanFileKind.MP3
                 startsWith(data, FLAC_SIGNATURE) -> return CleanFileKind.FLAC
@@ -146,18 +156,13 @@ object NativeWatermarkCleaner {
             CleanFileKind.JPEG -> cleanJpeg(input)
             CleanFileKind.WEBP -> cleanWebp(input)
             CleanFileKind.GIF -> cleanGif(input)
+            CleanFileKind.BMP -> cleanBmp(input)
             CleanFileKind.WAV -> cleanWav(input)
             CleanFileKind.MP3, CleanFileKind.FLAC -> cleanLeadingId3(input, kind)
             CleanFileKind.MP4, CleanFileKind.AVIF, CleanFileKind.HEIC -> cleanIsoBmff(input, kind)
             CleanFileKind.ZIP_CONTAINER -> cleanZip(input, displayName)
-            CleanFileKind.TIFF -> NativeCleanOutput(
-                input,
-                NativeCleanReport(kind, input.size, input.size, false, emptyList(), warnings = listOf("TIFF metadata is left untouched on Android to avoid rewriting pixel offsets.")),
-            )
-            CleanFileKind.PDF -> NativeCleanOutput(
-                input,
-                NativeCleanReport(kind, input.size, input.size, false, emptyList(), warnings = listOf("PDF requires a structural rewrite backend (qpdf/Ghostscript), not available offline in this APK.")),
-            )
+            CleanFileKind.TIFF -> cleanTiff(input)
+            CleanFileKind.PDF -> cleanPdf(input)
             CleanFileKind.UNSUPPORTED -> NativeCleanOutput(
                 input,
                 NativeCleanReport(kind, input.size, input.size, false, emptyList(), warnings = listOf("Format non pris en charge sur Android.")),
@@ -411,19 +416,37 @@ object NativeWatermarkCleaner {
         val outBody = ByteArrayOutputStream(input.size - 8)
         outBody.write(WEBP_SIGNATURE)
         val actions = mutableListOf<String>()
+        val metadataFlags = mapOf("ICCP" to 0x20, "EXIF" to 0x08, "XMP " to 0x04)
+        var removedFlags = 0
+        var scan = 12
+        while (scan + 8 <= input.size) {
+            val scanSize = readLe32(input, scan + 4)
+            if (scanSize < 0 || scan.toLong() + 8L + scanSize + (scanSize and 1) > input.size) break
+            val scanName = String(input, scan, 4, Charsets.ISO_8859_1)
+            if (scanName in metadataFlags || scanName.uppercase(Locale.US) == "C2PA" || scanName.uppercase(Locale.US) == "JUMB") {
+                removedFlags = removedFlags or (metadataFlags[scanName] ?: 0)
+            }
+            scan += 8 + scanSize + (scanSize and 1)
+        }
         var pos = 12
         while (pos + 8 <= input.size) {
             val type = input.copyOfRange(pos, pos + 4)
             val size = readLe32(input, pos + 4)
             if (size < 0 || pos.toLong() + 8L + size + (size and 1) > input.size) {
                 outBody.write(input, pos, input.size - pos)
+                pos = input.size
                 break
             }
-            val payload = input.copyOfRange(pos + 8, pos + 8 + size)
+            var payload = input.copyOfRange(pos + 8, pos + 8 + size)
             val name = String(type, Charsets.ISO_8859_1)
-            val drop = name in setOf("EXIF", "XMP ", "ICCP", "C2PA", "JUMB")
+            val upperName = name.uppercase(Locale.US)
+            val drop = name in setOf("EXIF", "XMP ", "ICCP", "C2PA", "JUMB") || upperName == "C2PA" || upperName == "JUMB"
             if (drop) actions += "Retrait du bloc WebP $name"
             else {
+                if (name == "VP8X" && payload.isNotEmpty() && removedFlags != 0) {
+                    payload = payload.copyOf()
+                    payload[0] = (payload[0].toInt() and removedFlags.inv()).toByte()
+                }
                 outBody.write(type)
                 outBody.write(le32(size))
                 outBody.write(payload)
@@ -431,6 +454,7 @@ object NativeWatermarkCleaner {
             }
             pos += 8 + size + (size and 1)
         }
+        if (pos < input.size) outBody.write(input, pos, input.size - pos)
         val body = outBody.toByteArray()
         val result = ByteArrayOutputStream(body.size + 8)
         result.write(RIFF_SIGNATURE)
@@ -470,8 +494,15 @@ object NativeWatermarkCleaner {
                     } else {
                         val label = input[pos + 1].toInt() and 0xFF
                         val payload = input.copyOfRange(pos + 2, end)
-                        val appId = if (label == 0xFF && payload.size >= 11) String(payload, 0, 11, Charsets.ISO_8859_1) else ""
-                        val drop = label == 0xFE || (label == 0xFF && appId != "NETSCAPE2.0" && appId != "ICCRGBG1012")
+                        val appId = if (label == 0xFF && pos + 3 + 11 <= end && (input[pos + 2].toInt() and 0xFF) >= 11) String(input, pos + 3, 11, Charsets.ISO_8859_1) else ""
+                        val markerHit = containsProvenanceMarker(String(payload, Charsets.ISO_8859_1).lowercase(Locale.US))
+                        val drop = when {
+                            label == 0xFE -> true
+                            label != 0xFF -> false
+                            appId == "XMP DataXMP" -> true
+                            appId == "NETSCAPE2.0" || appId == "ICCRGBG1012" -> markerHit
+                            else -> true
+                        }
                         if (drop) actions += "Retrait d'une extension GIF de métadonnées" else out.write(input, pos, end - pos)
                         pos = end
                     }
@@ -493,6 +524,180 @@ object NativeWatermarkCleaner {
             }
         }
         return outputFor(CleanFileKind.GIF, input, out.toByteArray(), actions)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // BMP / TIFF / PDF (formats without an Android metadata writer)
+    // ---------------------------------------------------------------------------------------------
+
+    /** Truncates non-standard bytes after the BMP pixel payload and fixes bfSize. */
+    private fun cleanBmp(input: ByteArray): NativeCleanOutput {
+        if (!startsWith(input, BMP_SIGNATURE) || input.size < 26) {
+            return unsupportedImage(input, CleanFileKind.BMP, "BMP invalide")
+        }
+        val pixelOffset = readLe32(input, 10)
+        val dibSize = readLe32(input, 14)
+        if (pixelOffset < 14 || dibSize < 12 || 14L + dibSize > input.size) {
+            return unsupportedImage(input, CleanFileKind.BMP, "En-tête BMP incomplet")
+        }
+
+        val width: Long
+        val height: Long
+        val bitsPerPixel: Int
+        val compression: Int
+        if (dibSize == 12) {
+            width = readLe16(input, 18).toLong()
+            height = readLe16(input, 20).toLong()
+            bitsPerPixel = readLe16(input, 24)
+            compression = 0
+        } else {
+            if (14 + 40 > input.size) return unsupportedImage(input, CleanFileKind.BMP, "DIB BMP incomplet")
+            width = kotlin.math.abs(readLe32(input, 18).toLong())
+            height = kotlin.math.abs(readLe32(input, 22).toLong())
+            bitsPerPixel = readLe16(input, 28)
+            compression = readLe32(input, 30)
+        }
+        // RLE/JPEG/PNG-compressed BMPs do not expose a safely computable pixel
+        // extent here. Preserving them is safer than cutting their payload.
+        if (width <= 0 || height <= 0 || bitsPerPixel <= 0 || compression !in setOf(0, 3, 6)) {
+            return NativeCleanOutput(input, NativeCleanReport(CleanFileKind.BMP, input.size, input.size, false, emptyList(), warnings = listOf("BMP compressé : fichier conservé.")))
+        }
+        val rowBytes = ((width * bitsPerPixel + 31L) / 32L) * 4L
+        val payloadEnd = pixelOffset.toLong() + rowBytes * height
+        if (payloadEnd > input.size || payloadEnd < 0) {
+            return NativeCleanOutput(input, NativeCleanReport(CleanFileKind.BMP, input.size, input.size, false, emptyList(), warnings = listOf("Extension BMP impossible à déterminer : fichier conservé.")))
+        }
+        if (payloadEnd == input.size.toLong()) return outputFor(CleanFileKind.BMP, input, input, emptyList())
+        val output = input.copyOf(payloadEnd.toInt())
+        copyInto(output, 2, le32(output.size))
+        return outputFor(CleanFileKind.BMP, input, output, listOf("Retrait des ${input.size - output.size} octets BMP après l'image"))
+    }
+
+    /**
+     * Removes descriptive TIFF IFD entries in place. No strip/tile payload is
+     * moved, so offsets used by decoders remain valid for classic TIFF and
+     * BigTIFF. Exif/GPS sub-IFDs are recursively treated as metadata.
+     */
+    private fun cleanTiff(input: ByteArray): NativeCleanOutput {
+        val layout = when {
+            input.size >= 8 && input[0] == 'I'.code.toByte() && input[1] == 'I'.code.toByte() && input[2] == 42.toByte() && input[3] == 0.toByte() -> false to false
+            input.size >= 8 && input[0] == 'M'.code.toByte() && input[1] == 'M'.code.toByte() && input[2] == 0.toByte() && input[3] == 42.toByte() -> true to false
+            input.size >= 16 && input[0] == 'I'.code.toByte() && input[1] == 'I'.code.toByte() && input[2] == 43.toByte() && input[3] == 0.toByte() -> false to true
+            input.size >= 16 && input[0] == 'M'.code.toByte() && input[1] == 'M'.code.toByte() && input[2] == 0.toByte() && input[3] == 43.toByte() -> true to true
+            else -> return unsupportedImage(input, CleanFileKind.TIFF, "TIFF invalide")
+        }
+        val bigEndian = layout.first
+        val bigTiff = layout.second
+        val offsetBytes = if (bigTiff) 8 else 4
+        val countBytes = if (bigTiff) 8 else 2
+        val entryBytes = if (bigTiff) 20 else 12
+        val headerBytes = if (bigTiff) 16 else 8
+        val first = if (bigTiff) readEndian64(input, headerBytes - 8, bigEndian) else readEndian32(input, headerBytes - 4, bigEndian).toLong()
+        if (first <= 0 || first > input.size - countBytes) {
+            return NativeCleanOutput(input, NativeCleanReport(CleanFileKind.TIFF, input.size, input.size, false, emptyList(), warnings = listOf("TIFF sans IFD lisible : fichier conservé.")))
+        }
+
+        val metadataTags = setOf(269, 270, 271, 272, 305, 306, 315, 316, 33432, 33723, 34377, 34665, 34853, 37500, 40091, 40092, 40093, 40094, 40095, 40965, 700)
+        val typeSizes = mapOf(1 to 1, 2 to 1, 3 to 2, 4 to 4, 5 to 8, 6 to 1, 7 to 1, 8 to 2, 9 to 4, 10 to 8, 11 to 4, 12 to 8, 16 to 8, 17 to 8, 18 to 8)
+        val output = input.copyOf()
+        val queue = mutableListOf(first to false)
+        val seen = mutableSetOf<Pair<Long, Boolean>>()
+        val actions = mutableListOf<String>()
+        var visited = 0
+        while (queue.isNotEmpty() && visited++ < 4096) {
+            val (ifdOffset, subIfd) = queue.removeAt(queue.lastIndex)
+            if (!seen.add(ifdOffset to subIfd)) continue
+            if (ifdOffset > Int.MAX_VALUE || ifdOffset < 0 || ifdOffset > input.size - countBytes) continue
+            val offset = ifdOffset.toInt()
+            val count = if (bigTiff) readEndian64(input, offset, bigEndian).coerceAtMost(4096L).toInt() else readEndian16(input, offset, bigEndian)
+            val entriesEnd = offset.toLong() + countBytes.toLong() + count.toLong() * entryBytes
+            if (entriesEnd + offsetBytes > input.size) continue
+            for (index in 0 until count) {
+                val entry = offset + countBytes + index * entryBytes
+                val tag = readEndian16(input, entry, bigEndian)
+                val type = readEndian16(input, entry + 2, bigEndian)
+                val valueCount = if (bigTiff) readEndian64(input, entry + 4, bigEndian) else readEndian32(input, entry + 4, bigEndian).toLong()
+                val valueField = entry + (if (bigTiff) 12 else 8)
+                val valueCapacity = if (bigTiff) 8 else 4
+                val byteCount = valueCount.coerceAtMost(Int.MAX_VALUE.toLong()) * (typeSizes[type] ?: 1)
+                val valueOffset = if (byteCount > valueCapacity) {
+                    if (bigTiff) readEndian64(input, valueField, bigEndian) else readEndian32(input, valueField, bigEndian).toLong()
+                } else -1L
+                val payload = if (valueOffset >= 0 && valueOffset + byteCount <= input.size) input.copyOfRange(valueOffset.toInt(), (valueOffset + byteCount).toInt()) else input.copyOfRange(valueField, valueField + minOf(valueCapacity, input.size - valueField))
+                if (tag in setOf(34665, 34853, 40965) && payload.size >= offsetBytes) {
+                    val child = if (bigTiff) readEndian64(payload, 0, bigEndian) else readEndian32(payload, 0, bigEndian).toLong()
+                    if (child > 0) queue += child to true
+                }
+                val marker = containsProvenanceMarker(String(payload, Charsets.ISO_8859_1).lowercase(Locale.US))
+                val drop = subIfd || tag in metadataTags || marker
+                if (!drop) continue
+                output.fill(0, entry, minOf(entry + entryBytes, output.size))
+                if (valueOffset >= 0 && valueOffset + byteCount <= output.size) output.fill(0, valueOffset.toInt(), (valueOffset + byteCount).toInt())
+                actions += "Retrait de la balise TIFF $tag"
+            }
+            val nextPos = entriesEnd.toInt()
+            if (nextPos + offsetBytes <= input.size) {
+                val next = if (bigTiff) readEndian64(input, nextPos, bigEndian) else readEndian32(input, nextPos, bigEndian).toLong()
+                if (next > 0) queue += next to subIfd
+            }
+        }
+        return outputFor(CleanFileKind.TIFF, input, output, actions.distinct())
+    }
+
+    /** Best-effort in-place PDF info/XMP scrub; xref offsets remain unchanged. */
+    private fun cleanPdf(input: ByteArray): NativeCleanOutput {
+        if (!startsWith(input, "%PDF-".toByteArray(Charsets.ISO_8859_1))) {
+            return NativeCleanOutput(input, NativeCleanReport(CleanFileKind.PDF, input.size, input.size, false, emptyList(), warnings = listOf("PDF invalide.")))
+        }
+        val output = input.copyOf()
+        val actions = mutableListOf<String>()
+        val keys = listOf("/Title", "/Author", "/Subject", "/Keywords", "/Creator", "/Producer", "/CreationDate", "/ModDate")
+        for (key in keys) {
+            var at = 0
+            val needle = key.toByteArray(Charsets.ISO_8859_1)
+            while (true) {
+                val found = indexOf(input, needle, at)
+                if (found < 0) break
+                var value = found + needle.size
+                while (value < input.size && input[value].toInt() and 0xFF <= 0x20) value++
+                if (value >= input.size) break
+                if (input[value] == '('.code.toByte()) {
+                    var cursor = value + 1
+                    var depth = 1
+                    while (cursor < input.size && depth > 0) {
+                        if (input[cursor] == '\\'.code.toByte()) cursor += 2
+                        else {
+                            if (input[cursor] == '('.code.toByte()) depth++
+                            if (input[cursor] == ')'.code.toByte()) depth--
+                            cursor++
+                        }
+                    }
+                    if (depth == 0) {
+                        output.fill(' '.code.toByte(), value + 1, cursor - 1)
+                        actions += "Nettoyage du champ PDF $key"
+                    }
+                } else if (input[value] == '<'.code.toByte() && value + 1 < input.size && input[value + 1] != '<'.code.toByte()) {
+                    val end = indexOf(input, byteArrayOf('>'.code.toByte()), value + 1)
+                    if (end > value) {
+                        output.fill('0'.code.toByte(), value + 1, end)
+                        actions += "Nettoyage du champ PDF $key"
+                    }
+                }
+                at = maxOf(found + needle.size, value + 1)
+            }
+        }
+        var xmp = indexOf(input, "<?xpacket".toByteArray(Charsets.ISO_8859_1), 0)
+        while (xmp >= 0) {
+            val endMarker = indexOf(input, "<?xpacket end".toByteArray(Charsets.ISO_8859_1), xmp + 9)
+            if (endMarker < 0) break
+            val end = indexOf(input, byteArrayOf('>'.code.toByte()), endMarker)
+            if (end < 0) break
+            output.fill(' '.code.toByte(), xmp, end + 1)
+            actions += "Retrait du paquet XMP PDF"
+            xmp = indexOf(input, "<?xpacket".toByteArray(Charsets.ISO_8859_1), end + 1)
+        }
+        val warning = "PDF nettoyé sans réécriture qpdf : les pièces jointes et métadonnées d'images peuvent nécessiter le backend desktop."
+        return NativeCleanOutput(output, NativeCleanReport(CleanFileKind.PDF, input.size, output.size, !input.contentEquals(output), actions.distinct(), warnings = listOf(warning)))
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -565,26 +770,85 @@ object NativeWatermarkCleaner {
             }
             if (size < header || size > input.size - pos) {
                 out.write(input, pos, input.size - pos)
+                pos = input.size
                 break
             }
             val payloadStart = pos + header
             val payloadEnd = pos + size.toInt()
             val payload = input.copyOfRange(payloadStart, payloadEnd)
             val lowerPayload = String(payload.copyOfRange(0, minOf(payload.size, 1 shl 20)), Charsets.ISO_8859_1).lowercase(Locale.US)
-            val drop = name.lowercase(Locale.US) in setOf("c2pa", "jumb") ||
-                (name.equals("uuid", ignoreCase = true) && containsProvenanceMarker(lowerPayload)) ||
-                (name.equals("meta", ignoreCase = true) && containsProvenanceMarker(lowerPayload)) ||
+            val isUuid = name.equals("uuid", ignoreCase = true)
+            val uuidIsXmp = isUuid && startsWith(payload, XMP_UUID)
+            val uuidIsC2pa = isUuid && (startsWith(payload, C2PA_BMFF_UUID) || (payload.size >= 20 && payload.copyOfRange(4, 20).contentEquals(C2PA_BMFF_UUID)))
+            val dropWhole = name.lowercase(Locale.US) in setOf("c2pa", "jumb") || name.lowercase(Locale.US).startsWith("c2") ||
+                isUuid ||
                 (name.equals("udta", ignoreCase = true) && containsProvenanceMarker(lowerPayload)) ||
                 (name.equals("xml ", ignoreCase = true) && containsProvenanceMarker(lowerPayload))
-            if (drop && size >= 8) {
-                actions += "Neutralisation de la boîte MP4 $name"
+            if (name.equals("meta", ignoreCase = true) && payload.size >= 4) {
+                val cleanedMeta = cleanIsoMetaPayload(payload, actions)
+                if (cleanedMeta != null) {
+                    if (!cleanedMeta.contentEquals(payload)) actions += "Nettoyage des sous-boîtes meta ISO-BMFF"
+                    out.write(buildIsoBox(type, cleanedMeta, header))
+                } else if (containsProvenanceMarker(lowerPayload)) {
+                    actions += "Neutralisation de la boîte MP4 $name"
+                    out.write(freeBox(size, header))
+                } else {
+                    out.write(input, start, size.toInt())
+                }
+            } else if (dropWhole && size >= header) {
+                val reason = when {
+                    uuidIsC2pa -> "UUID C2PA"
+                    uuidIsXmp -> "UUID XMP"
+                    isUuid -> "UUID metadata"
+                    else -> name
+                }
+                actions += "Neutralisation de la boîte MP4 $reason"
                 out.write(freeBox(size, header))
             } else {
                 out.write(input, start, size.toInt())
             }
             pos = payloadEnd
         }
+        if (pos < input.size) out.write(input, pos, input.size - pos)
         return outputFor(kind, input, out.toByteArray(), actions)
+    }
+
+    /** Rewrites only the child boxes of a FullBox meta payload, preserving sizes and offsets. */
+    private fun cleanIsoMetaPayload(payload: ByteArray, actions: MutableList<String>): ByteArray? {
+        if (payload.size < 4) return null
+        val out = ByteArrayOutputStream(payload.size)
+        out.write(payload, 0, 4) // version and flags
+        var pos = 4
+        var parsed = false
+        while (pos + 8 <= payload.size) {
+            val size32 = readBe32(payload, pos)
+            val type = payload.copyOfRange(pos + 4, pos + 8)
+            val name = String(type, Charsets.ISO_8859_1)
+            var header = 8
+            var size = size32.toLong()
+            if (size32 == 1 && pos + 16 <= payload.size) {
+                size = readBe64(payload, pos + 8)
+                header = 16
+            } else if (size32 == 0) {
+                size = (payload.size - pos).toLong()
+            }
+            if (size < header || size > payload.size - pos) return null
+            parsed = true
+            val child = payload.copyOfRange(pos + header, pos + size.toInt())
+            val lower = String(child.copyOfRange(0, minOf(child.size, 1 shl 20)), Charsets.ISO_8859_1).lowercase(Locale.US)
+            val uuid = name.equals("uuid", ignoreCase = true)
+            val drop = name.lowercase(Locale.US) in setOf("jumb", "c2pa", "xml ", "bxml") || name.lowercase(Locale.US).startsWith("c2") ||
+                uuid || containsProvenanceMarker(lower)
+            if (drop) {
+                actions += "Neutralisation de la sous-boîte meta $name"
+                out.write(freeBox(size, header))
+            } else {
+                out.write(payload, pos, size.toInt())
+            }
+            pos += size.toInt()
+        }
+        if (pos < payload.size) out.write(payload, pos, payload.size - pos)
+        return if (parsed) out.toByteArray() else null
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -629,6 +893,16 @@ object NativeWatermarkCleaner {
             ((data[offset + 2].toInt() and 0xFF) shl 8) or
             (data[offset + 3].toInt() and 0xFF)
 
+    private fun readLe16(data: ByteArray, offset: Int): Int =
+        (data[offset].toInt() and 0xFF) or ((data[offset + 1].toInt() and 0xFF) shl 8)
+
+    private fun readEndian16(data: ByteArray, offset: Int, bigEndian: Boolean): Int =
+        if (bigEndian) readBe16(data, offset) else readLe16(data, offset)
+
+    private fun readEndian32(data: ByteArray, offset: Int, bigEndian: Boolean): Long =
+        if (bigEndian) readBe32(data, offset).toLong() and 0xFFFF_FFFFL
+        else readLe32(data, offset).toLong() and 0xFFFF_FFFFL
+
     private fun readBe64(data: ByteArray, offset: Int): Long {
         var result = 0L
         repeat(8) { result = (result shl 8) or (data[offset + it].toLong() and 0xFF) }
@@ -641,6 +915,33 @@ object NativeWatermarkCleaner {
             ((data[offset + 2].toInt() and 0xFF) shl 16) or
             ((data[offset + 3].toInt() and 0xFF) shl 24)
 
+    private fun readEndian64(data: ByteArray, offset: Int, bigEndian: Boolean): Long {
+        var result = 0L
+        if (bigEndian) {
+            repeat(8) { result = (result shl 8) or (data[offset + it].toLong() and 0xFF) }
+        } else {
+            for (i in 0 until 8) result = result or ((data[offset + i].toLong() and 0xFF) shl (8 * i))
+        }
+        return result
+    }
+
+    private fun indexOf(data: ByteArray, needle: ByteArray, fromIndex: Int = 0): Int {
+        if (needle.isEmpty()) return fromIndex.coerceIn(0, data.size)
+        val start = fromIndex.coerceAtLeast(0)
+        if (needle.size > data.size - start) return -1
+        for (i in start..(data.size - needle.size)) {
+            var matches = true
+            for (j in needle.indices) {
+                if (data[i + j] != needle[j]) {
+                    matches = false
+                    break
+                }
+            }
+            if (matches) return i
+        }
+        return -1
+    }
+
     private fun le32(value: Int): ByteArray = byteArrayOf(
         value.toByte(), (value ushr 8).toByte(), (value ushr 16).toByte(), (value ushr 24).toByte(),
     )
@@ -649,8 +950,32 @@ object NativeWatermarkCleaner {
         value.copyInto(target, offset)
     }
 
+    private fun buildIsoBox(type: ByteArray, payload: ByteArray, header: Int): ByteArray {
+        val size = payload.size.toLong() + header
+        if (size > Int.MAX_VALUE) return ByteArray(0)
+        val result = ByteArray(size.toInt())
+        if (header == 16) {
+            result[0] = 0
+            result[1] = 0
+            result[2] = 0
+            result[3] = 1
+            type.copyInto(result, 4)
+            var value = size
+            for (i in 0 until 8) {
+                result[15 - i] = (value and 0xFF).toByte()
+                value = value ushr 8
+            }
+            payload.copyInto(result, 16)
+        } else {
+            leOrBeSize(result, size)
+            type.copyInto(result, 4)
+            payload.copyInto(result, 8)
+        }
+        return result
+    }
+
     private fun freeBox(size: Long, header: Int): ByteArray {
-        if (size < header) return ByteArray(size.toInt())
+        if (size < header || size > Int.MAX_VALUE) return ByteArray(size.coerceAtLeast(0).coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
         val result = ByteArray(size.toInt())
         if (header == 16) {
             result[0] = 0
@@ -675,7 +1000,11 @@ object NativeWatermarkCleaner {
     }
 
     private fun containsProvenanceMarker(text: String): Boolean =
-        listOf("c2pa", "jumb", "contentcredentials", "contentauth", "aigc", "synthid", "provenance").any(text::contains)
+        listOf(
+            "c2pa", "c2ma", "jumb", "contentcredentials", "contentauth", "cai:",
+            "aigc", "synthid", "provenance", "digitalsourcetype", "trainedalgorithmicmedia",
+            "algorithmicmedia", "dcterms:provenance",
+        ).any(text::contains)
 
     private fun gifExtensionEnd(data: ByteArray, start: Int): Int? {
         if (start + 2 > data.size) return null
@@ -710,6 +1039,12 @@ object NativeWatermarkCleaner {
     private fun startsWith(data: ByteArray, prefix: ByteArray): Boolean = data.size >= prefix.size && data.copyOfRange(0, prefix.size).contentEquals(prefix)
 
     private val PNG_SIGNATURE = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+    private val BMP_SIGNATURE = byteArrayOf('B'.code.toByte(), 'M'.code.toByte())
+    private val TIFF_LE_SIGNATURE = byteArrayOf('I'.code.toByte(), 'I'.code.toByte(), 42, 0)
+    private val TIFF_BE_SIGNATURE = byteArrayOf('M'.code.toByte(), 'M'.code.toByte(), 0, 42)
+    private val TIFF_LE_BIG_SIGNATURE = byteArrayOf('I'.code.toByte(), 'I'.code.toByte(), 43, 0)
+    private val TIFF_BE_BIG_SIGNATURE = byteArrayOf('M'.code.toByte(), 'M'.code.toByte(), 0, 43)
+    private val PDF_SIGNATURE = "%PDF-".toByteArray(Charsets.ISO_8859_1)
     private val JPEG_SIGNATURE = byteArrayOf(0xFF.toByte(), 0xD8.toByte())
     private val GIF87_SIGNATURE = "GIF87a".toByteArray(Charsets.ISO_8859_1)
     private val GIF89_SIGNATURE = "GIF89a".toByteArray(Charsets.ISO_8859_1)
@@ -718,6 +1053,8 @@ object NativeWatermarkCleaner {
     private val WEBP_SIGNATURE = "WEBP".toByteArray(Charsets.ISO_8859_1)
     private val ID3_SIGNATURE = "ID3".toByteArray(Charsets.ISO_8859_1)
     private val FLAC_SIGNATURE = "fLaC".toByteArray(Charsets.ISO_8859_1)
+    private val XMP_UUID = byteArrayOf(0xBE.toByte(), 0x7A.toByte(), 0xCF.toByte(), 0xCB.toByte(), 0x97.toByte(), 0xA9.toByte(), 0x42.toByte(), 0xE8.toByte(), 0x9C.toByte(), 0x71.toByte(), 0x99.toByte(), 0x94.toByte(), 0x91.toByte(), 0xE3.toByte(), 0xAF.toByte(), 0xAC.toByte())
+    private val C2PA_BMFF_UUID = byteArrayOf(0xD8.toByte(), 0xFE.toByte(), 0xC3.toByte(), 0xD6.toByte(), 0x1B.toByte(), 0x0E.toByte(), 0x48.toByte(), 0x3C.toByte(), 0x92.toByte(), 0x97.toByte(), 0x58.toByte(), 0x28.toByte(), 0x87.toByte(), 0x7E.toByte(), 0xC4.toByte(), 0x81.toByte())
     private val ZIP_SIGNATURE = byteArrayOf(0x50, 0x4B, 0x03, 0x04)
     private val FTYP_SIGNATURE = "ftyp".toByteArray(Charsets.ISO_8859_1)
 }
